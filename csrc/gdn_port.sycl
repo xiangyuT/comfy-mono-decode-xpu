@@ -1,0 +1,236 @@
+// SIMD16 ports of the Kitchen deferred GDN decode kernels (llm-scaler fd4a584 kitchen_deferred.cpp),
+// arithmetic copied verbatim, to check bit parity before they move into the persistent layer kernel.
+// in_proj_a/b use the exact oneDNN-order BF16 linear (16 interleaved K32 accumulators) unless at_linear.
+#include <cmath>
+#include <optional>
+
+#include <ATen/ops/linear.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+namespace cmdx {
+namespace {
+using T = sycl::ext::oneapi::bfloat16;
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+constexpr int SLOT = 8, D = 128, RG = 4, RPG = D / RG;
+class PConv;
+class PGates;
+class PSums;
+class PDelta;
+class PLinAB;
+inline float hw_rsqrt(float x) {
+#if defined(__SYCL_DEVICE_ONLY__)
+    float r;
+    __asm__ volatile("rsqrt (M1, 16) %0(0,0)<1> %1(0,0)<1;1,0>" : "=rw"(r) : "rw"(x));
+    return r;
+#else
+    return x;
+#endif
+}
+}  // namespace
+
+// bf16 x[R, K] @ w[N, K]^T in oneDNN jit:gemm order (M <= 8): 16 FP32 partials, K32 chunk c -> c % 16
+torch::Tensor linear_ab(torch::Tensor x, torch::Tensor w) {
+    const int64_t K = x.size(-1), R = x.numel() / K, N = w.size(0);
+    TORCH_CHECK(R <= 8 && N % 16 == 0 && K % 512 == 0, "linear_ab contract");
+    auto sizes = x.sizes().vec();
+    sizes.back() = N;
+    auto out = torch::empty(sizes, x.options());
+    const auto* xp = reinterpret_cast<const T*>(x.data_ptr());
+    const auto* wp = reinterpret_cast<const T*>(w.data_ptr());
+    auto* op = reinterpret_cast<T*>(out.data_ptr());
+    c10::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 2> part(sycl::range<2>(16, 128), cgh);
+        // one work-group per 16-column tile, sub-group j accumulates K32 chunks j, j + 16, ...
+        cgh.parallel_for<PLinAB>(sycl::nd_range<1>((N / 16) * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = it.get_sub_group();
+            const int j = sg.get_group_id()[0], lane = sg.get_local_id()[0];
+            const int64_t n0 = it.get_group(0) * 16;
+            jm::joint_matrix<sycl::sub_group, T, jm::use::a, 8, 16, jm::layout::row_major> a;
+            jm::joint_matrix<sycl::sub_group, T, jm::use::b, 16, 16, jm::layout::col_major> b;
+            jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> c;
+            jm::joint_matrix_fill(sg, c, 0.f);
+            for (int64_t k = int64_t(j) * 32; k < K; k += 16 * 32)
+                for (int h = 0; h < 2; ++h) {
+                    // rows >= R read row 0 again (their results are discarded)
+                    jm::joint_matrix_load(sg, a, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(xp + k + 16 * h), K);
+                    jm::joint_matrix_load(sg, b, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(wp + n0 * K + k + 16 * h), K);
+                    jm::joint_matrix_mad(sg, c, a, b, c);
+                }
+            int e = 0;
+            jm::joint_matrix_apply(sg, c, [&](float& v) { part[j][e * 16 + lane] = v; ++e; });
+            sycl::group_barrier(it.get_group());
+            const int t = it.get_local_id(0);
+            if (t < 128) {
+                const int r = t / 16, col = t % 16;
+                float acc = part[0][t];
+                for (int s = 1; s < 16; ++s) acc = acc + part[s][t];
+                if (r < R) op[r * N + n0 + col] = static_cast<T>(acc);
+            }
+        });
+    });
+    return out;
+}
+
+void gdn_conv_port(torch::Tensor proj, torch::Tensor state, torch::Tensor weight, std::optional<torch::Tensor> bias,
+                   torch::Tensor prev, torch::Tensor qkv, torch::Tensor ctl) {
+    const int B = proj.size(0), S = proj.size(1), C = proj.size(2), W = state.size(2);
+    const auto* x = static_cast<const T*>(proj.data_ptr()); auto* st = static_cast<T*>(state.data_ptr());
+    const auto* w = static_cast<const T*>(weight.data_ptr()); const T* b = bias ? static_cast<const T*>(bias->data_ptr()) : nullptr;
+    auto* pb = static_cast<T*>(prev.data_ptr()); auto* qb = static_cast<T*>(qkv.data_ptr()); const auto* control = ctl.data_ptr<int>();
+    const size_t total = size_t(B) * C;
+    c10::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<PConv>(sycl::nd_range<1>((total + 255) / 256 * 256, 256), [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+            const size_t gid = item.get_global_id(0);
+            if (gid >= total) return;
+            const int batch = gid / C, c = gid % C, p = control[1]; const int n = control[0];
+            if (p < 0 || p > 1 || n < 0 || n > SLOT) return;
+            const int64_t current = int64_t(p) * B * SLOT * C, previous = int64_t(1 - p) * B * SLOT * C;
+            T* history = st + (int64_t(batch) * C + c) * W;
+            for (int r = 0; r < W; ++r) {
+                const int accepted = n + r - W;
+                const int slot = accepted >= 0 ? control[2 + accepted] : 0;
+                history[r] = n + r < W ? history[n + r] : pb[previous + (int64_t(batch) * SLOT + slot) * C + c];
+            }
+            for (int t = 0; t < S; ++t) {
+                float sum = b ? float(b[c]) : 0.f;
+                int ancestor = t, missing = 0;
+                for (int distance = 0; distance <= W; ++distance) {
+                    if (distance) {
+                        ancestor = ancestor >= 0 ? control[2 + SLOT + ancestor] : -1;
+                        if (ancestor < 0) ++missing;
+                    }
+                    const float value = ancestor >= 0 ? float(x[(int64_t(batch) * S + ancestor) * C + c]) : float(history[W - missing]);
+                    sum += value * float(w[int64_t(c) * (W + 1) + W - distance]);
+                }
+                const float y = float(T(sum));
+                qb[((int64_t(p) * B + batch) * C + c) * SLOT + t] = T(y / (1.f + sycl::exp(-y)));
+            }
+            for (int t = 0; t < SLOT; ++t) {
+                pb[current + (int64_t(batch) * SLOT + t) * C + c] = t < S ? x[(int64_t(batch) * S + t) * C + c] : T(0.f);
+                if (t >= S) qb[((int64_t(p) * B + batch) * C + c) * SLOT + t] = T(0.f);
+            }
+        });
+    });
+}
+
+torch::Tensor gdn_delta_port(torch::Tensor x, torch::Tensor wa, torch::Tensor wb, torch::Tensor dt, torch::Tensor gd,
+                             torch::Tensor state, int64_t key_dim, int64_t hk, double scale, torch::Tensor z, torch::Tensor nw,
+                             double eps, torch::Tensor qkv, torch::Tensor gates, torch::Tensor sums, torch::Tensor ctl,
+                             bool at_linear) {
+    const int B = x.size(0), S = x.size(1), HV = state.size(1), C = qkv.size(2), HK = int(hk), KD = HK * D;
+    auto a = at_linear ? at::linear(x, wa) : linear_ab(x, wa);
+    auto bb = at_linear ? at::linear(x, wb) : linear_ab(x, wb);
+    const auto* ap = static_cast<const T*>(a.data_ptr()); const auto* bp = static_cast<const T*>(bb.data_ptr());
+    const auto* qp = static_cast<const T*>(qkv.data_ptr()); const auto* zp = static_cast<const T*>(z.data_ptr());
+    const auto* np = static_cast<const T*>(nw.data_ptr()); const auto* dp = dt.data_ptr<float>(); const auto* gp = gd.data_ptr<float>();
+    auto* gatesp = gates.data_ptr<float>(); auto* sumsp = sums.data_ptr<float>(); auto* sp = state.data_ptr<float>();
+    const auto* control = ctl.data_ptr<int>(); auto output = torch::empty({B, S, HV, D}, x.options());
+    auto* out = static_cast<T*>(output.data_ptr()); const float sc = scale, epsilon = eps;
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    const size_t ng = size_t(B) * SLOT * HV, ns = size_t(B) * SLOT * HK;
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<PGates>(sycl::nd_range<1>((ng + 255) / 256 * 256, 256), [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+            const size_t gid = item.get_global_id(0);
+            if (gid >= ng) return;
+            const int h = gid % HV, t = gid / HV % SLOT, batch = gid / (HV * SLOT), p = control[1];
+            if (p < 0 || p > 1) return;
+            const int64_t dst = ((int64_t(p) * B + batch) * SLOT + t) * HV + h;
+            float decay = 0, beta = 0;
+            if (t < S) {
+                const int64_t src = (int64_t(batch) * S + t) * HV + h;
+                const float av = float(ap[src]) + dp[h], bv = float(bp[src]);
+                const float softplus = av > 20.f ? av : sycl::log(1.f + sycl::exp(av));
+                decay = sycl::exp(gp[h] * softplus); beta = float(T(1.f / (1.f + sycl::exp(-bv))));
+            }
+            gatesp[dst * 2] = decay; gatesp[dst * 2 + 1] = beta;
+        });
+    });
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<PSums>(sycl::nd_range<1>((ns + 255) / 256 * 256, 256), [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+            const size_t gid = item.get_global_id(0);
+            if (gid >= ns) return;
+            const int h = gid % HK, t = gid / HK % SLOT, batch = gid / (HK * SLOT), p = control[1];
+            if (p < 0 || p > 1) return;
+            float qs = 0, ks = 0;
+            if (t < S) for (int d = 0; d < D; ++d) {
+                const int64_t base = (int64_t(p) * B + batch) * C * SLOT + (h * D + d) * SLOT + t;
+                const float q = float(qp[base]), k = float(qp[base + KD * SLOT]); qs += q * q; ks += k * k;
+            }
+            const int64_t dst = ((int64_t(p) * B + batch) * SLOT + t) * HK + h;
+            sumsp[dst * 2] = qs; sumsp[dst * 2 + 1] = ks;
+        });
+    });
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 2> qk(sycl::range<2>(2, D), cgh), red(sycl::range<2>(RG, D), cgh);
+        sycl::local_accessor<float, 1> square(D, cgh);
+        cgh.parallel_for<PDelta>(sycl::nd_range<1>(size_t(B) * HV * RG * D, RG * D),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+#pragma clang fp reassociate(off) contract(off)
+                const int head = it.get_group(0) % HV, batch = it.get_group(0) / HV;
+                const int col = it.get_local_id(0) % D, rg = it.get_local_id(0) / D, kh = head / (HV / HK);
+                const int p = control[1], pending = control[0];
+                if (p < 0 || p > 1 || pending < 0 || pending > SLOT) return;
+                const int64_t base = ((int64_t(batch) * HV + head) * D + rg * RPG) * D + col;
+                float st[RPG]; for (int r = 0; r < RPG; ++r) st[r] = sp[base + r * D];
+                for (int phase = 0; phase < 2; ++phase) {
+                    const int parity = phase ? p : 1 - p, count = phase ? S : pending;
+                    for (int entry = 0; entry < count; ++entry) {
+                        const int instruction = phase ? control[2 + 2 * SLOT + entry] : 0;
+                        const int t = phase ? (instruction & 15) : control[2 + entry];
+                        const bool commit = !phase || (instruction & 32);
+                        if (t < 0 || t >= SLOT || (phase && t >= S)) return;
+                        float saved[RPG];
+                        for (int r = 0; r < RPG; ++r) saved[r] = st[r];
+                        const int64_t qbbase = (int64_t(parity) * B + batch) * C * SLOT;
+                        const int64_t ss = ((int64_t(parity) * B + batch) * SLOT + t) * HK + kh;
+                        if (rg == 0) {
+                            const float qi = 1.f / sycl::fmax(sycl::sqrt(sumsp[ss * 2]), 1e-12f);
+                            const float ki = 1.f / sycl::fmax(sycl::sqrt(sumsp[ss * 2 + 1]), 1e-12f);
+                            // Kitchen ISA: (q * scale) * qi
+                            qk[0][col] = phase ? (float(qp[qbbase + (kh * D + col) * SLOT + t]) * sc) * qi : 0.f;
+                            qk[1][col] = float(qp[qbbase + (KD + kh * D + col) * SLOT + t]) * ki;
+                        }
+                        it.barrier(sycl::access::fence_space::local_space);
+                        const int64_t gate = ((int64_t(parity) * B + batch) * SLOT + t) * HV + head;
+                        const float decay = gatesp[gate * 2], beta = gatesp[gate * 2 + 1];
+                        float memory = 0;
+                        for (int r = 0; r < RPG; ++r) { st[r] = st[r] * decay; memory = sycl::fma(st[r], qk[1][rg * RPG + r], memory); }
+                        red[rg][col] = memory; it.barrier(sycl::access::fence_space::local_space);
+                        const float kv = red[0][col] + red[1][col] + red[2][col] + red[3][col];
+                        const float value = float(qp[qbbase + (2 * KD + head * D + col) * SLOT + t]);
+                        const float delta = (value - kv) * beta; float result = 0;
+                        for (int r = 0; r < RPG; ++r) { st[r] = sycl::fma(qk[1][rg * RPG + r], delta, st[r]); if (phase) result = sycl::fma(st[r], qk[0][rg * RPG + r], result); }
+                        it.barrier(sycl::access::fence_space::local_space);
+                        if (phase) {
+                            red[rg][col] = result; it.barrier(sycl::access::fence_space::local_space);
+                            const float raw = float(T(red[0][col] + red[1][col] + red[2][col] + red[3][col]));
+                            if (rg == 0) square[col] = raw * raw;
+                            it.barrier(sycl::access::fence_space::local_space);
+                            for (int stride = D / 2; stride > 0; stride /= 2) {
+                                if (rg == 0 && col < stride) square[col] += square[col + stride];
+                                it.barrier(sycl::access::fence_space::local_space);
+                            }
+                            if (rg == 0) {
+                                const int64_t dst = ((int64_t(batch) * S + t) * HV + head) * D + col;
+                                // the Kitchen build evaluates raw * rsqrt(..) * w as (raw * w) * rsqrt(..) (fast-math reassociation, ISA-checked)
+                                const float rs = hw_rsqrt(square[0] / D + epsilon);
+                                const float rw = raw * float(np[col]);
+                                const float normed = float(T(rw * rs));
+                                const float zz = float(zp[dst]), gate_z = float(T(zz / (1.f + sycl::exp(-zz))));
+                                out[dst] = T(normed * gate_z);
+                            }
+                        }
+                        if (!commit) for (int r = 0; r < RPG; ++r) st[r] = saved[r];
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+                    if (!phase && pending > 0) for (int r = 0; r < RPG; ++r) sp[base + r * D] = st[r];
+                }
+            });
+    });
+    return output;
+}
+}  // namespace cmdx

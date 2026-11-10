@@ -1,0 +1,462 @@
+// Single-launch Qwen3.5 Gated-DeltaNet decode layer (verify rows S <= 8, batch 1), bit-identical to
+//   x += out_proj(GDN(input_layernorm(x)));  x += mlp(post_attention_layernorm(x))
+// with GDN = Kitchen's deferred conv / gates / sums / replay-verify delta (llm-scaler fd4a584
+// kitchen_deferred.cpp) and in_proj_a/b in oneDNN's small-M BF16 order.
+//
+//   P1  rows    xn = RMSNorm(x); q1 = rot_quant(xn)
+//   P2  all     proj | z = W4(q1) (stream engine);  last WG first: a, b = BF16 linear(xn)
+//   P3  all     deferred conv (one channel per thread) | gates
+//   P4  all     q/k sum of squares
+//   P5  heads   replay + verify delta, gated RMSNorm -> core
+//   P6  rows    q1 = rot_quant(core)
+//   P7  all     x1 = x + out_proj(q1)
+//   P8  rows    q1 = rot_quant(RMSNorm(x1))
+//   P9  all     h = silu(gate) * up
+//   P10 rows    q2 = rot_quant(h)
+//   P11 all     x = x1 + down(q2)
+// The Kitchen arithmetic is ported operation for operation, including what its fast-math build
+// does (ISA-checked): sequential FMAs in the delta recurrences, (q * scale) * qi,
+// (raw * w) * rsqrt, EU math.rsqt.
+#include <cstdint>
+#include <map>
+#include <optional>
+
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include "mono_common.hpp"
+
+namespace cmdx {
+namespace {
+using namespace mono;
+constexpr int SLOT = 8, DH = 128, RG = 4, RPG = DH / RG;
+constexpr int64_t PF_P1 = 192 << 10, PF_O = 320 << 10, PF_G = 320 << 10, PF_D = 192 << 10;
+
+W4 w4g(const torch::Tensor& q, const torch::Tensor& s, const torch::Tensor& sc, const torch::Tensor& cb) {
+    TORCH_CHECK(q.is_xpu() && q.scalar_type() == at::kChar && q.dim() == 2 && q.is_contiguous(), "packed W4 int8 [N, K/2]");
+    TORCH_CHECK(s.scalar_type() == at::kFloat8_e4m3fn && s.is_contiguous() && s.size(1) * 16 == q.size(1) * 2, "FP8 G16 scales");
+    TORCH_CHECK(sc.scalar_type() == at::kFloat && sc.numel() == q.size(0) && cb.scalar_type() == at::kFloat && cb.numel() == 16, "scales");
+    return W4{q.data_ptr<int8_t>(), reinterpret_cast<const fp8*>(s.data_ptr()), sc.data_ptr<float>(), cb.data_ptr<float>(),
+              q.size(0), q.size(1) * 2};
+}
+
+struct GScratch {
+    torch::Tensor q1, q2, s, xn, proj, z, ab, core, x1, h, cnt, dbg;
+};
+GScratch& gscratch(const torch::Tensor& like) {
+    static std::map<int, GScratch> cache;
+    const int dev = like.get_device();
+    auto found = cache.find(dev);
+    if (found == cache.end()) {
+        auto o = like.options();
+        auto bf = o.dtype(at::kBFloat16);
+        GScratch sc{torch::zeros({8, MAXK}, o.dtype(at::kChar)), torch::zeros({8, MAXK}, o.dtype(at::kChar)),
+                    torch::zeros({32}, o.dtype(at::kFloat)), torch::zeros({8, 4096}, bf), torch::zeros({8, 8192}, bf),
+                    torch::zeros({8, 4096}, bf), torch::zeros({2, 8, 32}, bf), torch::zeros({8, 4096}, bf),
+                    torch::zeros({8, 4096}, bf), torch::zeros({8, MAXK}, bf), torch::zeros({2}, o.dtype(at::kInt)),
+                    torch::zeros({64 * 16}, o.dtype(at::kLong))};
+        found = cache.emplace(dev, sc).first;
+    }
+    return found->second;
+}
+
+class LayerGdnKernel;
+}  // namespace
+
+torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, torch::Tensor hadamard,
+                        std::vector<torch::Tensor> w4, torch::Tensor wa, torch::Tensor wb, torch::Tensor conv_w,
+                        torch::Tensor conv_state, torch::Tensor proj_buf, torch::Tensor qkv_buf, torch::Tensor ctl,
+                        torch::Tensor dt_bias, torch::Tensor g_decay, torch::Tensor rec_state, torch::Tensor gates_buf,
+                        torch::Tensor sums_buf, torch::Tensor gnorm_w, double gnorm_eps, double qscale, int64_t hk,
+                        torch::Tensor norm_post, double eps_post, torch::Tensor silu_lut, int64_t nwg, int64_t stop) {
+    using T = bf16;
+    TORCH_CHECK(x.is_xpu() && x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.size(-1) == 4096, "x bf16 [..., 4096]");
+    const int R = static_cast<int>(x.numel() / 4096);
+    TORCH_CHECK(R >= 1 && R <= SLOT, "1..8 rows");
+    TORCH_CHECK(w4.size() == 24, "W4: qkv, z, out, gate, up, down (q, s, sc, cb each)");
+    const W4 QKV = w4g(w4[0], w4[1], w4[2], w4[3]), Z = w4g(w4[4], w4[5], w4[6], w4[7]), O = w4g(w4[8], w4[9], w4[10], w4[11]);
+    const W4 G = w4g(w4[12], w4[13], w4[14], w4[15]), U = w4g(w4[16], w4[17], w4[18], w4[19]), Dn = w4g(w4[20], w4[21], w4[22], w4[23]);
+    const int HV = static_cast<int>(rec_state.size(1)), HK = static_cast<int>(hk), KD = HK * DH, C = static_cast<int>(QKV.n);
+    const int W = static_cast<int>(conv_state.size(2));
+    TORCH_CHECK(QKV.k == 4096 && Z.k == 4096 && Z.n == HV * DH && O.k == HV * DH && O.n == 4096 && C == 2 * KD + HV * DH, "GDN shapes");
+    TORCH_CHECK(G.k == 4096 && U.n == G.n && Dn.k == G.n && Dn.n == 4096 && G.n <= MAXK && HV * DH == 4096, "MLP shapes");
+    TORCH_CHECK(rec_state.scalar_type() == at::kFloat && rec_state.is_contiguous() && rec_state.size(2) == DH && rec_state.size(3) == DH, "state");
+    TORCH_CHECK(conv_state.scalar_type() == at::kBFloat16 && conv_state.is_contiguous() && conv_state.size(1) == C, "conv state");
+    TORCH_CHECK(conv_w.numel() == int64_t(C) * (W + 1) && conv_w.scalar_type() == at::kBFloat16 && conv_w.is_contiguous(), "conv weight");
+    TORCH_CHECK(wa.scalar_type() == at::kBFloat16 && wa.is_contiguous() && wa.size(0) == HV && wa.size(1) == 4096 && wb.sizes() == wa.sizes(), "w_a/w_b");
+    TORCH_CHECK(HV == 32 && HK > 0 && HV % HK == 0, "32 value heads");
+    TORCH_CHECK(ctl.scalar_type() == at::kInt && ctl.numel() == 2 + 3 * SLOT, "ctl");
+    auto& S = gscratch(x);
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    int64_t cores = queue.get_device().get_info<sycl::info::device::max_compute_units>() / 8;
+    if (nwg <= 0 || nwg > cores) nwg = cores;
+    const uint32_t NW = static_cast<uint32_t>(nwg);
+    TORCH_CHECK(NW * MWG >= uint32_t(C + SLOT * HV), "conv threads");
+    const W4 pre[2] = {QKV, Z}, gu[2] = {G, U};
+    Stream SP = make_stream(pre, 2, false), SO = make_stream(&O, 1, false), SG = make_stream(gu, 2, true), SD = make_stream(&Dn, 1, false);
+    for (Stream* st : {&SP, &SO, &SG, &SD}) {
+        int64_t a0, a1;
+        stream_range(*st, 0, NW, a0, a1);
+        TORCH_CHECK((a1 - a0) * 128 <= ACC, "SLM accumulators");
+        st->ksplit = choose_ksplit(a1 - a0, st->m[0].k);
+    }
+    auto* xp = reinterpret_cast<T*>(x.data_ptr());
+    const auto* nin = reinterpret_cast<const T*>(norm_in.data_ptr());
+    const auto* npost = reinterpret_cast<const T*>(norm_post.data_ptr());
+    const auto* hp = reinterpret_cast<const T*>(hadamard.data_ptr());
+    const auto* lut = reinterpret_cast<const T*>(silu_lut.data_ptr());
+    const auto* wap = reinterpret_cast<const T*>(wa.data_ptr());
+    const auto* wbp = reinterpret_cast<const T*>(wb.data_ptr());
+    const auto* cw = reinterpret_cast<const T*>(conv_w.data_ptr());
+    auto* cst = reinterpret_cast<T*>(conv_state.data_ptr());
+    auto* pb = reinterpret_cast<T*>(proj_buf.data_ptr());
+    auto* qb = reinterpret_cast<T*>(qkv_buf.data_ptr());
+    const int* control = ctl.data_ptr<int>();
+    const float* dp = dt_bias.data_ptr<float>();
+    const float* gdp = g_decay.data_ptr<float>();
+    float* rs = rec_state.data_ptr<float>();
+    float* gatesp = gates_buf.data_ptr<float>();
+    float* sumsp = sums_buf.data_ptr<float>();
+    const auto* gnw = reinterpret_cast<const T*>(gnorm_w.data_ptr());
+    auto* q1p = S.q1.data_ptr<int8_t>();
+    auto* q2p = S.q2.data_ptr<int8_t>();
+    auto* sp = S.s.data_ptr<float>();
+    auto* xnp = reinterpret_cast<T*>(S.xn.data_ptr());
+    auto* projp = reinterpret_cast<T*>(S.proj.data_ptr());
+    auto* zp = reinterpret_cast<T*>(S.z.data_ptr());
+    auto* abp = reinterpret_cast<T*>(S.ab.data_ptr());
+    auto* corep = reinterpret_cast<T*>(S.core.data_ptr());
+    auto* x1p = reinterpret_cast<T*>(S.x1.data_ptr());
+    auto* hb = reinterpret_cast<T*>(S.h.data_ptr());
+    auto* cnt = reinterpret_cast<uint32_t*>(S.cnt.data_ptr());
+    auto* dbg = reinterpret_cast<uint64_t*>(S.dbg.data_ptr());
+    const float e_in = static_cast<float>(eps_in), e_post = static_cast<float>(eps_post);
+    const float sc = static_cast<float>(qscale), epsilon = static_cast<float>(gnorm_eps);
+    const int64_t N1 = G.n;
+    const int ST = static_cast<int>(stop % 100);  // stop: last phase (debug); +200 enables the L2 warm-up
+    // L2 warm-up budgets per work-group (bytes); stop >= 100 disables (experiments)
+    const bool PF_ON = stop >= 200;  // L2 warm-up experiment: blocking prefetch issue cost more than it saved
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<uint32_t, 1> region(TAB / 2, cgh);
+        sycl::local_accessor<float, 1> red(MSG, cgh);
+        sycl::local_accessor<float, 1> nred(1056, cgh);
+        sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
+        sycl::local_accessor<float, 1> cbl(16, cgh);
+        sycl::local_accessor<float, 2> qk(sycl::range<2>(2, DH), cgh), dred(sycl::range<2>(RG, DH), cgh);
+        sycl::local_accessor<float, 1> square(DH, cgh);
+        cgh.parallel_for<LayerGdnKernel>(
+            sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                auto sg = it.get_sub_group();
+                const int t = it.get_local_id(0), lane = sg.get_local_id()[0], sgi = sg.get_group_id()[0];
+                const uint32_t wg = it.get_group(0);
+                const int gid = int(wg) * MWG + t;
+                uint32_t epoch = 0;
+                uint32_t* rraw = region.template get_multi_ptr<sycl::access::decorated::no>().get();
+                const LPtrF xr = lptr(reinterpret_cast<float*>(rraw));
+                const LPtrU16 tab = lptr(reinterpret_cast<uint16_t*>(rraw));
+                auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
+                auto lred = lptr(nred.template get_multi_ptr<sycl::access::decorated::no>().get());
+                if (t < 16) cbl[t] = QKV.cb[t];  // one codebook for every projection (host-checked)
+                const SlmCb cb{cbl, 0};
+                bool tab_ok = false;
+                auto table = [&]() {
+                    if (!tab_ok) { build_pair_table(it, tab, cb); tab_ok = true; }
+                    sycl::group_barrier(it.get_group());
+                };
+                auto gemv = [&](const Stream& st, const int8_t* xq, int64_t& t0, int64_t& t1) {
+                    stream_range(st, wg, NW, t0, t1);
+                    table();
+                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) acc[i] = 0;
+                    sycl::group_barrier(it.get_group());
+                    stream_gemv(it, xq, st, t0, t1, tab, lacc);
+                    sycl::group_barrier(it.get_group());
+                };
+                if (t == 0) dbg[wg * 16] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                const int p = control[1], pending = control[0];
+                const bool ctl_ok = p >= 0 && p <= 1 && pending >= 0 && pending <= SLOT;
+                // ---- P1: xn = RMSNorm(x); q1 = rot_quant(xn) ----
+                if (PF_ON && int(wg) >= R) prefetch_stream(it, SP, wg, NW, PF_P1);
+                for (int r = wg; r < R; r += NW) {
+                    rms_norm_row(it, xp + r * 4096, nin, xnp + r * 4096, e_in, lred);
+                    rot_quant_row(it, xnp + r * 4096, hp, q1p + r * 4096, sp + r, 4096, xr, red);
+                    tab_ok = false;
+                }
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 16 + 1] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- P2: proj, z ----
+                {
+                    int64_t t0, t1;
+                    gemv(SP, q1p, t0, t1);
+                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
+                        const int e2 = i % 128, r = e2 / 16;
+                        if (r >= R) continue;
+                        int tile;
+                        const int m = stream_which(SP, int(t0 + i / 128), tile);
+                        const int64_t n = int64_t(tile) * 16 + e2 % 16;
+                        if (m == 0) projp[r * C + n] = scaleback(acc[i], sp[r], QKV.sc[n]);
+                        else zp[r * 4096 + n] = scaleback(acc[i], sp[r], Z.sc[n]);
+                    }
+                }
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 16 + 2] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- P3: deferred conv (channel = gid) | a, b BF16 linear (last work-group) ----
+                if (ctl_ok && gid < C) {
+                    const int c = gid, n = pending;
+                    const int64_t current = int64_t(p) * SLOT * C, previous = int64_t(1 - p) * SLOT * C;
+                    T* history = cst + int64_t(c) * W;
+                    for (int r = 0; r < W; ++r) {
+                        const int accepted = n + r - W;
+                        const int slot = accepted >= 0 ? control[2 + accepted] : 0;
+                        history[r] = n + r < W ? history[n + r] : pb[previous + int64_t(slot) * C + c];
+                    }
+                    for (int ts = 0; ts < R; ++ts) {
+                        float sum = 0.f;
+                        int ancestor = ts, missing = 0;
+                        for (int distance = 0; distance <= W; ++distance) {
+                            if (distance) {
+                                ancestor = ancestor >= 0 ? control[2 + SLOT + ancestor] : -1;
+                                if (ancestor < 0) ++missing;
+                            }
+                            const float value = ancestor >= 0 ? float(projp[int64_t(ancestor) * C + c]) : float(history[W - missing]);
+                            sum = sycl::fma(value, float(cw[int64_t(c) * (W + 1) + W - distance]), sum);
+                        }
+                        const float y = float(T(sum));
+                        qb[(int64_t(p) * C + c) * SLOT + ts] = T(y / (1.f + sycl::exp(-y)));
+                    }
+                    for (int ts = 0; ts < SLOT; ++ts) {
+                        pb[current + int64_t(ts) * C + c] = ts < R ? projp[int64_t(ts) * C + c] : T(0.f);
+                        if (ts >= R) qb[(int64_t(p) * C + c) * SLOT + ts] = T(0.f);
+                    }
+                }
+                if (wg == NW - 1) {  // a, b in oneDNN order (conv only occupies the first C / 1024 work-groups)
+                    // 4 tiles (a: 2, b: 2) x 16 partial accumulators = 64 sub-groups; partial j sums K32
+                    // chunks j, j + 16, ... in order; the 16 partials are then added sequentially
+                    auto part = lptr(reinterpret_cast<float*>(acc.template get_multi_ptr<sycl::access::decorated::no>().get()));
+                    const int tile = sgi / 16, j = sgi % 16;
+                    const T* w = (tile < 2 ? wap : wbp) + int64_t(tile & 1) * 16 * 4096;
+                    jm::joint_matrix<sycl::sub_group, T, jm::use::a, 8, 16, jm::layout::row_major> a;
+                    jm::joint_matrix<sycl::sub_group, T, jm::use::b, 16, 16, jm::layout::col_major> b;
+                    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> c;
+                    jm::joint_matrix_fill(sg, c, 0.f);
+                    for (int k = j * 32; k < 4096; k += 16 * 32)
+                        for (int h = 0; h < 2; ++h) {
+                            jm::joint_matrix_load(sg, a, gptr(xnp + k + 16 * h), 4096);
+                            jm::joint_matrix_load(sg, b, gptr(w + k + 16 * h), 4096);
+                            jm::joint_matrix_mad(sg, c, a, b, c);
+                        }
+                    int e = 0;
+                    jm::joint_matrix_apply(sg, c, [&](float& v) { part[(tile * 16 + j) * 128 + e * 16 + lane] = v; ++e; });
+                    sycl::group_barrier(it.get_group());
+                    if (t < 4 * 128) {
+                        const int tl = t / 128, el = t % 128, r = el / 16, col = el % 16;
+                        float s = part[(tl * 16) * 128 + el];
+                        for (int q = 1; q < 16; ++q) s = s + part[(tl * 16 + q) * 128 + el];
+                        if (r < R) abp[(tl / 2) * 8 * 32 + r * 32 + (tl & 1) * 16 + col] = static_cast<T>(s);
+                    }
+                    sycl::group_barrier(it.get_group());
+                }
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 16 + 3] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- P5: replay accepted + verify, one value head per work-group (threads 0..511) ----
+                if (PF_ON) { prefetch_stream(it, SO, wg, NW, PF_O); prefetch_stream(it, SG, wg, NW, PF_G); }
+#ifndef GDN_NO_DELTA
+                for (int head = wg; head < HV && ctl_ok; head += NW) {
+                    const int kh = head / (HV / HK);
+                    // prologue: this head's gates and its key head's q/k sums of squares for parity p
+                    // (Kitchen gates / sums kernels; the two heads of a key head write identical sums)
+                    if (t < SLOT) {
+                        const int ts = t;
+                        const int64_t dst = (int64_t(p) * SLOT + ts) * HV + head;
+                        float decay = 0, beta = 0;
+                        if (ts < R) {
+                            const float av = float(abp[ts * 32 + head]) + dp[head], bv = float(abp[8 * 32 + ts * 32 + head]);
+                            const float softplus = av > 20.f ? av : sycl::log(1.f + sycl::exp(av));
+                            decay = sycl::exp(gdp[head] * softplus);
+                            beta = float(T(1.f / (1.f + sycl::exp(-bv))));
+                        }
+                        gatesp[dst * 2] = decay;
+                        gatesp[dst * 2 + 1] = beta;
+                    }
+                    {
+                        auto vals = lptr(reinterpret_cast<float*>(acc.template get_multi_ptr<sycl::access::decorated::no>().get()));
+                        for (int i = t; i < 2 * SLOT * DH; i += MWG) {  // [q|k][ts][d]
+                            const int which = i / (SLOT * DH), ts = (i / DH) % SLOT, d = i % DH;
+                            const int64_t src = int64_t(p) * C * SLOT + (int64_t(which) * KD + kh * DH + d) * SLOT + ts;
+                            vals[i] = ts < R ? float(qb[src]) : 0.f;
+                        }
+                        sycl::group_barrier(it.get_group());
+                        if (t < 2 * SLOT) {
+                            const int which = t / SLOT, ts = t % SLOT;
+                            float acc2 = 0;
+                            if (ts < R)
+                                for (int d = 0; d < DH; ++d) {
+                                    const float v = vals[(which * SLOT + ts) * DH + d];
+                                    acc2 = sycl::fma(v, v, acc2);
+                                }
+                            sumsp[((int64_t(p) * SLOT + ts) * HK + kh) * 2 + which] = acc2;
+                        }
+                        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group);
+                        sycl::group_barrier(it.get_group());
+                    }
+                    {
+#pragma clang fp reassociate(off) contract(off)
+                    const bool act = t < RG * DH;
+                    const int col = t % DH, rg = (t / DH) % RG;
+                    const int64_t base = (int64_t(head) * DH + rg * RPG) * DH + col;
+                    float st[RPG];
+                    for (int r = 0; r < RPG; ++r) st[r] = act ? rs[base + r * DH] : 0.f;
+                    bool abort = false;
+                    for (int phase = 0; phase < 2 && !abort; ++phase) {
+                        const int parity = phase ? p : 1 - p, count = phase ? R : pending;
+                        for (int entry = 0; entry < count; ++entry) {
+                            const int instruction = phase ? control[2 + 2 * SLOT + entry] : 0;
+                            const int ts = phase ? (instruction & 15) : control[2 + entry];
+                            const bool commit = !phase || (instruction & 32);
+                            if (ts < 0 || ts >= SLOT || (phase && ts >= R)) { abort = true; break; }
+                            // the pre-entry state of a non-committing entry lives in SLM (the table region),
+                            // not in registers: 32 more live registers slowed every GEMV phase by ~10%
+                            if (act && !commit)
+                                for (int r = 0; r < RPG; ++r) xr[r * (RG * DH) + t] = st[r];
+                            const int64_t qbbase = int64_t(parity) * C * SLOT;
+                            const int64_t ss = (int64_t(parity) * SLOT + ts) * HK + kh;
+                            if (act && rg == 0) {
+                                const float qi = 1.f / sycl::fmax(sycl::sqrt(sumsp[ss * 2]), 1e-12f);
+                                const float ki = 1.f / sycl::fmax(sycl::sqrt(sumsp[ss * 2 + 1]), 1e-12f);
+                                qk[0][col] = phase ? (float(qb[qbbase + (kh * DH + col) * SLOT + ts]) * sc) * qi : 0.f;
+                                qk[1][col] = float(qb[qbbase + (KD + kh * DH + col) * SLOT + ts]) * ki;
+                            }
+                            sycl::group_barrier(it.get_group());
+                            const int64_t gate = (int64_t(parity) * SLOT + ts) * HV + head;
+                            const float decay = gatesp[gate * 2], beta = gatesp[gate * 2 + 1];
+                            float memory = 0;
+                            if (act)
+                                for (int r = 0; r < RPG; ++r) { st[r] = st[r] * decay; memory = sycl::fma(st[r], qk[1][rg * RPG + r], memory); }
+                            if (act) dred[rg][col] = memory;
+                            sycl::group_barrier(it.get_group());
+                            float result = 0;
+                            if (act) {
+                                const float kv = dred[0][col] + dred[1][col] + dred[2][col] + dred[3][col];
+                                const float value = float(qb[qbbase + (2 * KD + head * DH + col) * SLOT + ts]);
+                                const float delta = (value - kv) * beta;
+                                for (int r = 0; r < RPG; ++r) {
+                                    st[r] = sycl::fma(qk[1][rg * RPG + r], delta, st[r]);
+                                    if (phase) result = sycl::fma(st[r], qk[0][rg * RPG + r], result);
+                                }
+                            }
+                            sycl::group_barrier(it.get_group());
+                            if (phase) {
+                                if (act) dred[rg][col] = result;
+                                sycl::group_barrier(it.get_group());
+                                const float raw = act ? float(T(dred[0][col] + dred[1][col] + dred[2][col] + dred[3][col])) : 0.f;
+                                if (act && rg == 0) square[col] = raw * raw;
+                                sycl::group_barrier(it.get_group());
+                                for (int stride = DH / 2; stride > 0; stride /= 2) {
+                                    if (act && rg == 0 && col < stride) square[col] = square[col] + square[col + stride];
+                                    sycl::group_barrier(it.get_group());
+                                }
+                                if (act && rg == 0) {
+                                    const int64_t dst = (int64_t(ts) * HV + head) * DH + col;
+                                    const float rsq = hw_rsqrt(square[0] / DH + epsilon);
+                                    const float rw = raw * float(gnw[col]);
+                                    const float normed = float(T(rw * rsq));
+                                    const float zz = float(zp[dst]), gate_z = float(T(zz / (1.f + sycl::exp(-zz))));
+                                    corep[dst] = T(normed * gate_z);
+                                }
+                            }
+                            if (act && !commit) for (int r = 0; r < RPG; ++r) st[r] = xr[r * (RG * DH) + t];
+                            sycl::group_barrier(it.get_group());
+                        }
+                        if (!abort && !phase && pending > 0 && act)
+                            for (int r = 0; r < RPG; ++r) rs[base + r * DH] = st[r];
+                    }
+                    }
+                    tab_ok = false;
+                }
+#endif
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 16 + 5] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- P6: q1 = rot_quant(core) ----
+                if (ST >= 6)
+                    for (int r = wg; r < R; r += NW) {
+                        rot_quant_row(it, corep + r * 4096, hp, q1p + r * 4096, sp + r, 4096, xr, red);
+                        tab_ok = false;
+                    }
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 16 + 6] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- P7: x1 = x + out_proj(q1) ----
+                if (ST >= 7) {
+                    int64_t t0, t1;
+                    gemv(SO, q1p, t0, t1);
+                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
+                        const int e2 = i % 128, r = e2 / 16;
+                        if (r >= R) continue;
+                        const int64_t n = (t0 + i / 128) * 16 + e2 % 16;
+                        x1p[r * 4096 + n] = bf16_add(xp[r * 4096 + n], scaleback(acc[i], sp[r], O.sc[n]));
+                    }
+                }
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 16 + 7] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- P8: q1 = rot_quant(RMSNorm(x1)) ----
+                if (ST >= 8)
+                    for (int r = wg; r < R; r += NW) {
+                        rms_norm_row(it, x1p + r * 4096, npost, xnp + r * 4096, e_post, lred);
+                        rot_quant_row(it, xnp + r * 4096, hp, q1p + r * 4096, sp + 8 + r, 4096, xr, red);
+                        tab_ok = false;
+                    }
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 16 + 8] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- P9: h = silu(gate) * up ----
+                if (ST >= 9) {
+                    int64_t t0, t1;
+                    gemv(SG, q1p, t0, t1);
+                    for (int64_t i = t; i < (t1 - t0) / 2 * 128; i += MWG) {
+                        const int64_t tl = i / 128;
+                        const int e2 = i % 128, r = e2 / 16;
+                        if (r >= R) continue;
+                        const int64_t n = (t0 / 2 + tl) * 16 + e2 % 16;
+                        const T g = scaleback(acc[(2 * tl) * 128 + e2], sp[8 + r], G.sc[n]);
+                        const T u = scaleback(acc[(2 * tl + 1) * 128 + e2], sp[8 + r], U.sc[n]);
+                        hb[r * N1 + n] = bf16_mul(lut[sycl::bit_cast<uint16_t>(g)], u);
+                    }
+                }
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 16 + 9] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- P10: q2 = rot_quant(h) ----
+                if (PF_ON && int(wg) >= R) prefetch_stream(it, SD, wg, NW, PF_D);
+                if (ST >= 10)
+                    for (int r = wg; r < R; r += NW) {
+                        rot_quant_row(it, hb + r * N1, hp, q2p + r * N1, sp + 16 + r, N1, xr, red);
+                        tab_ok = false;
+                    }
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 16 + 10] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- P11: x = x1 + down(q2) ----
+                if (ST >= 11) {
+                    int64_t t0, t1;
+                    gemv(SD, q2p, t0, t1);
+                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
+                        const int e2 = i % 128, r = e2 / 16;
+                        if (r >= R) continue;
+                        const int64_t n = (t0 + i / 128) * 16 + e2 % 16;
+                        xp[r * 4096 + n] = bf16_add(x1p[r * 4096 + n], scaleback(acc[i], sp[16 + r], Dn.sc[n]));
+                    }
+                }
+                // barrier counter self-reset
+                sycl::group_barrier(it.get_group());
+                if (t == 0) dbg[wg * 16 + 11] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                if (t == 0) {
+                    sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                     sycl::access::address_space::global_space> done(cnt[1]), c0(cnt[0]);
+                    if (done.fetch_add(1u) == NW - 1) { c0.store(0u); done.store(0u); }
+                }
+            });
+    });
+    return x;
+}
+
+// debug views of the GDN scratch (proj, z, a/b, core) for tests
+std::vector<torch::Tensor> layer_gdn_scratch(torch::Tensor like) {
+    auto& S = gscratch(like);
+    return {S.xn, S.proj, S.z, S.ab, S.core, S.x1, S.dbg};
+}
+}  // namespace cmdx

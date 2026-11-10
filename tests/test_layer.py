@@ -10,9 +10,9 @@ dev = torch.device("xpu")
 H = _build_hadamard(256, device=dev, dtype=torch.bfloat16).contiguous()
 allbf = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).to(dev)
 SILU = F.silu(allbf).contiguous(); SIG = torch.sigmoid(allbf).contiguous()
+from comfy_mono_decode_xpu import mono as _mono
 def wp(lin):
-    w = lin.weight; p = w._params
-    return [w._qdata.contiguous(), p.scale.contiguous(), p.s_channel.float().contiguous(), p.codebook.float().contiguous()]
+    return _mono._w4(lin)
 g = torch.Generator(device="cpu").manual_seed(7)
 def xs(R, kind, scale=1.0):
     x = torch.randn(R, 4096, generator=g) * scale

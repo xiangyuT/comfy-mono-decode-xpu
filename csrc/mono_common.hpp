@@ -7,6 +7,7 @@
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/experimental/clock.hpp>
+#include <sycl/ext/oneapi/experimental/prefetch.hpp>
 
 namespace cmdx {
 namespace mono {
@@ -18,9 +19,14 @@ constexpr int MSG = MWG / 16;
 constexpr int GS = 256;                  // ConvRot group
 constexpr int MAXK = 12288;
 
+// W4 layout used by the persistent kernels ("tile-major", repacked once per linear on the host):
+//   q: [N/16][K/32][16 lanes][16 B]  = qdata.view(N/16, 16, K/32, 16).permute(0, 2, 1, 3)
+//   s: [N/16][K/256][16 lanes][16 B] = s_rel.view(N/16, 16, K/256, 16).permute(0, 2, 1, 3)
+// so every K32 step of a 16-column tile is one contiguous 256 B block (row-major rows were 16
+// separate 16 B pieces 2-6 KB apart: 14-34% lower single-kernel bandwidth).
 struct W4 {
-    const int8_t* q;      // [N, K/2] packed nibbles
-    const fp8* s;         // [N, K/16] relative group scales
+    const int8_t* q;      // tile-major packed nibbles (N * K/2 bytes)
+    const fp8* s;         // tile-major relative group scales (N * K/16 bytes)
     const float* sc;      // [N] channel scales
     const float* cb;      // [16] codebook
     int64_t n, k;
@@ -158,26 +164,27 @@ inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st
     const int total = mine * steps;
     const int8_t* q0 = st.m[0].q; const int8_t* q1 = st.m[1].q; const int8_t* q2 = st.m[2].q;
     const fp8* s0 = st.m[0].s; const fp8* s1 = st.m[1].s; const fp8* s2 = st.m[2].s;
-    auto col_of = [&](int u, int& which) {
+    // tile-major weights (see the W4 layout note): a sub-group's K32 step is one contiguous 256 B block
+    auto tile_of = [&](int u, int& which) {
         int tile;
         which = stream_which(st, t0 + (u >> kl2), tile);
-        return int64_t(tile * 16 + lane);
+        return int64_t(tile);
     };
     auto wptr = [&](int lu, int ls) {
         const int u = sgi + lu * MSG;
         int which;
-        const int64_t col = col_of(u, which);
+        const int64_t tile = tile_of(u, which);
         const int kk = (u & kmask) * klen + ls * 32;
         const int8_t* q = which == 0 ? q0 : (which == 1 ? q1 : q2);
-        return reinterpret_cast<const uint32_t*>(q + col * (K / 2) + kk / 2);
+        return reinterpret_cast<const uint32_t*>(q + ((tile * (K / 32) + kk / 32) * 16 + lane) * 16);
     };
     auto sptr = [&](int su, int sb) {  // 16 B = scale pairs of one block (8 steps)
         const int u = sgi + su * MSG;
         int which;
-        const int64_t col = col_of(u, which);
+        const int64_t tile = tile_of(u, which);
         const int kk = (u & kmask) * klen + sb * 256;
         const fp8* s = which == 0 ? s0 : (which == 1 ? s1 : s2);
-        return reinterpret_cast<const uint32_t*>(s + col * (K / 16) + kk / 16);
+        return reinterpret_cast<const uint32_t*>(s + ((tile * (K / 256) + kk / 256) * 16 + lane) * 16);
     };
     constexpr int PF = 4;
     sycl::vec<uint32_t, 4> ring[PF], scur, snxt;
@@ -237,6 +244,30 @@ inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st
                 jm::joint_matrix_fill(sg, c, 0);
             }
         }
+    }
+}
+
+// Warm the L2 with the first `budget` bytes of this work-group's share of a coming GEMV phase, so
+// phases that leave the memory system idle (row-wise rot_quant, the GDN core) overlap the next
+// phase's weight stream. Tiles are prefetched in the order the engine will consume them.
+inline void prefetch_stream(sycl::nd_item<1>& it, const Stream& st, uint32_t wg, uint32_t nw, int64_t budget) {
+    namespace syclex = sycl::ext::oneapi::experimental;
+    int64_t t0, t1;
+    stream_range(st, wg, nw, t0, t1);
+    const int t = it.get_local_id(0);
+    const int64_t K = st.m[0].k, wbytes = 16 * K / 2, sbytes = 16 * K / 16;
+    int64_t used = 0;
+    for (int64_t g = t0; g < t1 && used < budget; ++g, used += wbytes + sbytes) {
+        int tile;
+        const int m = stream_which(st, int(g), tile);
+        const int8_t* q = m == 0 ? st.m[0].q : (m == 1 ? st.m[1].q : st.m[2].q);
+        const fp8* s = m == 0 ? st.m[0].s : (m == 1 ? st.m[1].s : st.m[2].s);
+        char* wp = const_cast<char*>(reinterpret_cast<const char*>(q + int64_t(tile) * 16 * (K / 2)));
+        char* sp = const_cast<char*>(reinterpret_cast<const char*>(s + int64_t(tile) * 16 * (K / 16)));
+        for (int64_t off = int64_t(t) * 64; off < wbytes; off += int64_t(MWG) * 64)
+            syclex::prefetch(wp + off, syclex::properties{syclex::prefetch_hint_L2});
+        for (int64_t off = int64_t(t) * 64; off < sbytes; off += int64_t(MWG) * 64)
+            syclex::prefetch(sp + off, syclex::properties{syclex::prefetch_hint_L2});
     }
 }
 

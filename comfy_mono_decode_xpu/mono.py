@@ -56,10 +56,21 @@ def _w4(lin):
     cache = getattr(lin, "_cmdx_w4", None)
     if cache is None or cache[0] is not q:
         # the kernel's pair table covers FP8 scale bytes 0x00-0x7F (non-negative scales)
-        ok = int(p.scale.view(torch.uint8).max()) < 128
-        cache = (q, [q, p.scale, p.s_channel.float().contiguous(), p.codebook.float().contiguous()] if ok else None)
+        n, k2 = q.shape
+        ok = int(p.scale.view(torch.uint8).max()) < 128 and n % 16 == 0 and (2 * k2) % 256 == 0
+        parts = None
+        if ok:
+            parts = [tile_major(q, 16), tile_major(p.scale.view(torch.uint8), 16).view(torch.float8_e4m3fn),
+                     p.s_channel.float().contiguous(), p.codebook.float().contiguous()]
+        cache = (q, parts)
         lin._cmdx_w4 = cache
     return cache[1]
+
+
+def tile_major(t, block):
+    """[N, B] bytes -> [N/16][B/block][16][block] (the persistent kernels' W4 layout), kept as [N, B]."""
+    n, b = t.shape
+    return t.view(n // 16, 16, b // block, block).permute(0, 2, 1, 3).contiguous().view(n, b)
 
 
 def install():

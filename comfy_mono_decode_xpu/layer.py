@@ -22,11 +22,12 @@ CLAIM = "__comfy_mono_decode_xpu_layer__"
 _stats = {"layer": 0, "fallback": {}}
 _lock = threading.Lock()
 _consts = {}
+_single_gdn = __import__("os").environ.get("CMDX_GDN1", "1") == "1"
 
 
 def stats():
     with _lock:
-        return {"layer": _stats["layer"], "fallback": dict(_stats["fallback"])}
+        return {"layer": _stats["layer"], "gdn1": _stats.get("gdn1", 0), "fallback": dict(_stats["fallback"])}
 
 
 def _fallback(why):
@@ -89,8 +90,25 @@ def _build_plan(block):
         return None
     if not gdn and mix.num_heads * mix.head_dim != 4096:
         return None
+    extra = None
+    if gdn:
+        from comfy_kitchen.tensor import QuantizedTensor
+        ws = []
+        for lin in (mix.in_proj_a, mix.in_proj_b):
+            w = lin.weight
+            if getattr(lin, "weight_function", None) or getattr(lin, "bias", None) is not None or w.device.type != "xpu":
+                return None
+            w = w.dequantize() if isinstance(w, QuantizedTensor) else w
+            if w.dtype != torch.bfloat16 or tuple(w.shape) != (mix.num_value_heads, 4096):
+                return None
+            ws.append(w.contiguous())
+        cw = mix.conv1d.weight
+        if cw.device.type != "xpu" or cw.dtype != torch.bfloat16 or mix.conv1d.bias is not None or getattr(mix.conv1d, "weight_function", None):
+            return None
+        extra = {"wa": ws[0], "wb": ws[1], "conv_w": cw.contiguous()}
     return {
         "gdn": gdn,
+        "extra": extra,
         "pre": sum(parts[:len(pre)], []),
         "out": parts[len(pre)],
         "mlp": sum(parts[len(pre) + 1:], []),
@@ -175,6 +193,18 @@ def install():
             return original(self, x, attention_mask, freqs_cis, optimized_attention, past_key_value)
         h, silu, sig = _constants(x.device)
         x2 = x.view(S, 4096)
+        if gdn and _single_gdn:
+            # the whole GDN block in one launch
+            mix, kv, ex = self.linear_attn, past_key_value, plan["extra"]
+            (nin, ein), (npo, epo) = plan["norm_in"], plan["norm_post"]
+            _C.layer_gdn(x2, nin, ein, h, plan["pre"] + plan["out"] + plan["mlp"], ex["wa"], ex["wb"], ex["conv_w"],
+                         kv.conv_state, kv.proj_buf, kv.qkv_buf, kv.ctl, kv.dt_bias, kv.g_decay, kv.recurrent_state,
+                         kv.gates_buf, kv.sumsq_buf, kv.norm_weight, mix.norm.eps, mix.key_head_dim ** -0.5,
+                         mix.num_key_heads, npo, epo, silu, 0, 11)
+            with _lock:
+                _stats["layer"] += 1
+                _stats["gdn1"] = _stats.get("gdn1", 0) + 1
+            return x, past_key_value
         nw, eps = plan["norm_in"]
         outs = _C.layer_pre(x2, nw, eps, h, plan["pre"], 0)
         gate = None
