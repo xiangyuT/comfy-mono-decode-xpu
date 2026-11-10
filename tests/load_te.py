@@ -4,6 +4,10 @@ def load():
     sys.argv = ["main.py", "--gpu-only", "--disable-dynamic-vram", "--extra-model-paths-config", "/artifacts/scripts/model-paths.yaml"]
     sys.path.insert(0, "/llm/ComfyUI"); os.chdir("/llm/ComfyUI")
     import comfy.options; comfy.options.enable_args_parsing()
+    import importlib.util  # OmniXPU prestartup registers the Kitchen XPU backend before comfy imports
+    pre = "/llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU/prestartup_script.py"
+    spec = importlib.util.spec_from_file_location("omnixpu_prestartup", pre)
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
     import utils.extra_config
     utils.extra_config.load_extra_path_config("/artifacts/scripts/model-paths.yaml")
     import nodes

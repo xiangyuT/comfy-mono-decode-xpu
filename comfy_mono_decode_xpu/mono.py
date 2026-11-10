@@ -55,7 +55,9 @@ def _w4(lin):
         return None
     cache = getattr(lin, "_cmdx_w4", None)
     if cache is None or cache[0] is not q:
-        cache = (q, [q, p.scale, p.s_channel.float().contiguous(), p.codebook.float().contiguous()])
+        # the kernel's pair table covers FP8 scale bytes 0x00-0x7F (non-negative scales)
+        ok = int(p.scale.view(torch.uint8).max()) < 128
+        cache = (q, [q, p.scale, p.s_channel.float().contiguous(), p.codebook.float().contiguous()] if ok else None)
         lin._cmdx_w4 = cache
     return cache[1]
 
@@ -79,6 +81,12 @@ def install():
         if any(p is None for p in parts):
             self._cmdx_skip = True
             _fallback("weights")
+            return original(self, x, norm=norm)
+        key = tuple(p[0].data_ptr() for p in parts)
+        if getattr(self, "_cmdx_cb_ok", (None,))[0] != key:  # one shared codebook (checked once per weights)
+            self._cmdx_cb_ok = (key, torch.equal(parts[0][3], parts[1][3]) and torch.equal(parts[0][3], parts[2][3]))
+        if not self._cmdx_cb_ok[1]:
+            _fallback("codebook")
             return original(self, x, norm=norm)
         h, lut = _constants(x.device)
         xn = norm(x)
