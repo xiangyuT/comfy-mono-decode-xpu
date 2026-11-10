@@ -1,0 +1,397 @@
+// Persistent single-launch MLP block for Qwen3.5 W4A8 decode (rows <= 8).
+//
+//   q1, s1 = rot_quant(xn)                       phase 1   (one work-group per row)
+//   h      = bf16(silu(gate(q1)) * up(q1))       phase 2   (16-column tiles, K split over sub-groups)
+//   q2, s2 = rot_quant(h)                        phase 3
+//   out    = down(q2)                            phase 4
+//
+// Every phase reproduces the eager kernels bit for bit: ConvRot rotation by in-order BF16 DPAS,
+// packed W4 decode onto the INT8 grid with a modular INT32 dot, FP32 scale-back then one BF16
+// cast, and SiLU through a 65536-entry table produced by torch's own F.silu. Phases are separated
+// by a device-wide barrier; the launch must keep every work-group resident (nwg <= resident WGs).
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <tuple>
+
+#include <c10/util/Float8_e4m3fn.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/experimental/clock.hpp>
+#include <torch/extension.h>
+
+namespace cmdx {
+namespace {
+using bf16 = sycl::ext::oneapi::bfloat16;
+using fp8 = c10::Float8_e4m3fn;
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+constexpr int MWG = 1024;                // threads per work-group (64 sub-groups: all hardware threads of an Xe core)
+constexpr int MSG = MWG / 16;
+constexpr int GS = 256;                  // ConvRot group
+constexpr int MAXK = 12288;
+
+struct W4 {
+    const int8_t* q;      // [N, K/2] packed nibbles
+    const fp8* s;         // [N, K/16] relative group scales
+    const float* sc;      // [N] channel scales
+    const float* cb;      // [16] codebook
+    int64_t n, k;
+};
+
+template <typename T>
+inline auto gptr(T* p) {
+    return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p);
+}
+
+inline void grid_sync(sycl::nd_item<1>& it, uint32_t* counter, uint32_t nwg, uint32_t& epoch) {
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+    sycl::group_barrier(it.get_group());
+    if (it.get_local_id(0) == 0) {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space>
+            a(*counter);
+        const uint32_t target = (++epoch) * nwg;
+        a.fetch_add(1u);
+        // poll with an atomic RMW: a plain atomic load can be served stale and never observe
+        // the other work-groups' arrivals on Xe2 (measured hang); RMW polling costs ~0.4 us/barrier
+        while (a.fetch_add(0u) < target) {
+        }
+    } else {
+        ++epoch;
+    }
+    sycl::group_barrier(it.get_group());
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+}
+
+// exact general packed-W4 decode of 4 codes onto the INT8 grid (see w4a8_decode.sycl)
+template <typename CB>
+inline int32_t dec4(uint32_t word, int shift, const CB& cb, float scale) {
+    uint32_t packed = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float r = sycl::rint(cb[(word >> (4 * (shift + i))) & 15] * scale);
+        const int32_t q = sycl::isnan(r) ? 0 : static_cast<int32_t>(sycl::clamp(r, -127.f, 127.f));
+        packed |= (static_cast<uint32_t>(q) & 0xFFu) << (8 * i);
+    }
+    return static_cast<int32_t>(packed);
+}
+
+// Sub-group tile kernel: a sub-group owns 16 output columns (one per lane) and the K32 chunks
+// split*32, split*32 + nsplit*32, ... (the standalone Split-N layout: the nsplit sub-groups of a
+// tile read adjacent 16-byte packets of every column row together). PF packets stay in flight.
+template <int NM, typename CB, typename APTR>
+inline void w4_tiles(sycl::sub_group sg, APTR xq, const W4* const* ws, int64_t col0, int split,
+                     int nsplit, const CB* cbs,
+                     jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 16>& c0,
+                     jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 16>& c1) {
+    const int lane = sg.get_local_id()[0];
+    const W4& w0 = *ws[0];
+    const int64_t col = sycl::min<int64_t>(col0 + lane, w0.n - 1);
+    const int8_t* rows[NM];
+    const fp8* srows[NM];
+#pragma unroll
+    for (int m = 0; m < NM; ++m) {
+        rows[m] = ws[m]->q + col * (w0.k / 2);
+        srows[m] = ws[m]->s + col * (w0.k / 16);
+    }
+    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> a;
+    jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16, jm::layout::ext_intel_packed> b;
+    constexpr int PF = 2;
+    const int64_t step = int64_t(nsplit) * 32, kbeg = int64_t(split) * 32;
+    sycl::vec<uint32_t, 4> ring[NM][PF];
+    uint16_t sring[NM][PF];
+#pragma unroll
+    for (int p = 0; p < PF; ++p)
+#pragma unroll
+        for (int m = 0; m < NM; ++m) {
+            const int64_t kp = kbeg + p * step;
+            if (kp < w0.k) {
+                ring[m][p].load(0, gptr(reinterpret_cast<const uint32_t*>(rows[m] + kp / 2)));
+                sring[m][p] = *reinterpret_cast<const uint16_t*>(srows[m] + kp / 16);
+            }
+        }
+    int slot = 0;
+    for (int64_t k = kbeg; k < w0.k; k += step) {
+        sycl::vec<uint32_t, 4> pk[NM];
+        uint16_t sc[NM];
+        const int64_t kn = k + PF * step;
+#pragma unroll
+        for (int m = 0; m < NM; ++m) {
+            pk[m] = ring[m][slot];
+            sc[m] = sring[m][slot];
+            if (kn < w0.k) {
+                ring[m][slot].load(0, gptr(reinterpret_cast<const uint32_t*>(rows[m] + kn / 2)));
+                sring[m][slot] = *reinterpret_cast<const uint16_t*>(srows[m] + kn / 16);
+            }
+        }
+        slot = slot + 1 == PF ? 0 : slot + 1;
+        jm::joint_matrix_load(sg, a, xq + k, w0.k);
+#pragma unroll
+        for (int m = 0; m < NM; ++m) {
+            const float sa = static_cast<float>(sycl::bit_cast<fp8>(uint8_t(sc[m] & 0xFF)));
+            const float sb = static_cast<float>(sycl::bit_cast<fp8>(uint8_t(sc[m] >> 8)));
+            int32_t d[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) d[j] = dec4(pk[m][j / 2], (j & 1) * 4, cbs[m], j < 4 ? sa : sb);
+            int e = 0;
+            jm::joint_matrix_apply(sg, b, [&](int8_t& v) {
+                const int i = e++;
+                v = static_cast<int8_t>((d[i >> 2] >> (8 * (i & 3))) & 0xFF);
+            });
+            if (m == 0) jm::joint_matrix_mad(sg, c0, a, b, c0);
+            else jm::joint_matrix_mad(sg, c1, a, b, c1);
+        }
+    }
+}
+
+// rot_quant of one row (see act_prep.sycl), done by one work-group into q[row], s[row]
+template <typename XR, typename RED>
+inline void rot_quant_row(sycl::nd_item<1>& it, const bf16* x, const bf16* h, int8_t* q, float* s, int64_t K,
+                          XR& xr, RED& red) {
+    auto sg = it.get_sub_group();
+    const int t = it.get_local_id(0), sgi = sg.get_group_id()[0];
+    const int64_t tiles = (K / GS / 8) * (GS / 16);
+    for (int64_t tile = sgi; tile < tiles; tile += MSG) {
+        const int64_t gb = tile / (GS / 16);
+        const int cb = tile % (GS / 16);
+        jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a;
+        jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::row_major> b;
+        jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> c;
+        jm::joint_matrix_fill(sg, c, 0.f);
+        for (int k = 0; k < GS; k += 16) {
+            jm::joint_matrix_load(sg, a, gptr(x + gb * 8 * GS + k), GS);
+            jm::joint_matrix_load(sg, b, gptr(h + k * GS + cb * 16), GS);
+            jm::joint_matrix_mad(sg, c, a, b, c);
+        }
+        jm::joint_matrix_store(
+            sg, c,
+            sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                xr.template get_multi_ptr<sycl::access::decorated::no>().get() + gb * 8 * GS + cb * 16),
+            GS, jm::layout::row_major);
+    }
+    sycl::group_barrier(it.get_group());
+    float amax = 0.f;
+    for (int64_t i = t; i < K; i += MWG) {
+        const float v = static_cast<float>(static_cast<bf16>(xr[i]));
+        xr[i] = v;
+        amax = sycl::fmax(amax, sycl::fabs(v));
+    }
+    const float m = sycl::reduce_over_group(sg, amax, sycl::maximum<float>());
+    if (sg.get_local_id()[0] == 0) red[sgi] = m;
+    sycl::group_barrier(it.get_group());
+    float rmax = 0.f;
+#pragma unroll
+    for (int i = 0; i < MSG; ++i) rmax = sycl::fmax(rmax, red[i]);
+    const float sv = sycl::fmax(rmax / 127.0f, 1e-30f);
+    if (t == 0) *s = sv;
+    bf16 sb = static_cast<bf16>(sv);
+    if (static_cast<float>(sb) == 0.f) sb = sycl::bit_cast<bf16>(uint16_t(0x0080));
+    const float sbf = static_cast<float>(sb);
+    for (int64_t i = t; i < K; i += MWG) {
+        const float d = static_cast<float>(static_cast<bf16>(xr[i] / sbf));
+        q[i] = static_cast<int8_t>(sycl::clamp(sycl::rint(d), -128.f, 127.f));
+    }
+    sycl::group_barrier(it.get_group());
+}
+
+// codebook in SLM addressed through the accessor (local address space): a generic pointer
+// makes every lookup an address-space-resolved access, which was the decode bottleneck
+struct SlmCb {
+    sycl::local_accessor<float, 1> acc;
+    int off;
+    float operator[](int i) const { return acc[off + i]; }
+};
+
+class MonoMlpKernel;
+torch::Tensor g_dbg;
+}  // namespace
+
+torch::Tensor mono_mlp_debug() { return g_dbg; }
+
+torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor silu_lut,
+                       torch::Tensor gq, torch::Tensor gs, torch::Tensor gsc, torch::Tensor gcb,
+                       torch::Tensor uq, torch::Tensor us, torch::Tensor usc, torch::Tensor ucb,
+                       torch::Tensor dq, torch::Tensor ds, torch::Tensor dsc, torch::Tensor dcb, int64_t nwg, int64_t stop) {
+    TORCH_CHECK(xn.is_xpu() && xn.scalar_type() == at::kBFloat16 && xn.is_contiguous(), "xn bf16");
+    const int64_t K1 = xn.size(-1), R = xn.numel() / K1, N1 = gq.size(0), N2 = dq.size(0);
+    TORCH_CHECK(R >= 1 && R <= 8, "1..8 rows");
+    TORCH_CHECK(K1 % 2048 == 0 && N1 % 2048 == 0 && N1 <= MAXK && K1 <= MAXK && N2 % 16 == 0, "shape contract");
+    TORCH_CHECK(gq.size(1) * 2 == K1 && uq.sizes() == gq.sizes() && dq.size(1) * 2 == N1, "weight shapes");
+    for (auto* t : {&gs, &us, &ds})
+        TORCH_CHECK(t->scalar_type() == at::kFloat8_e4m3fn && t->is_contiguous(), "fp8 group scales (G16)");
+    TORCH_CHECK(gs.size(1) * 16 == K1 && ds.size(1) * 16 == N1, "G16 scales");
+    auto opts = xn.options();
+    // persistent scratch (stable addresses for graph replay); pad rows of q1/q2 stay zero and the
+    // barrier counter returns to zero at the end of every launch
+    struct Scratch { torch::Tensor q1, q2, s12, h, cnt, dbg; };
+    static std::map<std::tuple<int, int64_t, int64_t>, Scratch> cache;
+    auto key = std::make_tuple(static_cast<int>(xn.get_device()), K1, N1);
+    auto found = cache.find(key);
+    if (found == cache.end()) {
+        Scratch sc{torch::zeros({8, K1}, opts.dtype(at::kChar)), torch::zeros({8, N1}, opts.dtype(at::kChar)),
+                   torch::zeros({16}, opts.dtype(at::kFloat)), torch::zeros({8, N1}, opts),
+                   torch::zeros({2}, opts.dtype(at::kInt)), torch::zeros({64 * 8}, opts.dtype(at::kLong))};
+        found = cache.emplace(key, sc).first;
+    }
+    auto& q1 = found->second.q1;
+    auto& q2 = found->second.q2;
+    auto& s12 = found->second.s12;
+    auto& hbuf = found->second.h;
+    auto& counter = found->second.cnt;
+    auto* dbg = reinterpret_cast<uint64_t*>(found->second.dbg.data_ptr());
+    g_dbg = found->second.dbg;
+    auto out = torch::empty({R, N2}, opts);
+    const W4 G{gq.data_ptr<int8_t>(), reinterpret_cast<const fp8*>(gs.data_ptr()), gsc.data_ptr<float>(),
+               gcb.data_ptr<float>(), N1, K1};
+    const W4 U{uq.data_ptr<int8_t>(), reinterpret_cast<const fp8*>(us.data_ptr()), usc.data_ptr<float>(),
+               ucb.data_ptr<float>(), N1, K1};
+    const W4 D{dq.data_ptr<int8_t>(), reinterpret_cast<const fp8*>(ds.data_ptr()), dsc.data_ptr<float>(),
+               dcb.data_ptr<float>(), N2, N1};
+    const auto* xp = reinterpret_cast<const bf16*>(xn.data_ptr());
+    const auto* hp = reinterpret_cast<const bf16*>(hadamard.data_ptr());
+    const auto* lut = reinterpret_cast<const bf16*>(silu_lut.data_ptr());
+    auto* q1p = q1.data_ptr<int8_t>();
+    auto* q2p = q2.data_ptr<int8_t>();
+    auto* sp = s12.data_ptr<float>();
+    auto* hb = reinterpret_cast<bf16*>(hbuf.data_ptr());
+    auto* op = reinterpret_cast<bf16*>(out.data_ptr());
+    auto* cnt = reinterpret_cast<uint32_t*>(counter.data_ptr());
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    // co-residency: at most one ~65 KB-SLM work-group per Xe core (64 x 32 KB measured to hang)
+    const int64_t cores = queue.get_device().get_info<sycl::info::device::max_compute_units>() / 8;
+    if (nwg <= 0 || nwg > cores) nwg = cores;
+    const uint32_t NW = static_cast<uint32_t>(nwg);
+    const int ST = static_cast<int>(stop);
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> xr(MAXK, cgh);
+        sycl::local_accessor<float, 1> red(MSG, cgh);
+        sycl::local_accessor<int32_t, 1> part(MSG * 256, cgh);
+        sycl::local_accessor<float, 1> cbl(48, cgh);
+        sycl::local_accessor<float, 1> gu(256, cgh);
+        cgh.parallel_for<MonoMlpKernel>(
+            sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                auto sg = it.get_sub_group();
+                const int t = it.get_local_id(0), sgi = sg.get_group_id()[0], lane = sg.get_local_id()[0];
+                const uint32_t wg = it.get_group(0);
+                uint32_t epoch = 0;
+                if (t < 16) { cbl[t] = G.cb[t]; cbl[16 + t] = U.cb[t]; cbl[32 + t] = D.cb[t]; }
+                sycl::group_barrier(it.get_group());
+                const SlmCb cbg{cbl, 0}, cbu{cbl, 16}, cbd{cbl, 32};
+                if (t == 0) dbg[wg * 8 + 0] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- phase 1: rot_quant(xn) ----
+                for (int64_t r = wg; r < R; r += NW) rot_quant_row(it, xp + r * K1, hp, q1p + r * K1, sp + r, K1, xr, red);
+                if (t == 0) dbg[wg * 8 + 1] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 8 + 2] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                if (ST >= 2)
+                // ---- phase 2: h = silu(gate) * up; KS2 sub-groups split the K of each 16-column tile ----
+                {
+                    auto lp = part.template get_multi_ptr<sycl::access::decorated::no>().get();
+                    const int64_t tiles = N1 / 16;
+                    // stage the 8-row INT8 activation in SLM: after the device-scope acquire, global
+                    // re-reads of data produced by other work-groups do not hit the L1 cache
+                    int8_t* xs8 = reinterpret_cast<int8_t*>(xr.template get_multi_ptr<sycl::access::decorated::no>().get());
+                    for (int64_t i = t; i < 8 * K1 / 16; i += MWG)
+                        reinterpret_cast<sycl::vec<uint32_t, 4>*>(xs8)[i] = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(q1p)[i];
+                    sycl::group_barrier(it.get_group());
+                    auto xa = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(xs8);
+                    // spread tiles evenly over all work-groups, then split K over the spare sub-groups
+                    const int64_t TPW2 = (tiles + NW - 1) / NW;
+                    constexpr int KS2 = 8;              // Split8 per tile, 8 tiles per round
+                    constexpr int64_t TPR = MSG / KS2;
+                    for (int64_t base = int64_t(wg) * TPW2; base < int64_t(wg + 1) * TPW2 && base < tiles; base += TPR) {
+                        const int64_t tile = base + sgi / KS2;
+                        if (sgi / KS2 < TPR && tile < tiles && tile < int64_t(wg + 1) * TPW2) {
+                            jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 16> cg, cu;
+                            jm::joint_matrix_fill(sg, cg, 0);
+                            jm::joint_matrix_fill(sg, cu, 0);
+                            const W4* wgu[2] = {&G, &U};
+                            const SlmCb cgu_cb[2] = {cbg, cbu};
+                            w4_tiles<1>(sg, gptr(q1p), wgu, tile * 16, sgi % KS2, KS2, cgu_cb, cg, cg);
+                            w4_tiles<1>(sg, gptr(q1p), wgu + 1, tile * 16, sgi % KS2, KS2, cgu_cb + 1, cu, cu);
+                            auto lsp = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(lp + sgi * 256);
+                            jm::joint_matrix_store(sg, cg, lsp, 16, jm::layout::row_major);
+                            jm::joint_matrix_store(sg, cu, lsp + 128, 16, jm::layout::row_major);
+                        }
+                        sycl::group_barrier(it.get_group());
+                        for (int i = t; i < TPR * 128; i += MWG) {
+                            const int tl = i / 128, e = i % 128, r = e / 16;
+                            const int64_t tg = base + tl;
+                            if (tg >= tiles || tg >= int64_t(wg + 1) * TPW2 || r >= R) continue;
+                            uint32_t sg_sum = 0, su_sum = 0;
+#pragma unroll
+                            for (int k2 = 0; k2 < KS2; ++k2) {
+                                sg_sum += static_cast<uint32_t>(lp[(tl * KS2 + k2) * 256 + e]);
+                                su_sum += static_cast<uint32_t>(lp[(tl * KS2 + k2) * 256 + 128 + e]);
+                            }
+                            const int64_t n = tg * 16 + e % 16;
+                            float fg = static_cast<float>(sycl::bit_cast<int32_t>(sg_sum));
+                            fg = fg * sp[r];
+                            fg = fg * G.sc[n];
+                            float fu = static_cast<float>(sycl::bit_cast<int32_t>(su_sum));
+                            fu = fu * sp[r];
+                            fu = fu * U.sc[n];
+                            const bf16 g = static_cast<bf16>(fg);
+                            const float act = static_cast<float>(lut[sycl::bit_cast<uint16_t>(g)]);
+                            hb[r * N1 + n] = static_cast<bf16>(act * static_cast<float>(static_cast<bf16>(fu)));
+                        }
+                        sycl::group_barrier(it.get_group());
+                    }
+                }
+                if (t == 0) dbg[wg * 8 + 3] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 8 + 4] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- phase 3: rot_quant(h) ----
+                if (ST >= 3) for (int64_t r = wg; r < R; r += NW) rot_quant_row(it, hb + r * N1, hp, q2p + r * N1, sp + 8 + r, N1, xr, red);
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 8 + 5] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- phase 4: out = down(q2); a work-group owns TPW tiles, KS sub-groups split each K ----
+                if (ST >= 4) {
+                    const int64_t tiles = N2 / 16;
+                    const int64_t TPW = (tiles + NW - 1) / NW;
+                    int KS = 1;
+                    while (KS * 2 * TPW <= MSG && KS < 16) KS *= 2;
+                    const int64_t tl = sgi / KS;
+                    const int split = sgi % KS;
+                    const int64_t tile = int64_t(wg) * TPW + tl;
+                    jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 16> cd;
+                    jm::joint_matrix_fill(sg, cd, 0);
+                    if (tl < TPW && tile < tiles) {
+                        const W4* wd[1] = {&D};
+                        const SlmCb dcb1[1] = {cbd};
+                        w4_tiles<1>(sg, gptr(q2p), wd, tile * 16, split, KS, dcb1, cd, cd);
+                    }
+                    auto lp = part.template get_multi_ptr<sycl::access::decorated::no>().get();
+                    if (tl < TPW)
+                        jm::joint_matrix_store(sg, cd, sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(lp + sgi * 128), 16, jm::layout::row_major);
+                    sycl::group_barrier(it.get_group());
+                    for (int64_t i = t; i < TPW * 128; i += MWG) {
+                        const int64_t tt = i / 128, e = i % 128;
+                        const int64_t tg = int64_t(wg) * TPW + tt;
+                        const int r = e / 16;
+                        if (tg >= tiles || r >= R) continue;
+                        uint32_t sum = 0;
+                        for (int sidx = 0; sidx < KS; ++sidx) sum += static_cast<uint32_t>(part[(tt * KS + sidx) * 128 + e]);
+                        const int64_t n = tg * 16 + e % 16;
+                        float f = static_cast<float>(sycl::bit_cast<int32_t>(sum));
+                        f = f * sp[8 + r];
+                        f = f * D.sc[n];
+                        op[r * N2 + n] = static_cast<bf16>(f);
+                    }
+                }
+                if (t == 0) dbg[wg * 8 + 6] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // self-reset of the barrier counter: the last work-group to finish knows nobody polls
+                sycl::group_barrier(it.get_group());
+                if (t == 0) {
+                    sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                     sycl::access::address_space::global_space> done(cnt[1]), c0(cnt[0]);
+                    if (done.fetch_add(1u) == NW - 1) { c0.store(0u); done.store(0u); }
+                }
+                (void)lane;
+            });
+    });
+    return out;
+}
+}  // namespace cmdx
