@@ -12,7 +12,7 @@ setup(
     ext_modules=[
         SyclExtension(
             "comfy_mono_decode_xpu._C",
-            ["csrc/bindings.cpp", "csrc/w4a8_decode.sycl", "csrc/act_prep.sycl", "csrc/mono_mlp.sycl"],
+            ["csrc/bindings.cpp", "csrc/w4a8_decode.sycl", "csrc/act_prep.sycl", "csrc/mono_mlp.sycl", "csrc/exact_probe.sycl", "csrc/mono_layer.sycl"],
             extra_compile_args={"cxx": ["-O3"], "sycl": sycl_flags},
         )
     ],

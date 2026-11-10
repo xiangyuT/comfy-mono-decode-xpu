@@ -1,4 +1,5 @@
 #include <optional>
+#include <vector>
 #include <torch/extension.h>
 
 namespace cmdx {
@@ -13,6 +14,17 @@ torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor s
                        torch::Tensor gq, torch::Tensor gs, torch::Tensor gsc, torch::Tensor gcb,
                        torch::Tensor uq, torch::Tensor us, torch::Tensor usc, torch::Tensor ucb,
                        torch::Tensor dq, torch::Tensor ds, torch::Tensor dsc, torch::Tensor dcb, int64_t nwg, int64_t stop);
+torch::Tensor rms_norm_probe(torch::Tensor x, torch::Tensor w, double eps, int64_t variant);
+torch::Tensor linear_probe(torch::Tensor x, torch::Tensor w, int64_t variant);
+torch::Tensor rms_stats();
+std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, double eps, torch::Tensor hadamard,
+                                     std::vector<torch::Tensor> mats, int64_t nwg);
+torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::Tensor> gate, torch::Tensor sig_lut,
+                         torch::Tensor oq, torch::Tensor os, torch::Tensor osc, torch::Tensor ocb,
+                         torch::Tensor norm_w, double eps, torch::Tensor hadamard, torch::Tensor silu_lut,
+                         torch::Tensor gq, torch::Tensor gs, torch::Tensor gsc, torch::Tensor gcb,
+                         torch::Tensor uq, torch::Tensor us, torch::Tensor usc, torch::Tensor ucb,
+                         torch::Tensor dq, torch::Tensor ds, torch::Tensor dsc, torch::Tensor dcb, int64_t nwg, int64_t stop);
 }  // namespace cmdx
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -25,5 +37,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mono_mlp", &cmdx::mono_mlp, py::arg("xn"), py::arg("hadamard"), py::arg("silu_lut"), py::arg("gq"), py::arg("gs"),
           py::arg("gsc"), py::arg("gcb"), py::arg("uq"), py::arg("us"), py::arg("usc"), py::arg("ucb"), py::arg("dq"),
           py::arg("ds"), py::arg("dsc"), py::arg("dcb"), py::arg("nwg") = 0, py::arg("stop") = 4);
+    m.def("rms_norm_probe", &cmdx::rms_norm_probe);
+    m.def("linear_probe", &cmdx::linear_probe);
+    m.def("rms_stats", &cmdx::rms_stats);
+    m.def("layer_pre", &cmdx::layer_pre, py::arg("x"), py::arg("norm_w"), py::arg("eps"), py::arg("hadamard"), py::arg("mats"),
+          py::arg("nwg") = 0);
+    m.def("layer_post", &cmdx::layer_post);
     m.def("rot_quant", &cmdx::rot_quant, py::arg("x"), py::arg("h"), py::arg("order") = 0);
 }

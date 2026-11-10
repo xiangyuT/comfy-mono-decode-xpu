@@ -33,13 +33,13 @@ with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.XPU]) as
     ids = gen(maxlen); torch.xpu.synchronize()
 ev = sorted([e for e in pr.events() if e.device_type == torch.autograd.DeviceType.XPU], key=lambda e: e.time_range.start)
 def cat(n):
-    for k, c in (("MonoMlp", "mono_mlp"), ("W4A8", "w4"), ("RotQuant", "rotq"), ("int8_linear", "lm_head"), ("gemm_kernel", "gemm"),
+    for k, c in (("LayerPre", "layer_pre"), ("LayerPost", "layer_post"), ("MonoMlp", "mono_mlp"), ("W4A8", "w4"), ("RotQuant", "rotq"), ("int8_linear", "lm_head"), ("gemm_kernel", "gemm"),
                  ("DecodeChunks", "attn"), ("DecodeCombine", "attn"), ("DecodeStepMerge", "attn"), ("Deferred", "gdn"), ("rms_norm", "norm"),
                  ("topk", "topk"), ("Sbtopk", "topk"), ("Memcpy", "memcpy")):
         if k in n: return c
     return "other"
 # decode portion: drop events before the largest gap after prefill? use the last 70% of the span
-monos = [e for e in ev if "MonoMlp" in e.name]
+monos = [e for e in ev if "MonoMlp" in e.name or "LayerPost" in e.name]
 ncyc = len(monos) // 32 - 1
 w0, w1 = monos[31].time_range.end, monos[-1].time_range.end  # first verify done .. last verify done
 ev = [e for e in ev if w0 < e.time_range.start and e.time_range.end <= w1]
