@@ -155,16 +155,6 @@ def _attn_core(mix, qg, xk, xv, attention_mask, freqs_cis, optimized_attention, 
         past_key_value.write(xk, xv)
     if decode and (isinstance(past_key_value, Int8FixedKVCache) or
                    mix.comfy_attention.method is None and not comfy.model_management.comfy_kitchen_attention_enabled()):
-        tree = getattr(past_key_value, "tracker", {}).get("tree")
-        if (_attn_port and tree is not None and type(past_key_value).__name__ == "FixedKVCache" and B == 1
-                and xq.shape[-1] == 256 and past_key_value.key.is_contiguous() and past_key_value.value.is_contiguous()
-                and past_key_value.key.dtype == torch.bfloat16 and tree.mask.numel() == S):
-            # Kitchen's tree-verify decode attention (decode_gqa + tree_merge), bit-identical, one launch
-            from . import _C
-            with _lock:
-                _stats["attn"] = _stats.get("attn", 0) + 1
-            return _C.attn_core(xq, past_key_value.key, past_key_value.value, past_key_value.seqlen, xk, xv,
-                                tree.mask.to(torch.int32), 0)
         return past_key_value.attend(xq, xk, xv)
     if decode:
         xk, xv = past_key_value.key, past_key_value.value
@@ -179,8 +169,45 @@ def _attn_core(mix, qg, xk, xv, attention_mask, freqs_cis, optimized_attention, 
                                preferred_attention=mix.comfy_attention, **gqa_kwargs)
 
 
+def _install_attend():
+    """FixedKVCache.attend -> one bit-identical launch (tree verify rows, or the single MTP draft row)."""
+    from comfy.text_encoders import llama
+    from . import _C
+    cls = llama.FixedKVCache
+    original = cls.attend
+    if getattr(original, CLAIM, False):
+        return False
+    empty = {}
+
+    def attend(self, xq, xk, xv):
+        tree = self.tracker.get("tree") if isinstance(self.tracker, dict) else None
+        S = xq.shape[2] if xq.dim() == 4 else 0
+        if (_attn_port and xq.device.type == "xpu" and xq.dtype == torch.bfloat16 and xq.shape[0] == 1
+                and xq.shape[-1] == 256 and self.key.dtype == torch.bfloat16 and self.key.is_contiguous()
+                and self.value.is_contiguous() and 1 <= S <= 8 and self.seqlen.dtype == torch.int32):
+            if tree is not None and tree.mask.numel() == S and tree.mask.dtype == torch.int32:
+                mask = tree.mask
+            elif tree is None and S == 1:
+                mask = empty.get(xq.device)
+                if mask is None:
+                    mask = empty[xq.device] = torch.empty(0, dtype=torch.int32, device=xq.device)
+            else:
+                mask = None
+            if mask is not None:
+                with _lock:
+                    _stats["attn"] = _stats.get("attn", 0) + 1
+                return _C.attn_core(xq, self.key, self.value, self.seqlen, xk, xv, mask, 0)
+        return original(self, xq, xk, xv)
+
+    setattr(attend, CLAIM, True)
+    attend.__wrapped__ = original
+    cls.attend = attend
+    return True
+
+
 def install():
     from comfy.text_encoders import qwen35 as q35
+    _install_attend()
     from comfy.text_encoders.llama import SPEC_ROWS
     from . import _C
 

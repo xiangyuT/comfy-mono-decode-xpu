@@ -72,7 +72,10 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
     TORCH_CHECK(key.is_contiguous() && value.is_contiguous() && key.sizes() == value.sizes() && key.size(3) == D, "cache [B, Hk, cap, 256]");
     TORCH_CHECK(seqlen.scalar_type() == at::kInt && mask.scalar_type() == at::kInt && mask.is_contiguous(), "int32 seqlen / mask");
     const int B = q.size(0), H = q.size(1), S = q.size(2), HK = key.size(1), cap = key.size(2);
-    TORCH_CHECK(B == 1 && S >= 1 && S <= 8 && H % HK == 0 && mask.numel() == S, "batch 1, 1..8 rows");
+    // mask [S]: tree verify (decode_gqa non-causal + tree_merge); empty mask: plain decode_gqa for one
+    // row (causal and non-causal agree at S = 1), the MTP draft's attention
+    const bool merge = mask.numel() > 0;
+    TORCH_CHECK(B == 1 && S >= 1 && S <= 8 && H % HK == 0 && (merge ? mask.numel() == S : S == 1), "batch 1, 1..8 rows");
     const int groups = H / HK, rows = groups * S, packs = (rows + ROWS - 1) / ROWS;
     const int splits = std::min(32, std::max(1, (cap + 255) / 256));
     const int split_tiles = ((cap + TILE - 1) / TILE + splits - 1) / splits;
@@ -107,7 +110,7 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
     const BF16* Kc = reinterpret_cast<const BF16*>(key.data_ptr());
     const BF16* Vc = reinterpret_cast<const BF16*>(value.data_ptr());
     const int* lens = seqlen.data_ptr<int>();
-    const int* masks = mask.data_ptr<int>();
+    const int* masks = merge ? mask.data_ptr<int>() : nullptr;
     float* part = partial.data_ptr<float>();
     float* st = stats.data_ptr<float>();
     BF16* dest = reinterpret_cast<BF16*>(merged.data_ptr());
@@ -277,6 +280,10 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
                 if (ok && dprefix) {
                     dprefix[((int64_t(0) * S + s) * H + h) * D + tt] = BF16(prefix);
                     if (tt == 0) dlse[index] = ls;
+                }
+                if (!merge) {  // decode_gqa output: the combined prefix
+                    if (ok) dest[((int64_t(0) * S + s) * H + h) * D + tt] = BF16(prefix);
+                    continue;  // uniform per work-group (merge is a kernel argument)
                 }
                 // merge scores: virtual warp wsg < 8 = row
                 if (wsg < 8) {
