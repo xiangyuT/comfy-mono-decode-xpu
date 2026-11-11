@@ -11,7 +11,7 @@
 #include <sycl/sycl.hpp>
 #include <torch/extension.h>
 
-namespace cmdx {
+namespace mono_decode_xpu {
 namespace {
 using T = sycl::ext::oneapi::bfloat16;
 namespace jm = sycl::ext::oneapi::experimental::matrix;
@@ -233,4 +233,4 @@ torch::Tensor gdn_delta_port(torch::Tensor x, torch::Tensor wa, torch::Tensor wb
     });
     return output;
 }
-}  // namespace cmdx
+}  // namespace mono_decode_xpu

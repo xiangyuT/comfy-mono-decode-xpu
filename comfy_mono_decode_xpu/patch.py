@@ -1,4 +1,4 @@
-"""Route small-M packed W4A8 linears to the fused cmdx decode kernel.
+"""Route small-M packed W4A8 linears to the fused mono_decode_xpu decode kernel.
 
 The wrapped entry is ``omni_xpu_kernel.int8.w4a8_linear_prequantized``, which the XPU
 Kitchen backend looks up on every call. A call that matches the kernel contract (1-8 rows,
@@ -86,14 +86,14 @@ def install():
     setattr(w4a8_linear_prequantized, CLAIM, True)
     w4a8_linear_prequantized.__wrapped__ = original
     oint8.w4a8_linear_prequantized = w4a8_linear_prequantized
-    out = os.environ.get("CMDX_STATS")
+    out = os.environ.get("MONO_DECODE_XPU_STATS")
     if out:
         atexit.register(lambda: open(out, "w").write(json.dumps(_stats)))
     return True
 
 
 def install_prep():
-    """Route decode-row ConvRot rotation + row quantization to cmdx.rot_quant (bit-identical)."""
+    """Route decode-row ConvRot rotation + row quantization to mono_decode_xpu.rot_quant (bit-identical)."""
     import sys as _sys
     from . import _C
     targets = [m for n, m in list(_sys.modules.items())

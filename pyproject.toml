@@ -1,0 +1,15 @@
+[project]
+name = "comfy-mono-decode-xpu"
+description = "Bit-exact persistent decode kernels for ComfyUI Qwen3.5 W4A8 prompt enhance (TextGenerate + MTP) on Intel XPU."
+version = "0.1.0"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []  # torch (XPU) and ComfyUI come from the host environment; the extension is built by install.py
+
+[project.urls]
+Repository = "https://github.com/xiangyuT/comfy-mono-decode-xpu"
+
+[tool.comfy]
+PublisherId = "xiangyuT"
+DisplayName = "Mono Decode XPU"
+Icon = ""

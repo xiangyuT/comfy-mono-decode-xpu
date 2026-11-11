@@ -1,0 +1,175 @@
+// Exact single-row top-k (k <= 8) and argmax for BF16 logits, one launch.
+//
+// torch XPU topk on one long slice (torch-xpu-ops sbtopk_gather_kernel + segmented sort) returns the
+// k largest by the radix key (TopKTypeConfig<BFloat16>::convert: NaN on top, -0 below +0), ties in
+// gather order: iteration i / 32768, then thread (i % 8192) / 8, then load (i % 32768) / 8192, then
+// lane i % 8 (1024 threads x 4 vector loads of 8 per 32768-element iteration). Checked against
+// torch on tie-heavy inputs. argmax (ReduceOp ArgMaxOps<float>) takes the largest float, NaN first,
+// smallest index on ties.
+#include <cstdint>
+#include <map>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+namespace mono_decode_xpu {
+namespace {
+constexpr int TK_WG = 1024, TK_K = 8, TK_NW = 32;
+
+// 64-bit rank: larger = better
+inline uint64_t rank_topk(uint16_t bits, uint32_t i) {
+    const uint32_t mask = (bits & 0x8000u) ? 0xFFFFu : 0x8000u;
+    const bool nan = (bits & 0x7FFFu) > 0x7F80u;
+    const uint32_t conv = nan ? 0xFFFFu : ((bits ^ mask) & 0xFFFFu);
+    const uint32_t it = i >> 15, off = i & 32767u;
+    const uint32_t gkey = (it << 15) | (((off & 8191u) >> 3) << 5) | ((off >> 13) << 3) | (off & 7u);
+    return (uint64_t(conv) << 32) | uint64_t(0xFFFFFFFFu - gkey);
+}
+inline uint64_t rank_argmax(uint16_t bits, uint32_t i) {
+    const bool nan = (bits & 0x7FFFu) > 0x7F80u;
+    uint32_t key;
+    if (nan) key = 0xFFFFFFFFu;
+    else {
+        const uint16_t b = (bits & 0x7FFFu) == 0 ? 0 : bits;  // -0 == +0
+        key = (b & 0x8000u) ? uint32_t(0x7FFFu - (b & 0x7FFFu)) : uint32_t(0x8000u + b);
+    }
+    return (uint64_t(key) << 32) | uint64_t(0xFFFFFFFFu - i);
+}
+inline void insert(uint64_t (&top)[TK_K], uint64_t r, int k) {
+    if (r <= top[k - 1]) return;
+    int p = k - 1;
+    while (p > 0 && top[p - 1] < r) { top[p] = top[p - 1]; --p; }
+    top[p] = r;
+}
+
+// merge sorted (descending) lists a and b of length k, keep the k best in a
+template <typename L>
+inline void merge_lists(L& lst, int a, int b, int k) {
+    uint64_t out[TK_K];
+    int i = 0, j = 0;
+    for (int o = 0; o < TK_K; ++o) {
+        if (o >= k) break;
+        const uint64_t x = lst[a + i], y = lst[b + j];
+        if (x >= y) { out[o] = x; ++i; } else { out[o] = y; ++j; }
+    }
+    for (int o = 0; o < TK_K; ++o) if (o < k) lst[a + o] = out[o];
+}
+
+class FastTopkKernel;
+}  // namespace
+
+// argmax_order: rank by argmax rules (k must be 1). with_argmax: also return the argmax index from the
+// same pass (top-k ranked lists plus one argmax-ranked best per thread), so a pick that needs both the
+// argmax and a top-k of the same row costs one launch.
+std::vector<torch::Tensor> fast_topk_impl(torch::Tensor x, int64_t k, bool argmax_order, bool with_argmax) {
+    TORCH_CHECK(x.is_xpu() && x.scalar_type() == at::kBFloat16 && x.is_contiguous(), "bf16 contiguous");
+    TORCH_CHECK(k >= 1 && k <= TK_K, "1 <= k <= 8");
+    const int64_t V = x.size(-1);
+    TORCH_CHECK(x.numel() == V && V >= 32768 && V < (int64_t(1) << 31), "one long row");
+    auto opts = x.options();
+    auto values = torch::empty({1, k}, opts);
+    auto indices = torch::empty({1, k}, opts.dtype(at::kLong));
+    static std::map<int, torch::Tensor> scratch;
+    auto& sc = scratch[x.get_device()];
+    if (!sc.defined()) sc = torch::zeros({TK_NW * TK_K + TK_NW + 2}, opts.dtype(at::kLong));
+    auto* part = reinterpret_cast<uint64_t*>(sc.data_ptr());
+    auto* part_am = part + TK_NW * TK_K;
+    auto* cnt = reinterpret_cast<uint32_t*>(part_am + TK_NW);
+    auto amidx = torch::empty({with_argmax ? 1 : 0}, opts.dtype(at::kLong));
+    auto* ap = amidx.data_ptr<int64_t>();
+    const bool both = with_argmax;
+    const auto* xp = reinterpret_cast<const uint16_t*>(x.data_ptr());
+    auto* vp = reinterpret_cast<uint16_t*>(values.data_ptr());
+    auto* ip = indices.data_ptr<int64_t>();
+    const int K = int(k);
+    const bool am = argmax_order;
+    c10::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<uint64_t, 1> lst(TK_WG * TK_K, cgh);
+        sycl::local_accessor<int, 1> last(1, cgh);
+        sycl::local_accessor<uint64_t, 1> amb(1, cgh);
+        cgh.parallel_for<FastTopkKernel>(sycl::nd_range<1>(TK_NW * TK_WG, TK_WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int t = it.get_local_id(0);
+            const int wg = it.get_group(0);
+            uint64_t top[TK_K];
+            for (int j = 0; j < TK_K; ++j) top[j] = 0;
+            uint64_t best = 0;
+            for (int64_t i = int64_t(wg) * TK_WG + t; i < V; i += int64_t(TK_NW) * TK_WG) {
+                const uint16_t b = xp[i];
+                insert(top, am ? rank_argmax(b, uint32_t(i)) : rank_topk(b, uint32_t(i)), K);
+                if (both) best = sycl::max(best, rank_argmax(b, uint32_t(i)));
+            }
+            if (both) best = sycl::reduce_over_group(it.get_group(), best, sycl::maximum<uint64_t>());
+            // work-group tree: pairwise merges of sorted lists, 1024 -> 1
+            for (int j = 0; j < TK_K; ++j) lst[t * TK_K + j] = top[j];
+            sycl::group_barrier(it.get_group());
+            for (int n = TK_WG / 2; n >= 1; n /= 2) {
+                if (t < n) merge_lists(lst, t * TK_K, (t + n) * TK_K, K);
+                sycl::group_barrier(it.get_group());
+            }
+            if (t == 0) {
+                for (int j = 0; j < TK_K; ++j) part[wg * TK_K + j] = lst[j];
+                if (both) part_am[wg] = best;
+                sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+                sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space> c(cnt[0]);
+                last[0] = c.fetch_add(1u) == TK_NW - 1;
+            }
+            sycl::group_barrier(it.get_group());
+            if (last[0]) {  // the last work-group merges the 32 partial lists
+                sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+                if (t < TK_NW)
+                    for (int j = 0; j < TK_K; ++j) {
+                        sycl::atomic_ref<uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                         sycl::access::address_space::global_space> pr(part[t * TK_K + j]);
+                        lst[t * TK_K + j] = pr.load();
+                    }
+                uint64_t pb = 0;
+                if (both && t < TK_NW) {
+                    sycl::atomic_ref<uint64_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                     sycl::access::address_space::global_space> pr(part_am[t]);
+                    pb = pr.load();
+                }
+                if (both) {
+                    pb = sycl::reduce_over_group(it.get_group(), pb, sycl::maximum<uint64_t>());
+                    if (t == 0) amb[0] = pb;
+                }
+                sycl::group_barrier(it.get_group());
+                for (int n = TK_NW / 2; n >= 1; n /= 2) {
+                    if (t < n) merge_lists(lst, t * TK_K, (t + n) * TK_K, K);
+                    sycl::group_barrier(it.get_group());
+                }
+            }
+            if (last[0] && t == 0) {
+                uint64_t fin[TK_K];
+                for (int j = 0; j < TK_K; ++j) fin[j] = lst[j];
+                for (int j = 0; j < K; ++j) {
+                    const uint32_t idx = am ? 0xFFFFFFFFu - uint32_t(fin[j]) : 0;
+                    uint32_t i = idx;
+                    if (!am) {  // invert the gather key back to the element index
+                        const uint32_t g = 0xFFFFFFFFu - uint32_t(fin[j]);
+                        const uint32_t itn = g >> 15, th = (g >> 5) & 1023u, ld = (g >> 3) & 3u, ln = g & 7u;
+                        i = (itn << 15) | (ld << 13) | (th << 3) | ln;
+                    }
+                    ip[j] = int64_t(i);
+                    vp[j] = xp[i];
+                }
+                if (both) ap[0] = int64_t(0xFFFFFFFFu - uint32_t(amb[0]));
+                sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space> c(cnt[0]);
+                c.store(0u);
+            }
+        });
+    });
+    return {values, indices, amidx};
+}
+
+std::vector<torch::Tensor> fast_topk(torch::Tensor x, int64_t k, bool argmax_order) {
+    auto r = fast_topk_impl(x, k, argmax_order, false);
+    return {r[0], r[1]};
+}
+
+// top-k (topk order) and the argmax of the same row in one launch: {values, indices, argmax [1]}
+std::vector<torch::Tensor> fast_pick(torch::Tensor x, int64_t k) { return fast_topk_impl(x, k, false, true); }
+}  // namespace mono_decode_xpu

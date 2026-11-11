@@ -17,7 +17,7 @@
 
 #include "mono_common.hpp"
 
-namespace cmdx {
+namespace mono_decode_xpu {
 namespace {
 using namespace mono;
 
@@ -184,6 +184,7 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
     Stream SO = make_stream(&O, 1, false);
     const W4 gu[2] = {G, U};
     Stream SG = make_stream(gu, 2, true), SD = make_stream(&D, 1, false);
+    stream_finalize(SG, NW);
     SO.tiled = SG.tiled = SD.tiled = tiled;
     {
         int64_t a0, a1;
@@ -321,4 +322,4 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
     });
     return x;
 }
-}  // namespace cmdx
+}  // namespace mono_decode_xpu

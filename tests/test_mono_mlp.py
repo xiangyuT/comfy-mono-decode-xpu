@@ -36,13 +36,13 @@ for li in (0, 3, 17, 31):
             if kind == "wide": x = x * torch.exp(torch.randn(R, 4096, generator=g) * 2)
             xn = x.to(torch.bfloat16).to(dev)
             ch, _ = chain(xn, a)
-            mo = C.mono_mlp(xn, H, LUT, *a, 32)
+            mo = C.mono_mlp(xn, H, LUT, *a, 32, 4, False)
             b = (mo.view(torch.int16) != ch.view(torch.int16)).sum().item(); bad_total += b
     print(f"MONO layer {li}: mismatches vs chain so far {bad_total}", flush=True)
 mlp = tm.model.layers[0].mlp; a = wparts(mlp.gate_proj) + wparts(mlp.up_proj) + wparts(mlp.down_proj)
 for R in (1, 8):
     xn = torch.randn(R, 4096, dtype=torch.bfloat16, device=dev)
-    for name, fn in [("chain", lambda: chain(xn, a))] + [(f"mono-stop{st}", (lambda st: lambda: C.mono_mlp(xn, H, LUT, *a, 32, st))(st)) for st in (1, 2, 3, 4)]:
+    for name, fn in [("chain", lambda: chain(xn, a))] + [(f"mono-stop{st}", (lambda st: lambda: C.mono_mlp(xn, H, LUT, *a, 32, st, False))(st)) for st in (1, 2, 3, 4)]:
         for _ in range(10): fn()
         torch.xpu.synchronize()
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.XPU]) as p:
@@ -52,7 +52,7 @@ for R in (1, 8):
         tot = sum(e.device_time_total for e in ks) / 20
         print(f"TIME R{R} {name}: kernels/call={len(ks)/20:.0f} kernel_us={tot:.1f}", flush=True)
 xn = torch.randn(8, 4096, dtype=torch.bfloat16, device=dev)
-for _ in range(3): C.mono_mlp(xn, H, LUT, *a, 32, 4)
+for _ in range(3): C.mono_mlp(xn, H, LUT, *a, 32, 4, False)
 torch.xpu.synchronize()
 d = C.mono_mlp_debug().view(64, 8)[:32, :7].cpu().double()
 d = d - d[:, :1]

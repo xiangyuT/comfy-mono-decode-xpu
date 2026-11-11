@@ -9,7 +9,7 @@
 #include <sycl/ext/oneapi/experimental/clock.hpp>
 #include <sycl/ext/oneapi/experimental/prefetch.hpp>
 
-namespace cmdx {
+namespace mono_decode_xpu {
 namespace mono {
 using bf16 = sycl::ext::oneapi::bfloat16;
 using fp8 = c10::Float8_e4m3fn;
@@ -121,6 +121,7 @@ struct Stream {
     int64_t tiles;     // total tiles over all matrices
     int ksplit;        // K chunks per tile (power of two)
     bool tiled;        // tile-major W4 copy (resident weights) or the checkpoint's row-major layout
+    int pblock;        // PAIR: tiles per work-group block; a block lists its gate tiles, then its up tiles
 };
 
 inline Stream make_stream(const W4* ms, int nm, bool pair) {
@@ -132,6 +133,7 @@ inline Stream make_stream(const W4* ms, int nm, bool pair) {
     for (int i = 0; i < nm; ++i) st.tiles += ms[i].n / 16;
     st.ksplit = 1;
     st.tiled = true;
+    st.pblock = 0;
     return st;
 }
 
@@ -153,16 +155,26 @@ inline int stream_which(const Stream& st, int g, int& tile) {
     return 2;
 }
 
-template <int VAR = 0, typename ACC>
-inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st, int64_t t0_, int64_t t1_,
-                        LPtrU16 tab, ACC acc) {
+// W: K32 steps per weight load per lane. Tile-major blocks are already contiguous across the lanes
+// (W = 1, 16 B); row-major rows are 2-6 KB apart per lane, so each lane fetches a whole 64 B line
+// (W = 4) instead of a quarter line per step.
+#ifndef ROW_W
+#define ROW_W 4
+#endif
+template <int VAR, int W, typename ACC>
+inline void stream_gemv_impl(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st, int64_t t0_, int64_t t1_,
+                             LPtrU16 tab, ACC acc) {
     auto sg = it.get_sub_group();
     const int lane = sg.get_local_id()[0], sgi = sg.get_group_id()[0];
     // 32-bit index math throughout; ksplit is a power of two (shift/mask, no division)
     const int K = int(st.m[0].k), kl2 = sycl::ctz(st.ksplit), kmask = st.ksplit - 1;
     const int klen = K >> kl2, steps = klen >> 5, blocks = steps >> 3;  // block = 8 steps = K256
     const int t0 = int(t0_), units = int(t1_ - t0_) << kl2;
-    const int mine = units > sgi ? (units - sgi + MSG - 1) / MSG : 0;
+    // sub-group sgi takes a contiguous run of units (consecutive K chunks of the same tiles), so each
+    // lane reads long sequential runs of its weight row; INT32 atomics make the split order-free
+    const int uq = units / MSG, ur = units % MSG;
+    const int mine = uq + (sgi < ur ? 1 : 0);
+    const int ubeg = sgi * uq + sycl::min(sgi, ur);
     const int total = mine * steps;
     const int8_t* q0 = st.m[0].q; const int8_t* q1 = st.m[1].q; const int8_t* q2 = st.m[2].q;
     const fp8* s0 = st.m[0].s; const fp8* s1 = st.m[1].s; const fp8* s2 = st.m[2].s;
@@ -174,7 +186,7 @@ inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st
         return int64_t(tile);
     };
     auto wptr = [&](int lu, int ls) {
-        const int u = sgi + lu * MSG;
+        const int u = ubeg + lu;
         int which;
         const int64_t tile = tile_of(u, which);
         const int kk = (u & kmask) * klen + ls * 32;
@@ -183,7 +195,7 @@ inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st
                                                        : q + (tile * 16 + lane) * (K / 2) + kk / 2);
     };
     auto sptr = [&](int su, int sb) {  // 16 B = scale pairs of one block (8 steps)
-        const int u = sgi + su * MSG;
+        const int u = ubeg + su;
         int which;
         const int64_t tile = tile_of(u, which);
         const int kk = (u & kmask) * klen + sb * 256;
@@ -191,14 +203,16 @@ inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st
         return reinterpret_cast<const uint32_t*>(tiled ? s + ((tile * (K / 256) + kk / 256) * 16 + lane) * 16
                                                        : s + (tile * 16 + lane) * (K / 16) + kk / 16);
     };
-    constexpr int PF = 4;
-    sycl::vec<uint32_t, 4> ring[PF], scur, snxt;
+    constexpr int PF = 4;                 // steps of weights in flight
+    constexpr int NS = PF / W > 1 ? PF / W : 2;  // ring slots of W steps each
+    sycl::vec<uint32_t, 4 * W> ring[NS];
+    sycl::vec<uint32_t, 4> scur, snxt;
     int lu = 0, ls = 0, su = 0, sb = 0;
-    auto advance_w = [&]() { if (++ls == steps) { ls = 0; ++lu; } };
+    auto advance_w = [&]() { ls += W; if (ls == steps) { ls = 0; ++lu; } };
     auto advance_s = [&]() { if (++sb == blocks) { sb = 0; ++su; } };
 #pragma unroll
-    for (int p = 0; p < PF; ++p)
-        if (p < total) { ring[p].load(0, gptr(wptr(lu, ls))); advance_w(); }
+    for (int p = 0; p < NS; ++p)
+        if (p * W < total) { ring[p].load(0, gptr(wptr(lu, ls))); advance_w(); }
     if (total > 0) { snxt.load(0, gptr(sptr(su, sb))); advance_s(); }
     jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> a;
     jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16, jm::layout::ext_intel_packed> b;
@@ -211,10 +225,13 @@ inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st
 #pragma unroll
         for (int p = 0; p < 8; ++p) {
             const int i = i0 + p;
-            const sycl::vec<uint32_t, 4> pk = ring[p % PF];
-            if (i + PF < total) { ring[p % PF].load(0, gptr(wptr(lu, ls))); advance_w(); }
+            const int slot = (p / W) % NS, sub = p % W;
+            sycl::vec<uint32_t, 4> pk;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) pk[w] = ring[slot][4 * sub + w];
+            if (sub == W - 1 && i + 1 + (NS - 1) * W < total) { ring[slot].load(0, gptr(wptr(lu, ls))); advance_w(); }
             const uint32_t sc = (scur[p >> 1] >> (16 * (p & 1))) & 0xFFFFu;
-            const int u = sgi + cu * MSG;
+            const int u = ubeg + cu;
             const int kk = (u & kmask) * klen + cs * 32;
             jm::joint_matrix_load(sg, a, gptr(xq + kk), K);
             const uint32_t ba = (sc & 0xFFu) << 8, bb = (sc >> 8) << 8;
@@ -252,6 +269,13 @@ inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st
     }
 }
 
+template <int VAR = 0, typename ACC>
+inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st, int64_t t0_, int64_t t1_,
+                        LPtrU16 tab, ACC acc) {
+    if (st.tiled) stream_gemv_impl<VAR, 1>(it, xq, st, t0_, t1_, tab, acc);
+    else stream_gemv_impl<VAR, ROW_W>(it, xq, st, t0_, t1_, tab, acc);
+}
+
 // Warm the L2 with the first `budget` bytes of this work-group's share of a coming GEMV phase, so
 // phases that leave the memory system idle (row-wise rot_quant, the GDN core) overlap the next
 // phase's weight stream. Tiles are prefetched in the order the engine will consume them.
@@ -274,6 +298,13 @@ inline void prefetch_stream(sycl::nd_item<1>& it, const Stream& st, uint32_t wg,
         for (int64_t off = int64_t(t) * 64; off < sbytes; off += int64_t(MWG) * 64)
             syclex::prefetch(sp + off, syclex::properties{syclex::prefetch_hint_L2});
     }
+}
+
+// host: fix the work-group split of a stream (PAIR streams need it in stream_which)
+inline void stream_finalize(Stream& st, uint32_t nw) {
+    int64_t per = (st.tiles + nw - 1) / nw;
+    if (st.pair) per += per & 1;
+    st.pblock = st.pair ? int(per) : 0;
 }
 
 // host: K-split that minimises the busiest sub-group's step count
@@ -405,4 +436,4 @@ inline bf16 scaleback(int32_t acc, float xs, float sc) {
     return static_cast<bf16>(f);
 }
 }  // namespace mono
-}  // namespace cmdx
+}  // namespace mono_decode_xpu

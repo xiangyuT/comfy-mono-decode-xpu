@@ -16,7 +16,7 @@
 #include <sycl/sycl.hpp>
 #include <torch/extension.h>
 
-namespace cmdx {
+namespace mono_decode_xpu {
 namespace {
 using bf16 = sycl::ext::oneapi::bfloat16;
 namespace jm = sycl::ext::oneapi::experimental::matrix;
@@ -107,4 +107,4 @@ std::tuple<torch::Tensor, torch::Tensor> rot_quant(torch::Tensor x, torch::Tenso
            q.data_ptr<int8_t>(), scale.data_ptr<float>(), rows, K, c10::xpu::getCurrentXPUStream().queue());
     return {q, scale};
 }
-}  // namespace cmdx
+}  // namespace mono_decode_xpu

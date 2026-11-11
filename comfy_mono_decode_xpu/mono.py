@@ -1,4 +1,4 @@
-"""Route Qwen3.5 decode MLP blocks (rows <= 8) to the single-launch cmdx.mono_mlp kernel.
+"""Route Qwen3.5 decode MLP blocks (rows <= 8) to the single-launch mono_decode_xpu.mono_mlp kernel.
 
 ``MLP.forward(x, norm)`` computes ``down(silu(gate(norm(x))) * up(norm(x)))``. For decode rows
 whose three projections are packed W4A8 (G16, FP8 group scales, ConvRot group 256), the norm
@@ -55,14 +55,14 @@ def _layout_ok(w):
 def _static_ok(lin):
     """Module-level contract, checked once on the module's own (possibly host-side) weight: no bias or
     weight functions, and FP8 scale bytes inside the pair table (0x00-0x7F, non-negative)."""
-    cached = getattr(lin, "_cmdx_static", None)
+    cached = getattr(lin, "_mono_decode_xpu_static", None)
     w = getattr(lin, "weight", None)
     key = id(getattr(w, "_qdata", None))
     if cached is not None and cached[0] == key:
         return cached[1]
     ok = (_layout_ok(w) and getattr(lin, "bias", None) is None and not getattr(lin, "weight_function", None)
           and not getattr(lin, "bias_function", None) and int(w._params.scale.view(torch.uint8).max()) < 128)
-    lin._cmdx_static = (key, ok)
+    lin._mono_decode_xpu_static = (key, ok)
     return ok
 
 
@@ -78,12 +78,12 @@ def _w4(lin, w=None):
     if w is None or w.device.type != "xpu" or not _static_ok(lin):
         return None
     q, p = w._qdata, w._params
-    cache = getattr(lin, "_cmdx_w4", None)
+    cache = getattr(lin, "_mono_decode_xpu_w4", None)
     if cache is None or cache[0] is not q:
         parts = [tile_major(q, 16), tile_major(p.scale.view(torch.uint8), 16).view(torch.float8_e4m3fn),
                  p.s_channel.float().contiguous(), p.codebook.float().contiguous()]
         cache = (q, parts)
-        lin._cmdx_w4 = cache
+        lin._mono_decode_xpu_w4 = cache
     return cache[1]
 
 
@@ -106,17 +106,17 @@ def install():
         if (norm is None or self.merged_mlp or x.device.type != "xpu" or x.dtype != torch.bfloat16
                 or x.shape[-1] != 4096 or not 1 <= x.numel() // x.shape[-1] <= 8):
             return original(self, x, norm=norm)
-        if getattr(self, "_cmdx_skip", False):
+        if getattr(self, "_mono_decode_xpu_skip", False):
             return original(self, x, norm=norm)
         parts = [_w4(self.gate_proj), _w4(self.up_proj), _w4(self.down_proj)]
         if any(p is None for p in parts):
-            self._cmdx_skip = True
+            self._mono_decode_xpu_skip = True
             _fallback("weights")
             return original(self, x, norm=norm)
         key = tuple(p[0].data_ptr() for p in parts)
-        if getattr(self, "_cmdx_cb_ok", (None,))[0] != key:  # one shared codebook (checked once per weights)
-            self._cmdx_cb_ok = (key, torch.equal(parts[0][3], parts[1][3]) and torch.equal(parts[0][3], parts[2][3]))
-        if not self._cmdx_cb_ok[1]:
+        if getattr(self, "_mono_decode_xpu_cb_ok", (None,))[0] != key:  # one shared codebook (checked once per weights)
+            self._mono_decode_xpu_cb_ok = (key, torch.equal(parts[0][3], parts[1][3]) and torch.equal(parts[0][3], parts[2][3]))
+        if not self._mono_decode_xpu_cb_ok[1]:
             _fallback("codebook")
             return original(self, x, norm=norm)
         h, lut = _constants(x.device)

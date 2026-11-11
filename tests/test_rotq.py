@@ -35,7 +35,7 @@ for order in (3,):
 
 import time
 x = torch.randn(8, 4096, dtype=torch.bfloat16, device="xpu")
-for name, fn in (("eager", lambda: quantize_and_rotate_rowwise(x, h, 256)), ("cmdx", lambda: C.rot_quant(x, h, 3))):
+for name, fn in (("eager", lambda: quantize_and_rotate_rowwise(x, h, 256)), ("mono_decode_xpu", lambda: C.rot_quant(x, h, 3))):
     for _ in range(20): fn()
     torch.xpu.synchronize(); t = time.perf_counter()
     for _ in range(200): fn()

@@ -1,0 +1,96 @@
+// Partial split-half RoPE on q and k plus the KV cache write, one launch (decode rows S <= 8).
+//
+// Replaces q35.apply_partial_rope (comfy_kitchen apply_rope_split_half on the first rotary_dim lanes,
+// served by the OmniXPU kitchen backend, then torch.cat with the pass-through lanes) and
+// FixedKVCache.write (index_copy_ of k and v at the device-side positions). Per pair j < half:
+//   o0 = t[j] * f[j][0][0] + t[j + half] * f[j][0][1]
+//   o1 = t[j + half] * f[j][1][1] + t[j] * f[j][1][0]
+// each product rounded to float on its own (no FMA), the sum rounded once to BF16. Matches the live
+// dispatch bit for bit; the kitchen eager backend differs (its addcmul_ is an FMA), so layer.py
+// self-checks against the live path once before using this.
+#include <cstdint>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#pragma clang fp contract(off)
+
+namespace mono_decode_xpu {
+namespace {
+using bf16 = sycl::ext::oneapi::bfloat16;
+class RopeKvKernel;
+
+// z is a runtime 0: the XOR keeps IGC from fusing b * fb into the add (it contracts mul+add into mad
+// even with contract(off)), so both products round on their own as in the live omni rotary kernel.
+inline float rope_pair(float a, float fa, float b, float fb, uint32_t z) {
+#pragma clang fp contract(off)
+    const float o = a * fa;
+    const float p = sycl::bit_cast<float>(sycl::bit_cast<uint32_t>(b * fb) ^ z);
+    const float q = sycl::bit_cast<float>(sycl::bit_cast<uint32_t>(o) ^ z);
+    return q + p;
+}
+}  // namespace
+
+// qn [S, Hq, D], kn [S, Hk, D], vn [S, Hk, D] (contiguous, BF16); freqs [S, rd/2, 2, 2] float with row
+// stride fs (elements, last three dims contiguous); key/value [1, Hk, cap, D]; position int64 [>= S].
+// Returns (q [1, Hq, S, D], k [1, Hk, S, D]) contiguous, as the eager cat outputs.
+std::vector<torch::Tensor> rope_kv(torch::Tensor qn, torch::Tensor kn, torch::Tensor vn, torch::Tensor freqs,
+                                   torch::Tensor key, torch::Tensor value, torch::Tensor position, int64_t rd) {
+    TORCH_CHECK(qn.is_xpu() && qn.scalar_type() == at::kBFloat16 && kn.scalar_type() == at::kBFloat16 &&
+                    vn.scalar_type() == at::kBFloat16, "bf16 q/k/v");
+    TORCH_CHECK(qn.is_contiguous() && kn.is_contiguous() && vn.is_contiguous(), "contiguous [S, H, D] q/k/v");
+    TORCH_CHECK(key.is_contiguous() && value.is_contiguous() && key.scalar_type() == at::kBFloat16 &&
+                    value.scalar_type() == at::kBFloat16 && key.dim() == 4 && key.size(0) == 1, "bf16 [1, Hk, cap, D] cache");
+    TORCH_CHECK(freqs.scalar_type() == at::kFloat && position.scalar_type() == at::kLong, "float freqs, int64 position");
+    const int64_t S = qn.size(0), Hq = qn.size(1), D = qn.size(2), Hk = kn.size(1), cap = key.size(2);
+    TORCH_CHECK(S >= 1 && S <= 8 && kn.size(0) == S && vn.size(0) == S && kn.size(2) == D && key.size(1) == Hk &&
+                    key.size(3) == D && rd % 2 == 0 && rd <= D && position.numel() >= S, "shapes");
+    const int64_t half = rd / 2;
+    TORCH_CHECK(freqs.size(-1) == 2 && freqs.size(-2) == 2 && freqs.size(-3) == half && freqs.stride(-1) == 1 &&
+                    freqs.stride(-2) == 2 && freqs.stride(-3) == 4, "freqs [.., S, rd/2, 2, 2]");
+    TORCH_CHECK(freqs.numel() / (half * 4) == S, "one freqs row per decode row");
+    const int64_t fs = freqs.stride(-4);
+    auto q = torch::empty({1, Hq, S, D}, qn.options());
+    auto k = torch::empty({1, Hk, S, D}, qn.options());
+    const auto* qp = reinterpret_cast<const bf16*>(qn.data_ptr());
+    const auto* kp = reinterpret_cast<const bf16*>(kn.data_ptr());
+    const auto* vp = reinterpret_cast<const bf16*>(vn.data_ptr());
+    const float* fp = freqs.data_ptr<float>();
+    const int64_t* pp = position.data_ptr<int64_t>();
+    auto* oq = reinterpret_cast<bf16*>(q.data_ptr());
+    auto* ok = reinterpret_cast<bf16*>(k.data_ptr());
+    auto* kc = reinterpret_cast<bf16*>(key.data_ptr());
+    auto* vc = reinterpret_cast<bf16*>(value.data_ptr());
+    const uint32_t z = static_cast<uint32_t>(rd >> 20);  // 0 at run time, opaque to the compiler
+    const int64_t H = Hq + 2 * Hk;  // q heads, then k heads, then v heads
+    c10::xpu::getCurrentXPUStream().queue().parallel_for<RopeKvKernel>(
+        sycl::range<3>(S, H, D), [=](sycl::item<3> it) {
+            const int64_t s = it.get_id(0), h = it.get_id(1), d = it.get_id(2);
+            if (h >= Hq + Hk) {  // v: cache write only
+                const int64_t hv = h - Hq - Hk;
+                vc[(hv * cap + pp[s]) * D + d] = vp[(s * Hk + hv) * D + d];
+                return;
+            }
+            const bool isq = h < Hq;
+            const int64_t hh = isq ? h : h - Hq, nh = isq ? Hq : Hk;
+            const bf16* src = (isq ? qp : kp) + (s * nh + hh) * D;
+            bf16 r = src[d];
+            if (d < rd) {
+                const float* f = fp + s * fs;
+                const int64_t j = d < half ? d : d - half;
+                const float lo = static_cast<float>(src[j]), hi = static_cast<float>(src[j + half]);
+                const float* m = f + j * 4;  // [[f00, f01], [f10, f11]]
+                const float o = d < half ? rope_pair(lo, m[0], hi, m[1], z) : rope_pair(hi, m[3], lo, m[2], z);
+                r = static_cast<bf16>(o);
+            }
+            if (isq) oq[(hh * S + s) * D + d] = r;
+            else {
+                ok[(hh * S + s) * D + d] = r;
+                kc[(hh * cap + pp[s]) * D + d] = r;
+            }
+        });
+    return {q, k};
+}
+}  // namespace mono_decode_xpu

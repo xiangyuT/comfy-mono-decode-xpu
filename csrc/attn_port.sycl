@@ -17,7 +17,7 @@
 #include <vector>
 #include <torch/extension.h>
 
-namespace cmdx {
+namespace mono_decode_xpu {
 namespace {
 using BF16 = sycl::ext::oneapi::bfloat16;
 constexpr int TEAM = 256, TILE = 64, ROWS = 4, AWG = 1024, TEAMS = AWG / TEAM, D = 256;
@@ -325,4 +325,4 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
     });
     return merged;
 }
-}  // namespace cmdx
+}  // namespace mono_decode_xpu

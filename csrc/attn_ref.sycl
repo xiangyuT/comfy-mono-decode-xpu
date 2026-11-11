@@ -5,7 +5,7 @@
 #include <torch/extension.h>
 #include <array>
 #include <cmath>
-namespace cmdx {
+namespace mono_decode_xpu {
 namespace refattn {
 namespace {
 using BF16 = sycl::ext::oneapi::bfloat16;
@@ -206,4 +206,4 @@ std::vector<torch::Tensor> attn_ref(torch::Tensor q, torch::Tensor k, torch::Ten
     launch_decode<int32_t>(q,lengths,false,out,lse,k.size(1),k.size(2),DenseReader{view(q),view(k),view(v)},false,dbg.data_ptr<float>());
     return {out,lse};
 }
-}  // namespace cmdx
+}  // namespace mono_decode_xpu

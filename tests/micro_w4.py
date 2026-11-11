@@ -1,4 +1,4 @@
-"""Bit-exactness + micro for cmdx.w4a8_decode_linear vs omni_xpu_kernel w4a8_linear_prequantized.
+"""Bit-exactness + micro for mono_decode_xpu.w4a8_decode_linear vs omni_xpu_kernel w4a8_linear_prequantized.
 Real checkpoint weights (layer 0 / 3 projections), synthetic int8 activations."""
 import sys, json, struct, time, torch
 sys.path.insert(0, "/work")
@@ -45,8 +45,8 @@ for key, n in names.items():
             if not exact: print("MISMATCH", key, M, cols, fast, (out.float()-ref.float()).abs().max().item())
         tr = timeit(lambda i: oi.w4a8_linear_prequantized(x, xs, ws[i % copies][0], ws[i % copies][1], c, codebook=cb, bias=None, group_size=16, out_dtype=torch.bfloat16))
         byts = w.numel() + s.numel()
-        r = {"proj": key, "N": N, "K": K, "M": M, "ref_ms": tr, "cmdx_ms": best[1], "cols": best[0], "exact": best[2],
-             "ref_GBs": byts/tr/1e6, "cmdx_GBs": byts/best[1]/1e6}
+        r = {"proj": key, "N": N, "K": K, "M": M, "ref_ms": tr, "mono_decode_xpu_ms": best[1], "cols": best[0], "exact": best[2],
+             "ref_GBs": byts/tr/1e6, "mono_decode_xpu_GBs": byts/best[1]/1e6}
         print(json.dumps(r), flush=True); res.append(r)
 # same-card read roof: 1 GiB random
 buf = torch.randint(-2**31, 2**31-1, (2**28,), dtype=torch.int32, device=dev)

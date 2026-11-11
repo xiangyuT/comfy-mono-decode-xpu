@@ -21,7 +21,7 @@ import threading
 import torch
 
 CLAIM = "__comfy_mono_decode_xpu_graph__"
-WARMUP = int(os.environ.get("CMDX_GRAPH_WARMUP", "3"))
+WARMUP = int(os.environ.get("MONO_DECODE_XPU_GRAPH_WARMUP", "3"))
 _stats = {"replay": 0, "capture": 0, "eager": 0, "fallback": {}}
 _lock = threading.Lock()
 
@@ -75,13 +75,13 @@ def install():
         rows = embeds.shape[1]
         if not (2 <= rows <= 8) or not all(isinstance(kv, FixedKV) for kv in past_key_values):
             return call()
-        state = getattr(self, "_cmdx_graph", None)
+        state = getattr(self, "_mono_decode_xpu_graph", None)
         key = (id(past_key_values[0]), rows, embeds.shape[0], embeds.dtype)
         if state is None or state["key"] != key:
             if not _resident(self):
                 _fallback("not_resident")
                 return call()
-            state = self._cmdx_graph = {"key": key, "steps": 0, "graph": None, "out": None}
+            state = self._mono_decode_xpu_graph = {"key": key, "steps": 0, "graph": None, "out": None}
         hidden_buffer, rotary_buffer = decode_buffers
         hidden_buffer.copy_(embeds)
         rotary_buffer.copy_(rope_matrix(self.compute_freqs_cis(position_ids, embeds.device)))

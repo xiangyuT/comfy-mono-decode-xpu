@@ -1,4 +1,4 @@
-"""layer_pre / layer_post vs the eager modules (real W4A8 kitchen path, no cmdx patches)."""
+"""layer_pre / layer_post vs the eager modules (real W4A8 kitchen path, no mono_decode_xpu patches)."""
 import sys, time
 sys.path.insert(0, "/artifacts/scripts"); sys.path.insert(0, "/work")
 from load_te import load

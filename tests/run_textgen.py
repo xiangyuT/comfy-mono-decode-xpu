@@ -13,7 +13,7 @@ port = 8288
 log = open(f"{run}/server.log", "wb")
 srv = subprocess.Popen(["/llm/entrypoints/start_comfyui.sh", "--port", str(port), "--listen", "127.0.0.1",
     "--extra-model-paths-config", "/artifacts/scripts/model-paths.yaml", "--output-directory", f"{run}/out",
-    "--user-directory", f"{run}/user", "--input-directory", f"{run}/in", "--disable-auto-launch"] + os.environ.get("CMDX_SERVER_ARGS", extra_env.get("CMDX_SERVER_ARGS", "")).split(),
+    "--user-directory", f"{run}/user", "--input-directory", f"{run}/in", "--disable-auto-launch"] + os.environ.get("MONO_DECODE_XPU_SERVER_ARGS", extra_env.get("MONO_DECODE_XPU_SERVER_ARGS", "")).split(),
     cwd="/llm/ComfyUI", env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 def api(path, data=None):
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=None if data is None else json.dumps(data).encode(),

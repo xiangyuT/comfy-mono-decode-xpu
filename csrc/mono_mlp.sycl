@@ -24,7 +24,7 @@
 
 #include "mono_common.hpp"
 
-namespace cmdx {
+namespace mono_decode_xpu {
 namespace {
 using namespace mono;
 class MonoMlpKernel;
@@ -90,6 +90,7 @@ torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor s
     const int VARIANT = static_cast<int>(stop / 10);  // experiments only; 0 = exact
     const W4 gu[2] = {G, U};
     Stream SG = make_stream(gu, 2, true), SD = make_stream(&D, 1, false);
+    stream_finalize(SG, NW);
     SG.tiled = SD.tiled = tiled;
     {
         int64_t a0, a1, d0, d1;
@@ -191,4 +192,4 @@ torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor s
     });
     return out;
 }
-}  // namespace cmdx
+}  // namespace mono_decode_xpu

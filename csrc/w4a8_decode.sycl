@@ -19,7 +19,7 @@
 #include <torch/extension.h>
 #include <c10/util/Float8_e4m3fn.h>
 
-namespace cmdx {
+namespace mono_decode_xpu {
 namespace {
 
 constexpr int kLanes = 16;  // sub-group size
@@ -391,4 +391,4 @@ torch::Tensor read_checksum(torch::Tensor buf, int64_t wgs) {
     return out;
 }
 
-}  // namespace cmdx
+}  // namespace mono_decode_xpu

@@ -1,18 +1,18 @@
 """In-process TextGenerate-equivalent generate (MOSS official params, fixed tree) + device timeline.
-usage: gen_probe.py MAXLEN [MTP] ; env CMDX_ENABLE/PREP/MONO as in the plugin."""
+usage: gen_probe.py MAXLEN [MTP] ; env MONO_DECODE_XPU_W4/PREP/MONO as in the plugin."""
 import sys, os, json, time, hashlib, collections
 sys.path.insert(0, "/artifacts/scripts"); sys.path.insert(0, "/work")
 ARGV = list(sys.argv)
 from load_te import load
 clip, tm = load()
 import torch, comfy.model_management as mm
-if os.environ.get("CMDX_ENABLE") == "1":
+if os.environ.get("MONO_DECODE_XPU_W4") == "1":
     from comfy_mono_decode_xpu import patch; patch.install()
-if os.environ.get("CMDX_PREP") == "1":
+if os.environ.get("MONO_DECODE_XPU_PREP") == "1":
     import comfy_kitchen; from comfy_mono_decode_xpu import patch; patch.install_prep()
-if os.environ.get("CMDX_MONO") == "1":
+if os.environ.get("MONO_DECODE_XPU_MONO") == "1":
     from comfy_mono_decode_xpu import mono; mono.install()
-if os.environ.get("CMDX_LAYER") == "1":
+if os.environ.get("MONO_DECODE_XPU_LAYER") == "1":
     from comfy_mono_decode_xpu import layer; layer.install()
 W = json.load(open("/artifacts/scripts/moss-api.json"))
 SYS = W["18:14"]["inputs"]["value"]; BASE = W["18:17"]["inputs"]["value"]

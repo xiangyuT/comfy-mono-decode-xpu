@@ -11,8 +11,8 @@ C = _P(); [setattr(C, n, getattr(_C0, n)) for n in dir(_C0) if not n.startswith(
 patch.install(); import comfy_kitchen; patch.install_prep(); mono.install()
 from comfy.text_encoders import qwen35 as q35
 if os.environ.get("GDNMOD"):
-    sys.path.insert(0, "/artifacts/exp/gdnmod"); import cmdx_gdn
-    C.layer_gdn = cmdx_gdn.layer_gdn; C.layer_gdn_scratch = cmdx_gdn.layer_gdn_scratch
+    sys.path.insert(0, "/artifacts/exp/gdnmod"); import mono_decode_xpu_gdn
+    C.layer_gdn = mono_decode_xpu_gdn.layer_gdn; C.layer_gdn_scratch = mono_decode_xpu_gdn.layer_gdn_scratch
 from comfy_kitchen.tensor import QuantizedTensor
 N = int(ARGV[1]) if len(ARGV) > 1 else 200
 res = {"calls": 0}
