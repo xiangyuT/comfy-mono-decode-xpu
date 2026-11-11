@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """ComfyUI custom node entry point (this repo cloned into ComfyUI/custom_nodes/).
 
 Installs the decode hooks at startup and adds no nodes. With MONO_DECODE_XPU unset nothing happens.

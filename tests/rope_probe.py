@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Dump real apply_partial_rope / KV write inputs+outputs (verify S=8 and draft S=1) for the fused rope_kv kernel."""
 import sys, os, json
 sys.path.insert(0, "/artifacts/scripts"); sys.path.insert(0, "/work")

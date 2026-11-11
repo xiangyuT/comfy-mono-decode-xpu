@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Whole-verify XPU graph for Qwen3.5 MTP decode (experimental, resident weights only).
 
 The verify forward of ``Llama2_.forward`` interleaves per-layer host bookkeeping

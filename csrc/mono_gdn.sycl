@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0 AND MIT
+// Portions ported from intel/llm-scaler omni_xpu_kernel kitchen_deferred.cpp (fd4a584, MIT), which follows
+// Strata's verify kernels: Copyright (c) 2026 Niko1221 and the Strata contributors.
+// MIT license text: licenses/Strata-MIT.txt. See THIRD_PARTY_NOTICES.md.
 // Single-launch Qwen3.5 Gated-DeltaNet decode layer (verify rows S <= 8, batch 1), bit-identical to
 //   x += out_proj(GDN(input_layernorm(x)));  x += mlp(post_attention_layernorm(x))
 // with GDN = Kitchen's deferred conv / gates / sums / replay-verify delta (llm-scaler fd4a584
@@ -478,12 +482,6 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
     if (ST >= 6) launch(std::true_type{});
     else launch(std::false_type{});
     return x;
-}
-
-// debug views of the GDN scratch (proj, z, a/b, core) for tests
-std::vector<torch::Tensor> layer_gdn_scratch(torch::Tensor like) {
-    auto& S = gscratch(like);
-    return {S.xn, S.proj, S.z, S.ab, S.core, S.x1, S.dbg};
 }
 
 // the GDN core output of the last layer_gdn launch (rows 0..R-1), input of layer_post

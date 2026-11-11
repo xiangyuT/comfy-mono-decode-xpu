@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """rope_kv vs the eager apply_partial_rope + FixedKVCache.write, on dumped real inputs and synthetic ones."""
 import sys, os
 import torch

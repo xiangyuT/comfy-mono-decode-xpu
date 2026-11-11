@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Shared device code for the persistent decode kernels (mono MLP, layer pre/post).
 #pragma once
 #include <cstdint>

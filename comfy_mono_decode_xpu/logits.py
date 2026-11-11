@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Exact fast top-k / argmax on single-row BF16 logits (the MTP draft and first-token picks).
 
 BaseLlama.logits returns a zero-copy subclass view; its topk (k <= 8, largest, sorted, last dim) and

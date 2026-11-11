@@ -119,6 +119,19 @@ the **llm-scaler-omni 0.2.0-b3 ComfyUI image for BMG**. That image is based on
 `intel/omix:0.4.1-devel-ubuntu24.04` and adds ComfyUI and the XPU components below. Any environment
 with the same components should behave the same.
 
+`0.2.0-b3` is not published as an image; it exists only as a source build. To reproduce the tested
+environment, build it from [intel/llm-scaler](https://github.com/intel/llm-scaler) at commit
+`210b4ce991eb0ef3b0ad4c0c9f38b9806fb7e918`, following `omni/README.md`:
+
+```bash
+git clone https://github.com/intel/llm-scaler && cd llm-scaler
+git checkout 210b4ce991eb0ef3b0ad4c0c9f38b9806fb7e918
+cd omni && OMNI_IMAGE_REPOSITORY=llm-scaler-omni XPU_TARGET=bmg bash build.sh
+# -> llm-scaler-omni:0.2.0-b3-comfyui-bmg
+```
+
+The published image `intel/llm-scaler-omni:0.2.0-b2` is older and has not been tested with this node.
+
 | component | tested version | needed for |
 |---|---|---|
 | GPU | Intel Arc Pro B70 (Xe2 / BMG) | AOT target `bmg` by default; `--target` builds for another Xe2 device |
@@ -225,6 +238,7 @@ csrc/                    SYCL kernels (see docs/DESIGN.md) and bindings
 install.py / install.sh  build the extension in place (ComfyUI-Manager runs install.py)
 build_icpx.sh            the single-invocation icpx build
 pyproject.toml           Comfy Registry metadata
+THIRD_PARTY_NOTICES.md   third-party sources and licenses (full texts in licenses/)
 tests/                   exactness tests and benchmarks (written for the dev container mounts:
                          repo at /work, scripts at /artifacts/scripts)
 ```
@@ -241,4 +255,7 @@ tests/                   exactness tests and benchmarks (written for the dev con
 
 ## License
 
-Apache License 2.0, see [LICENSE](LICENSE).
+Apache License 2.0, see [LICENSE](LICENSE). `csrc/attn_port.sycl` and `csrc/mono_gdn.sycl` contain code
+ported from MIT-licensed Strata kernels (through intel/llm-scaler). `tests/moss-api.json` is an export of
+an MIT-licensed Comfy Org template. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
+[licenses/](licenses/).

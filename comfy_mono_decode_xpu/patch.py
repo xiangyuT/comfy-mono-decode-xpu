@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Route small-M packed W4A8 linears to the fused mono_decode_xpu decode kernel.
 
 The wrapped entry is ``omni_xpu_kernel.int8.w4a8_linear_prequantized``, which the XPU

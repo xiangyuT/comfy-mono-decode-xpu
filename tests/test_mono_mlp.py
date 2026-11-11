@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 import sys, time, json
 sys.path.insert(0, "/artifacts/scripts"); sys.path.insert(0, "/work")
 from load_te import load
@@ -51,13 +52,3 @@ for R in (1, 8):
         ks = [e for e in p.events() if e.device_type == torch.autograd.DeviceType.XPU]
         tot = sum(e.device_time_total for e in ks) / 20
         print(f"TIME R{R} {name}: kernels/call={len(ks)/20:.0f} kernel_us={tot:.1f}", flush=True)
-xn = torch.randn(8, 4096, dtype=torch.bfloat16, device=dev)
-for _ in range(3): C.mono_mlp(xn, H, LUT, *a, 32, 4, False)
-torch.xpu.synchronize()
-d = C.mono_mlp_debug().view(64, 8)[:32, :7].cpu().double()
-d = d - d[:, :1]
-names = ["start", "p1done", "b1pass", "p2done", "b2pass", "b3pass", "p4done"]
-print("PHASE (clock ticks, min/median/max over WGs):", flush=True)
-for i, n in enumerate(names):
-    col = d[:, i]; print(f"PHASE {n:7s} min {col.min().item():10.0f} med {col.median().item():10.0f} max {col.max().item():10.0f}", flush=True)
-sys.exit(0)

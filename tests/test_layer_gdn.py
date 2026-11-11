@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Real in-process generate; for decode GDN blocks compare layer_gdn (on cloned state) against the eager block."""
 import sys, os, json
 ARGV = list(sys.argv)
@@ -10,9 +11,6 @@ class _P: pass
 C = _P(); [setattr(C, n, getattr(_C0, n)) for n in dir(_C0) if not n.startswith("__")]
 patch.install(); import comfy_kitchen; patch.install_prep(); mono.install()
 from comfy.text_encoders import qwen35 as q35
-if os.environ.get("GDNMOD"):
-    sys.path.insert(0, "/artifacts/exp/gdnmod"); import mono_decode_xpu_gdn
-    C.layer_gdn = mono_decode_xpu_gdn.layer_gdn; C.layer_gdn_scratch = mono_decode_xpu_gdn.layer_gdn_scratch
 from comfy_kitchen.tensor import QuantizedTensor
 N = int(ARGV[1]) if len(ARGV) > 1 else 200
 res = {"calls": 0}
@@ -56,13 +54,3 @@ tokens = clip.tokenize(BASE.replace("a model", "a giant"), skip_template=False, 
 ids = clip.generate(tokens, do_sample=True, max_length=64, temperature=0.7, top_k=64, top_p=0.95, min_p=0.05,
                     repetition_penalty=1.0, seed=0, presence_penalty=0.0, mtp="tree4s1m8")
 print("RESULT", json.dumps(res), "tokens", len(ids))
-# phase timing: rerun the last captured inputs a few times (state mutates, fine for timing)
-d = C.layer_gdn_scratch(torch.empty(1, device="xpu"))[-1].view(64, 16)[:32, :12].cpu().double()
-d = d - d[:, :1]
-names = ["start", "P1 norm+rq", "P2 proj+z", "P3 conv+ab", None, "P5 delta", "P6 rq", "P7 out", "P8 norm+rq", "P9 gate/up", "P10 rq", "P11 down"]
-prev = None
-for i, n in enumerate(names):
-    if n is None: continue
-    col = d[:, i] / 2.8e3
-    print(f"PHASE {n:12s} end us med {col.median().item():7.1f} max {col.max().item():7.1f}" + (f"  (+{col.median().item() - prev:.1f})" if prev is not None else ""), flush=True)
-    prev = col.median().item()

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Route Qwen3.5 decode transformer blocks (1-8 verify rows) through the persistent layer kernels.
 
 A block is ``x += mixer(input_layernorm(x)); x += mlp(post_attention_layernorm(x))``. For decode rows

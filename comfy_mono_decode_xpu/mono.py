@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Route Qwen3.5 decode MLP blocks (rows <= 8) to the single-launch mono_decode_xpu.mono_mlp kernel.
 
 ``MLP.forward(x, norm)`` computes ``down(silu(gate(norm(x))) * up(norm(x)))``. For decode rows

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """In-process TextGenerate-equivalent generate (MOSS official params, fixed tree) + device timeline.
 usage: gen_probe.py MAXLEN [MTP] ; env MONO_DECODE_XPU_W4/PREP/MONO as in the plugin."""
 import sys, os, json, time, hashlib, collections

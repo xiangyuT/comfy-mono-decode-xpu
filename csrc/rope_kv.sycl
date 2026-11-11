@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Partial split-half RoPE on q and k plus the KV cache write, one launch (decode rows S <= 8).
 //
 // Replaces q35.apply_partial_rope (comfy_kitchen apply_rope_split_half on the first rotary_dim lanes,

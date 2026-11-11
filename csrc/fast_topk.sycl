@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Exact single-row top-k (k <= 8) and argmax for BF16 logits, one launch.
 //
 // torch XPU topk on one long slice (torch-xpu-ops sbtopk_gather_kernel + segmented sort) returns the

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0 AND MIT
+// Portions ported from intel/llm-scaler omni_xpu_kernel kitchen_decode.cpp (fd4a584, MIT), which follows
+// Strata's SYCL QSA decode: Copyright (c) 2026 Niko1221 and the Strata contributors.
+// MIT license text: licenses/Strata-MIT.txt. See THIRD_PARTY_NOTICES.md.
 // Persistent port of the Kitchen BF16 tree-verify decode attention (llm-scaler fd4a584 kitchen_decode.cpp:
 // DecodeChunks<int, DenseReader> + DecodeCombine + DecodeStepMerge), bit-identical, in one launch.
 //
@@ -61,8 +65,6 @@ inline float warp_sum32(sycl::sub_group sg, float lo, float hi) {
 class AttnCoreKernel;
 torch::Tensor g_prefix, g_lse, g_clk;
 }  // namespace
-
-std::vector<torch::Tensor> attn_core_debug() { return {g_prefix, g_lse, g_clk}; }
 
 torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,
                         torch::Tensor xk, torch::Tensor xv, torch::Tensor mask, int64_t nwg) {

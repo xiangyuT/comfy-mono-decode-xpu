@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Start ComfyUI via the image entrypoint and submit TextGenerate-only graphs (MOSS official PE params).
 usage: run_textgen.py TAG MTP words(comma) [--env K=V ...]"""
 import json, os, subprocess, sys, time, urllib.request, signal

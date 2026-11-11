@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """rope_kv variants vs the live dispatch of q35.apply_partial_rope (OmniXPU kitchen backend registered)."""
 import sys, os
 sys.path.insert(0, "/artifacts/scripts")

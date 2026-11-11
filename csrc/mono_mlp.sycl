@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Persistent single-launch MLP block for Qwen3.5 W4A8 decode (rows <= 8).
 //
 //   q1, s1 = rot_quant(xn)                       phase 1   (one work-group per row)
@@ -28,10 +29,7 @@ namespace mono_decode_xpu {
 namespace {
 using namespace mono;
 class MonoMlpKernel;
-torch::Tensor g_dbg;
 }  // namespace
-
-torch::Tensor mono_mlp_debug() { return g_dbg; }
 
 torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor silu_lut,
                        torch::Tensor gq, torch::Tensor gs, torch::Tensor gsc, torch::Tensor gcb,
@@ -64,7 +62,6 @@ torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor s
     auto& hbuf = found->second.h;
     auto& counter = found->second.cnt;
     auto* dbg = reinterpret_cast<uint64_t*>(found->second.dbg.data_ptr());
-    g_dbg = found->second.dbg;
     auto out = torch::empty({R, N2}, opts);
     const W4 G{gq.data_ptr<int8_t>(), reinterpret_cast<const fp8*>(gs.data_ptr()), gsc.data_ptr<float>(),
                gcb.data_ptr<float>(), N1, K1};

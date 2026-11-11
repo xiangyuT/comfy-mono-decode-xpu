@@ -26,7 +26,6 @@ keeping every output bit unchanged.
 | `csrc/rope_kv.sycl` | Partial split-half RoPE on q/k, the pass-through lanes, and the K/V cache write. |
 | `csrc/fast_topk.sycl` | Single-row top-k (k ≤ 8) / argmax / both, in torch XPU tie order. |
 | `csrc/w4a8_decode.sycl`, `csrc/act_prep.sycl` | Fused small-M W4A8 linear (SLM codebook, DPAS at M=8) and ConvRot rotate + INT8 quantize. |
-| `csrc/gdn_port.sycl`, `csrc/attn_ref.sycl`, `csrc/exact_probe.sycl` | Stand-alone ports and probes used to pin down reference arithmetic. |
 
 ### Stream GEMV engine
 

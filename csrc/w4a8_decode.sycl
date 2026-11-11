@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Fused small-M W4A8 decode linear for Intel Xe2 (BMG).
 //
 // out[m, n] = cast(float(int32_dot(x_q[m], decode(w[n]))) * x_scale[m] * s_channel[n]) (+ residual)
@@ -365,29 +366,6 @@ torch::Tensor w4a8_decode_linear(torch::Tensor x, torch::Tensor x_scale, torch::
             TORCH_CHECK(false, "s_rel must be fp32 or fp8 e4m3");
     };
     if (dtype == at::kFloat) run(float{}); else run(sycl::ext::oneapi::bfloat16{});
-    return out;
-}
-
-// Streaming read used to calibrate the same-card read roof (uint32 sum over all bits).
-class ReadBw;
-torch::Tensor read_checksum(torch::Tensor buf, int64_t wgs) {
-    TORCH_CHECK(buf.is_xpu() && buf.scalar_type() == at::kInt && buf.is_contiguous(), "int32 xpu buffer");
-    const int64_t n = buf.numel() / 4;
-    auto out = torch::zeros({wgs * 256}, buf.options());
-    const auto* p = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(buf.data_ptr());
-    auto* o = reinterpret_cast<uint32_t*>(out.data_ptr());
-    auto& q = c10::xpu::getCurrentXPUStream().queue();
-    q.submit([&](sycl::handler& h) {
-        h.parallel_for<ReadBw>(sycl::nd_range<1>(wgs * 256, 256), [=](sycl::nd_item<1> it) {
-            const int64_t g = it.get_global_id(0), stride = it.get_global_range(0);
-            uint32_t s = 0;
-            for (int64_t i = g; i < n; i += stride) {
-                const auto v = p[i];
-                s += v[0] + v[1] + v[2] + v[3];
-            }
-            o[g] = s;
-        });
-    });
     return out;
 }
 

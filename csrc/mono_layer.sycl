@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Persistent layer segments for Qwen3.5 W4A8 decode (rows <= 8), bit-identical to the eager ops.
 //
 // layer_pre:  xn = RMSNorm(x) (input_layernorm), q = rot_quant(xn), outs[m] = W4_m(q) for up to three

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """In-process: load the MOSS TE (resident, gpu-only) with OmniXPU, return the Qwen35 model."""
 import asyncio, os, sys
 def load():

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Build the extension in place: comfy_mono_decode_xpu/_C*.so.
 
 ComfyUI-Manager runs this after cloning the node, with ComfyUI's Python, in this directory. It can also

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Fused ConvRot activation rotation + row-wise INT8 quantization for decode rows.
 //
 // Reproduces comfy_kitchen's eager quantize_and_rotate_rowwise for BF16 input:

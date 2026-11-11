@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Bit-exactness + micro for mono_decode_xpu.w4a8_decode_linear vs omni_xpu_kernel w4a8_linear_prequantized.
 Real checkpoint weights (layer 0 / 3 projections), synthetic int8 activations."""
 import sys, json, struct, time, torch
@@ -48,12 +49,4 @@ for key, n in names.items():
         r = {"proj": key, "N": N, "K": K, "M": M, "ref_ms": tr, "mono_decode_xpu_ms": best[1], "cols": best[0], "exact": best[2],
              "ref_GBs": byts/tr/1e6, "mono_decode_xpu_GBs": byts/best[1]/1e6}
         print(json.dumps(r), flush=True); res.append(r)
-# same-card read roof: 1 GiB random
-buf = torch.randint(-2**31, 2**31-1, (2**28,), dtype=torch.int32, device=dev)
-for wgs in (2048, 4096, 8192):
-    t = timeit(lambda i: C.read_checksum(buf, wgs), iters=20)
-    print(json.dumps({"read_wgs": wgs, "GBs": buf.numel()*4/t/1e6}))
-ck = C.read_checksum(buf, 4096).to(torch.int64).sum().item() & 0xffffffff
-host = buf.cpu().view(torch.int32).to(torch.int64).sum().item() & 0xffffffff
-print("checksum ok", ck == host)
 json.dump(res, open(sys.argv[1] if len(sys.argv) > 1 else "/artifacts/runs/micro.json", "w"), indent=1)

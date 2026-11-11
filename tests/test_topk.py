@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 import sys, torch
 sys.path.insert(0, "/work")
 from comfy_mono_decode_xpu import _C as C
