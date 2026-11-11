@@ -4,17 +4,37 @@ Bit-exact decode kernels for ComfyUI prompt enhance (`TextGenerate` with MTP) on
 (Xe2 / BMG, Arc Pro B70), for Qwen3.5-9B W4A8 text encoders.
 
 The hooks sit at the model's decode step, so official workflows and templates speed up without new
-nodes. Every replaced op is bit-identical to the eager kernel it replaces, and generated tokens match
-the stock path exactly.
+nodes. Every replaced op is bit-identical to the eager kernel it replaces. Fixed-tree MTP runs preserve
+the generated token IDs; auto MTP can select a different tree and produce different text.
 
 ## Results
 
 All numbers are from one Arc Pro B70 in the llm-scaler-omni 0.2.0-b3 ComfyUI image (see Requirements).
 
-These 2026-11-11 showcase measurements predate the failure-recovery and cache-lifetime fixes.
-The C/D performance comparison has not been rerun after those fixes.
+### Current MOSS-Image C/D comparison (2026-11-12)
 
-### Official MOSS-Image text-to-image template: llm-scaler omni vs omni + mono
+Measured source: [`6357b612da29d23521647f0d323025c8768c1832`](https://github.com/xiangyuT/comfy-mono-decode-xpu/commit/6357b612da29d23521647f0d323025c8768c1832).
+C explicitly sets `MONO_DECODE_XPU=0`; D leaves it unset and exercises the default-on stack.
+Each C-before / D / C-after block uses a fresh server, excludes one cold run and three warmups,
+and measures three forced prompt expansions (text seeds 1/2/3, KSampler seed 42 fixed).
+The official MOSS template keeps 1024x1024, 25 steps, CFG 2.5 and er_sde/simple, in DynamicVRAM mode.
+
+| MTP | C paired mean | D mean | end-to-end change | wins | C before/after drift |
+|---|---:|---:|---:|---:|---:|
+| official auto | 36.395 s | 24.915 s | -31.54% | 3/3 | +0.936% |
+| fixed tree4s1m8 | 34.884 s | 24.738 s | -29.09% | 3/3 | -0.043% |
+
+With the fixed tree, full token sequences match across C/D/C (304/262/372 tokens).
+Prompt enhancement is 15.205 -> 5.050 s;
+decode is 13.666 -> 3.486 s (-74.49%).
+Auto timings include adaptive-tree and text-length differences and do not establish identical-work speedup.
+All 42 complete UI executions produced valid images; all 14 default-on generations ended with no live
+tile references or disabled paths. These are development source-overlay measurements.
+
+### Earlier official MOSS-Image showcase (2026-11-11)
+
+The measurements below predate the failure-recovery and cache-lifetime fixes. They retain their
+original cold/warm sampling scheme and medians; the current comparison above uses paired means.
 
 Workflow: the official `image_moss_image_t2i` template, unchanged except that the KSampler seed is
 fixed to **42** (the template randomizes it). Prompt enhance uses the template defaults: Qwen3.5-9B
