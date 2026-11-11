@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """ComfyUI custom node entry point (this repo cloned into ComfyUI/custom_nodes/).
 
-Installs the decode hooks at startup and adds no nodes. With MONO_DECODE_XPU unset nothing happens.
-MONO_DECODE_XPU=1 turns on the recommended stack (W4, PREP, MONO, LAYER). Each piece can be set on its
+Installs the recommended decode hooks (W4, PREP, MONO, LAYER) by default and adds no nodes.
+MONO_DECODE_XPU=0 turns off the recommended stack. Each piece can be set on its
 own with MONO_DECODE_XPU_<PIECE>=1/0, which also overrides the master switch. Each piece is installed
 on its own: one that fails to install is logged and the others still load.
 """
@@ -13,7 +13,7 @@ import os
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
-_MASTER = os.environ.get("MONO_DECODE_XPU") == "1"
+_MASTER = os.environ.get("MONO_DECODE_XPU", "1") == "1"
 _DEFAULTS = {"W4": _MASTER, "PREP": _MASTER, "MONO": _MASTER, "LAYER": _MASTER, "GRAPH": False}
 
 

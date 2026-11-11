@@ -6,7 +6,7 @@ The variables are read when ComfyUI starts, when the custom node loads. `1` mean
 
 | variable | when unset | effect |
 |---|---|---|
-| `MONO_DECODE_XPU` | off | Master switch. `1` sets `W4`, `PREP`, `MONO` and `LAYER` on. |
+| `MONO_DECODE_XPU` | on | Master switch. `0` disables `W4`, `PREP`, `MONO` and `LAYER` unless a piece is explicitly enabled. |
 | `MONO_DECODE_XPU_LAYER` | same as `MONO_DECODE_XPU` | Decode transformer blocks through the persistent layer kernels. Also installs the attention port, `rope_kv`, the MTP draft attention path, RMSNorm scale caching, the fast logits picks and DynamicVRAM session tiles. |
 | `MONO_DECODE_XPU_MONO` | same as `MONO_DECODE_XPU` | Single-launch MLP block (`mono_mlp`) for decode rows that do not take the layer path. |
 | `MONO_DECODE_XPU_W4` | same as `MONO_DECODE_XPU` | Fused small-M W4A8 linear for packed linears outside the layer kernels. |

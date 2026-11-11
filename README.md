@@ -11,12 +11,16 @@ the stock path exactly.
 
 All numbers are from one Arc Pro B70 in the llm-scaler-omni 0.2.0-b3 ComfyUI image (see Requirements).
 
+These 2026-11-11 showcase measurements predate the failure-recovery and cache-lifetime fixes.
+The C/D performance comparison has not been rerun after those fixes.
+
 ### Official MOSS-Image text-to-image template: llm-scaler omni vs omni + mono
 
 Workflow: the official `image_moss_image_t2i` template, unchanged except that the KSampler seed is
 fixed to **42** (the template randomizes it). Prompt enhance uses the template defaults: Qwen3.5-9B
-W4A8, `auto` MTP, sampling on. **C** is the image default (ComfyUI-OmniXPU, Kitchen XPU, DynamicVRAM);
-**D** is C plus `MONO_DECODE_XPU=1`. Each runs on a fresh server: one cold run, then three warm runs.
+W4A8, `auto` MTP, sampling on. **C** uses ComfyUI-OmniXPU, Kitchen XPU and DynamicVRAM with mono
+disabled (`MONO_DECODE_XPU=0`); **D** uses the same stack with mono enabled (now the default, or
+explicitly `MONO_DECODE_XPU=1`). Each runs on a fresh server: one cold run, then three warm runs.
 The warm runs change only the TextGenerate sampling seed (1, 2, 3; the same seeds for both
 configurations), so prompt enhance and the image stages run again while the model loaders stay
 cached.
@@ -68,7 +72,7 @@ comparison only.
 
 <details><summary>Reference: plain upstream ComfyUI with and without mono</summary>
 
-A = `OMNIXPU_ENABLE=0` (upstream ComfyUI + comfy-kitchen; upstream comfy-aimdo has no XPU
+A = `OMNIXPU_ENABLE=0 MONO_DECODE_XPU=0` (upstream ComfyUI + comfy-kitchen; upstream comfy-aimdo has no XPU
 DynamicVRAM). B = A + `MONO_DECODE_XPU=1`. Both are slow, so they are reference only: A has one
 warm run, and neither was run with the fixed tree.
 
@@ -186,11 +190,11 @@ identical source. The kernels are validated bit-exact against the single-invocat
 ## Use
 
 ```bash
-MONO_DECODE_XPU=1 python main.py ...
+python main.py ...
 ```
 
-The log should show `[mono_decode_xpu] layer installed=True`. Without `MONO_DECODE_XPU`, nothing is
-installed and ComfyUI runs the stock path. Both resident (`--gpu-only --disable-dynamic-vram`) and
+The recommended stack is enabled by default. Set `MONO_DECODE_XPU=0` to disable it.
+The log should show `[mono_decode_xpu] layer installed=True`. Both resident (`--gpu-only --disable-dynamic-vram`) and
 the default DynamicVRAM mode are supported. Calls the kernels do not cover fall back to the original
 code. These include prefill, other quantizations, LoRA weight functions, and batch size above 1.
 A failed pure operation is logged and disabled before trying the stock operation. After a dispatch
@@ -201,13 +205,13 @@ ComfyUI builds with `CombinedLinear` expose a projection interface this version 
 the MLP/layer hooks stay off with a warning. The tested interface is the v0.43.0 stack above.
 See [tests/README.md](tests/README.md) for unit tests and model validation through the ComfyUI UI.
 
-For normal use, set only `MONO_DECODE_XPU=1`. The pieces below can be set one by one, mainly for
+Normal use requires no environment variables. The pieces below can be set one by one, mainly for
 A/B tests. An explicit `1` or `0` on a piece wins over the master switch: for example,
 `MONO_DECODE_XPU=1 MONO_DECODE_XPU_W4=0` runs the recommended stack without the W4 linear.
 
 | variable | when unset | effect |
 |---|---|---|
-| `MONO_DECODE_XPU` | off | Master switch: `1` turns on the four pieces below |
+| `MONO_DECODE_XPU` | on | Master switch: `0` disables the four pieces below unless a piece is explicitly enabled |
 | `MONO_DECODE_XPU_LAYER` | same as `MONO_DECODE_XPU` | The main speedup. Decode layers run in persistent kernels, with the attention port, fused RoPE + KV write and fast draft top-k/argmax. |
 | `MONO_DECODE_XPU_MONO` | same as `MONO_DECODE_XPU` | Fallback: one-launch MLP block for decode rows that miss the layer path |
 | `MONO_DECODE_XPU_W4` | same as `MONO_DECODE_XPU` | Fallback: fused small-M W4A8 linear for linears outside the layer kernels |
