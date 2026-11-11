@@ -1,0 +1,321 @@
+// Persistent port of the Kitchen BF16 tree-verify decode attention (llm-scaler fd4a584 kitchen_decode.cpp:
+// DecodeChunks<int, DenseReader> + DecodeCombine + DecodeStepMerge), bit-identical, in one launch.
+//
+// The Kitchen kernels run 256-thread work-groups of eight SIMD32 warps. Here a 1024-thread SIMD16
+// work-group runs four such 256-thread teams in lockstep (same trip counts: every pack of a (kv head,
+// split) sees the same key range), and a SIMD32 warp is emulated by one SIMD16 sub-group holding two
+// lanes per work-item (virtual lanes j and j + 16), so the SIMD32 halving reductions (lanes i + i+16,
+// then +8, +4, +2, +1) are reproduced exactly. Arithmetic follows the source; contraction as built.
+#include <cmath>
+#include <cstdint>
+#include <map>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/experimental/clock.hpp>
+#include <vector>
+#include <torch/extension.h>
+
+namespace cmdx {
+namespace {
+using BF16 = sycl::ext::oneapi::bfloat16;
+constexpr int TEAM = 256, TILE = 64, ROWS = 4, AWG = 1024, TEAMS = AWG / TEAM, D = 256;
+
+struct V4 {  // [B, H, S, D] strided bf16 view
+    const BF16* p;
+    int64_t s0, s1, s2, s3;
+    float at(int b, int h, int s, int d) const { return float(p[b * s0 + h * s1 + s * s2 + d * s3]); }
+};
+V4 v4(const torch::Tensor& t) {
+    return {reinterpret_cast<const BF16*>(t.data_ptr()), t.stride(0), t.stride(1), t.stride(2), t.stride(3)};
+}
+
+inline void grid_sync_a(sycl::nd_item<1>& it, uint32_t* counter, uint32_t nwg, uint32_t& epoch) {
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+    sycl::group_barrier(it.get_group());
+    if (it.get_local_id(0) == 0) {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space> a(*counter);
+        const uint32_t target = (++epoch) * nwg;
+        a.fetch_add(1u);
+        while (a.fetch_add(0u) < target) {
+        }
+    } else {
+        ++epoch;
+    }
+    sycl::group_barrier(it.get_group());
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+}
+
+// SIMD32 halving sum of 32 virtual lanes held as (v[j], v[j + 16]) by the 16 work-items of a sub-group
+inline float warp_sum32(sycl::sub_group sg, float lo, float hi) {
+    float a = lo + hi;
+    a = a + sycl::shift_group_left(sg, a, 8);
+    a = a + sycl::shift_group_left(sg, a, 4);
+    a = a + sycl::shift_group_left(sg, a, 2);
+    a = a + sycl::shift_group_left(sg, a, 1);
+    return sycl::group_broadcast(sg, a, 0);
+}
+
+class AttnCoreKernel;
+torch::Tensor g_prefix, g_lse, g_clk;
+}  // namespace
+
+std::vector<torch::Tensor> attn_core_debug() { return {g_prefix, g_lse, g_clk}; }
+
+torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,
+                        torch::Tensor xk, torch::Tensor xv, torch::Tensor mask, int64_t nwg) {
+    const bool debug = nwg < 0;  // negative nwg: also write the combined prefix / LSE and phase clocks
+    if (debug) nwg = -nwg;
+    TORCH_CHECK(q.is_xpu() && q.scalar_type() == at::kBFloat16 && q.dim() == 4 && q.size(3) == D, "q bf16 [B, H, S, 256]");
+    TORCH_CHECK(key.is_contiguous() && value.is_contiguous() && key.sizes() == value.sizes() && key.size(3) == D, "cache [B, Hk, cap, 256]");
+    TORCH_CHECK(seqlen.scalar_type() == at::kInt && mask.scalar_type() == at::kInt && mask.is_contiguous(), "int32 seqlen / mask");
+    const int B = q.size(0), H = q.size(1), S = q.size(2), HK = key.size(1), cap = key.size(2);
+    TORCH_CHECK(B == 1 && S >= 1 && S <= 8 && H % HK == 0 && mask.numel() == S, "batch 1, 1..8 rows");
+    const int groups = H / HK, rows = groups * S, packs = (rows + ROWS - 1) / ROWS;
+    const int splits = std::min(32, std::max(1, (cap + 255) / 256));
+    const int split_tiles = ((cap + TILE - 1) / TILE + splits - 1) / splits;
+    // Kitchen computes 1/sqrt(D) on the host from the runtime head size; icpx's default fast-math host
+    // code turns that into an approximate reciprocal square root (0.062499996 for D = 256, not 0.0625).
+    // Evaluate the same expression on a runtime value so the constant cannot be folded exactly.
+    volatile int64_t d_rt = q.size(3);
+    const float scale = 1.0f / std::sqrt(float(d_rt));
+    auto opts = q.options();
+    auto partial = torch::empty({B, H, S, splits, D}, opts.dtype(at::kFloat));
+    auto stats = torch::empty({B, H, S, splits}, opts.dtype(at::kFloat));
+    auto merged = torch::empty({B, S, H * D}, opts);
+    BF16* dprefix = nullptr;
+    float* dlse = nullptr;
+    uint64_t* clk = nullptr;
+    if (debug) {
+        g_prefix = torch::empty({B, S, H * D}, opts);
+        g_lse = torch::empty({B, H, S}, opts.dtype(at::kFloat));
+        g_clk = torch::zeros({64 * 4}, opts.dtype(at::kLong));
+        dprefix = reinterpret_cast<BF16*>(g_prefix.data_ptr());
+        dlse = g_lse.data_ptr<float>();
+        clk = reinterpret_cast<uint64_t*>(g_clk.data_ptr());
+    }
+    static std::map<int, torch::Tensor> counters;
+    auto& cnt_t = counters[q.get_device()];
+    if (!cnt_t.defined()) cnt_t = torch::zeros({2}, opts.dtype(at::kInt));
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    int64_t cores = queue.get_device().get_info<sycl::info::device::max_compute_units>() / 8;
+    if (nwg <= 0 || nwg > cores) nwg = cores;
+    const uint32_t NW = static_cast<uint32_t>(nwg);
+    const V4 Q = v4(q), XK = v4(xk), XV = v4(xv);
+    const BF16* Kc = reinterpret_cast<const BF16*>(key.data_ptr());
+    const BF16* Vc = reinterpret_cast<const BF16*>(value.data_ptr());
+    const int* lens = seqlen.data_ptr<int>();
+    const int* masks = mask.data_ptr<int>();
+    float* part = partial.data_ptr<float>();
+    float* st = stats.data_ptr<float>();
+    BF16* dest = reinterpret_cast<BF16*>(merged.data_ptr());
+    uint32_t* cnt = reinterpret_cast<uint32_t*>(cnt_t.data_ptr());
+    // phase A tasks: (kv head, split, quad of packs); phase B tasks: quads of (h, s) items
+    const int tasksA = HK * packs * splits;
+    const int itemsB = B * H * S, tasksB = (itemsB + TEAMS - 1) / TEAMS;
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 2> sq(sycl::range<2>(ROWS, D), cgh);
+        sycl::local_accessor<float, 2> sp(sycl::range<2>(ROWS, TILE), cgh);
+        sycl::local_accessor<float, 1> bm(ROWS, cgh), bs(ROWS, cgh);
+        sycl::local_accessor<BF16, 1> vs(TILE * D, cgh);
+        sycl::local_accessor<float, 2> score(sycl::range<2>(TEAMS, 8), cgh);
+        cgh.parallel_for<AttnCoreKernel>(sycl::nd_range<1>(NW * AWG, AWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+#pragma clang fp contract(off)
+            auto sg = it.get_sub_group();
+            const int t = it.get_local_id(0), team = t / TEAM, tt = t % TEAM;
+            const int lane = sg.get_local_id()[0], wsg = (tt / 16);  // virtual warp = SIMD16 sub-group of the team (16 per team)
+            const uint32_t wg = it.get_group(0);
+            uint32_t epoch = 0;
+            const int64_t raw_length = lens[0];
+            const int64_t length = raw_length < 0 ? 0 : (raw_length > cap ? cap : raw_length);
+            if (clk && t == 0) clk[wg * 4] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+            // ---- phase A: DecodeChunks, one (kv head, pack, split) unit per work-group ----
+            // work-item t owns accumulator (row g = t / 256, dim = t % 256); sub-group sgi scores key
+            // row sgi of a tile for all four rows; sub-group g < 4 runs row g's tile softmax
+            const int sgi = t / 16, ga = t / D, da = t % D;
+            for (int task = wg; task < tasksA; task += NW) {
+                const int split = task % splits, pack = (task / splits) % packs, kh = task / (splits * packs);
+                const int begin = split * split_tiles * TILE;
+                const int end = sycl::min(cap, begin + split_tiles * TILE);
+                const int max_limit = rows > 0 && length > 0 ? int(length) : 0;  // non-causal: every row sees the prefix
+                if (!(begin < end && begin < max_limit)) {  // nothing to attend: the Kitchen kernel writes 0 / -inf
+                    const int row = pack * ROWS + ga;
+                    if (row < rows) {
+                        const int h = kh * groups + row / S, s = row % S;
+                        const int64_t pos = (int64_t(h) * S + s) * splits + split;
+                        part[pos * D + da] = 0.f;
+                        if (da == 0) st[pos] = -INFINITY;
+                    }
+                    continue;
+                }
+                {
+                    const int row = pack * ROWS + ga, h = kh * groups + row / S, s = row % S;
+                    sq[ga][da] = row < rows ? Q.at(0, h, s, da) : 0.f;
+                }
+                int limit[ROWS];
+#pragma unroll
+                for (int g = 0; g < ROWS; ++g) limit[g] = pack * ROWS + g < rows ? max_limit : 0;
+                sycl::group_barrier(it.get_group());
+                float acc = 0.f, maximum = -INFINITY, denominator = 0.f;
+                const bool row_ok = pack * ROWS + ga < rows;
+                for (int base = begin; base < end && base < max_limit; base += TILE) {
+                    // stage this tile's values in SLM with one 32 B load per work-item (64 keys x 256 dims)
+                    const int nk = sycl::max(0, sycl::min(TILE, max_limit - base));
+                    {
+                        const int key = t / 16, part16 = t % 16;  // 16 x 16 bf16 per key row
+                        sycl::vec<uint32_t, 8> pk(0u);
+                        if (key < nk)
+                            pk.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                                reinterpret_cast<const uint32_t*>(Vc + ((int64_t(kh) * cap) + base + key) * D + part16 * 16)));
+                        pk.store(0, sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                            reinterpret_cast<uint32_t*>(&vs[key * D + part16 * 16])));
+                    }
+#ifndef EXP_NOSCORE
+                    {
+                        const int r = sgi;  // 64 sub-groups, 64 keys per tile
+                        const bool live = base + r < max_limit;
+                        float k0[8], k1[8];
+                        const BF16* krow = Kc + ((int64_t(kh) * cap) + base + r) * D + lane;
+#pragma unroll
+                        for (int d = 0; d < 8; ++d) {
+                            k0[d] = live ? float(krow[32 * d]) : 0.f;
+                            k1[d] = live ? float(krow[16 + 32 * d]) : 0.f;
+                        }
+#pragma unroll
+                        for (int g = 0; g < ROWS; ++g) {
+                            float d0 = k0[0] * sq[g][lane], d1 = k1[0] * sq[g][lane + 16];
+#pragma unroll
+                            for (int d = 1; d < 8; ++d) {
+                                d0 = sycl::fma(k0[d], sq[g][lane + 32 * d], d0);
+                                d1 = sycl::fma(k1[d], sq[g][lane + 16 + 32 * d], d1);
+                            }
+                            const float dot = warp_sum32(sg, d0, d1);
+                            if (lane == 0) sp[g][r] = base + r < limit[g] ? dot * scale : -INFINITY;
+                        }
+                    }
+#else
+                    if (t < ROWS * TILE) sp[t / TILE][t % TILE] = 0.25f;
+#endif
+                    sycl::group_barrier(it.get_group());
+#ifndef EXP_NOSOFT
+                    if (sgi < ROWS) {
+                        const int g = sgi;
+                        const float a0 = sp[g][lane], a1 = sp[g][lane + 16];
+                        const float c0 = sp[g][lane + 32], c1 = sp[g][lane + 48];
+                        float mx = sycl::fmax(sycl::fmax(a0, c0), sycl::fmax(a1, c1));
+                        mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+                        const float m = mx;
+                        const float pa0 = m == -INFINITY ? 0.f : sycl::exp(a0 - m), pc0 = m == -INFINITY ? 0.f : sycl::exp(c0 - m);
+                        const float pa1 = m == -INFINITY ? 0.f : sycl::exp(a1 - m), pc1 = m == -INFINITY ? 0.f : sycl::exp(c1 - m);
+                        sp[g][lane] = pa0; sp[g][lane + 16] = pa1;
+                        sp[g][lane + 32] = pc0; sp[g][lane + 48] = pc1;
+                        const float sum = warp_sum32(sg, pa0 + pc0, pa1 + pc1);
+                        if (lane == 0) { bm[g] = m; bs[g] = sum; }
+                    }
+#else
+                    if (t < ROWS) { bm[t] = 0.5f; bs[t] = 3.f; }
+#endif
+                    sycl::group_barrier(it.get_group());
+                    {
+                        const float m = sycl::fmax(maximum, bm[ga]);
+                        const float old = maximum == -INFINITY ? 0.f : sycl::exp(maximum - m);
+                        const float factor = bm[ga] == -INFINITY ? 0.f : sycl::exp(bm[ga] - m);
+                        acc = acc * old;
+                        // Kitchen ISA: den = fma(den, old, bs * factor)
+                        const float bf = bs[ga] * factor;
+                        denominator = sycl::fma(denominator, old, bf);
+                        maximum = m;
+#ifndef EXP_NOACC
+                        auto spl = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(&sp[ga][0]);
+                        for (int j0 = 0; j0 < nk; j0 += 8) {
+                            sycl::vec<float, 8> pr;
+                            pr.load(0, spl + j0);  // all lanes read the same 32 B: one broadcast message
+                            float vv[8];
+#pragma unroll
+                            for (int j = 0; j < 8; ++j) vv[j] = float(vs[(j0 + j) * D + da]);
+#pragma unroll
+                            for (int j = 0; j < 8; ++j) {
+                                const float weight = j0 + j < nk ? pr[j] * factor : 0.f;
+                                const float upd = sycl::fma(weight, vv[j], acc);
+                                acc = weight > 0 ? upd : acc;
+                            }
+                        }
+#endif
+                    }
+                    sycl::group_barrier(it.get_group());
+                }
+                if (row_ok) {
+                    const int row = pack * ROWS + ga, h = kh * groups + row / S, s = row % S;
+                    const int64_t pos = (int64_t(h) * S + s) * splits + split;
+                    part[pos * D + da] = denominator > 0 ? acc / denominator : 0.f;
+                    if (da == 0) st[pos] = denominator > 0 ? maximum + sycl::log(denominator) : -INFINITY;
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            if (clk && t == 0) clk[wg * 4 + 1] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+            grid_sync_a(it, cnt, NW, epoch);
+            if (clk && t == 0) clk[wg * 4 + 2] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+            // ---- phase B: DecodeCombine + DecodeStepMerge per (h, s) ----
+            for (int task = wg; task < tasksB; task += NW) {
+                const int index = task * TEAMS + team;
+                const bool ok = index < itemsB;
+                const int s = ok ? index % S : 0, h = ok ? index / S % H : 0, kh = h / (H / HK);
+                // combine (thread tt = dim)
+                float m = -INFINITY, sum = 0, val = 0;
+                for (int i = 0; i < splits; ++i) m = sycl::fmax(m, ok ? st[int64_t(index) * splits + i] : -INFINITY);
+                for (int i = 0; i < splits; ++i) {
+                    const int64_t p = int64_t(index) * splits + i;
+                    if (!ok || st[p] == -INFINITY) continue;
+                    const float w = sycl::exp(st[p] - m);
+                    sum += w;
+                    val = sycl::fma(w, part[p * D + tt], val);
+                }
+                const float prefix = float(BF16(sum > 0 ? val / sum : 0.f));
+                const float ls = sum > 0 ? m + sycl::log(sum) : -INFINITY;
+                if (ok && dprefix) {
+                    dprefix[((int64_t(0) * S + s) * H + h) * D + tt] = BF16(prefix);
+                    if (tt == 0) dlse[index] = ls;
+                }
+                // merge scores: virtual warp wsg < 8 = row
+                if (wsg < 8) {
+                    const int row = wsg;
+                    const bool allowed = ok && row < S && ((masks[s] >> row) & 1);
+                    float d0 = 0.f, d1 = 0.f;
+                    if (allowed)
+                        for (int d = 0; d < 8; ++d) {
+                            d0 = sycl::fma(Q.at(0, h, s, lane + 32 * d), XK.at(0, kh, row, lane + 32 * d), d0);
+                            d1 = sycl::fma(Q.at(0, h, s, lane + 16 + 32 * d), XK.at(0, kh, row, lane + 16 + 32 * d), d1);
+                        }
+                    const float dot = warp_sum32(sg, d0, d1);
+                    if (lane == 0) score[team][row] = allowed ? dot * scale : -INFINITY;
+                }
+                sycl::group_barrier(it.get_group());
+                if (ok) {
+                    float mm = ls;
+                    for (int i = 0; i < S; ++i) mm = sycl::fmax(mm, score[team][i]);
+                    const float wp = ls == -INFINITY ? 0.f : sycl::exp(ls - mm);
+                    float sm = wp, value = wp > 0 ? wp * prefix : 0.f;
+                    for (int i = 0; i < S; ++i) {
+                        if (score[team][i] == -INFINITY) continue;
+                        const float w = sycl::exp(score[team][i] - mm);
+                        sm += w;
+                        value = sycl::fma(w, XV.at(0, kh, i, tt), value);
+                    }
+                    dest[((int64_t(0) * S + s) * H + h) * D + tt] = BF16(sm > 0 ? value / sm : 0.f);
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            sycl::group_barrier(it.get_group());
+            if (clk && t == 0) clk[wg * 4 + 3] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+            if (t == 0) {
+                sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space> done(cnt[1]), c0(cnt[0]);
+                if (done.fetch_add(1u) == NW - 1) { c0.store(0u); done.store(0u); }
+            }
+        });
+    });
+    return merged;
+}
+}  // namespace cmdx

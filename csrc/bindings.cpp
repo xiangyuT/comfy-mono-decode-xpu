@@ -25,6 +25,10 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                         torch::Tensor sums_buf, torch::Tensor gnorm_w, double gnorm_eps, double qscale, int64_t hk,
                         torch::Tensor norm_post, double eps_post, torch::Tensor silu_lut, int64_t nwg, int64_t stop);
 std::vector<torch::Tensor> layer_gdn_scratch(torch::Tensor like);
+torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,
+                        torch::Tensor xk, torch::Tensor xv, torch::Tensor mask, int64_t nwg);
+std::vector<torch::Tensor> attn_core_debug();
+std::vector<torch::Tensor> attn_ref(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor lengths, torch::Tensor dbg);
 void gdn_conv_port(torch::Tensor proj, torch::Tensor state, torch::Tensor weight, std::optional<torch::Tensor> bias,
                    torch::Tensor prev, torch::Tensor qkv, torch::Tensor ctl);
 torch::Tensor gdn_delta_port(torch::Tensor x, torch::Tensor wa, torch::Tensor wb, torch::Tensor dt, torch::Tensor gd,
@@ -57,6 +61,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("linear_ab", &cmdx::linear_ab);
     m.def("layer_gdn", &cmdx::layer_gdn);
     m.def("layer_gdn_scratch", &cmdx::layer_gdn_scratch);
+    m.def("attn_core", &cmdx::attn_core);
+    m.def("attn_core_debug", &cmdx::attn_core_debug);
+    m.def("attn_ref", &cmdx::attn_ref);
     m.def("gdn_conv_port", &cmdx::gdn_conv_port);
     m.def("gdn_delta_port", &cmdx::gdn_delta_port);
     m.def("layer_pre", &cmdx::layer_pre, py::arg("x"), py::arg("norm_w"), py::arg("eps"), py::arg("hadamard"), py::arg("mats"),

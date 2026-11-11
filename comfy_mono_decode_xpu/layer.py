@@ -23,11 +23,13 @@ _stats = {"layer": 0, "fallback": {}}
 _lock = threading.Lock()
 _consts = {}
 _single_gdn = __import__("os").environ.get("CMDX_GDN1", "1") == "1"
+_attn_port = __import__("os").environ.get("CMDX_ATTN", "1") == "1"
 
 
 def stats():
     with _lock:
-        return {"layer": _stats["layer"], "gdn1": _stats.get("gdn1", 0), "fallback": dict(_stats["fallback"])}
+        return {"layer": _stats["layer"], "gdn1": _stats.get("gdn1", 0), "attn": _stats.get("attn", 0),
+                "fallback": dict(_stats["fallback"])}
 
 
 def _fallback(why):
@@ -153,6 +155,16 @@ def _attn_core(mix, qg, xk, xv, attention_mask, freqs_cis, optimized_attention, 
         past_key_value.write(xk, xv)
     if decode and (isinstance(past_key_value, Int8FixedKVCache) or
                    mix.comfy_attention.method is None and not comfy.model_management.comfy_kitchen_attention_enabled()):
+        tree = getattr(past_key_value, "tracker", {}).get("tree")
+        if (_attn_port and tree is not None and type(past_key_value).__name__ == "FixedKVCache" and B == 1
+                and xq.shape[-1] == 256 and past_key_value.key.is_contiguous() and past_key_value.value.is_contiguous()
+                and past_key_value.key.dtype == torch.bfloat16 and tree.mask.numel() == S):
+            # Kitchen's tree-verify decode attention (decode_gqa + tree_merge), bit-identical, one launch
+            from . import _C
+            with _lock:
+                _stats["attn"] = _stats.get("attn", 0) + 1
+            return _C.attn_core(xq, past_key_value.key, past_key_value.value, past_key_value.seqlen, xk, xv,
+                                tree.mask.to(torch.int32), 0)
         return past_key_value.attend(xq, xk, xv)
     if decode:
         xk, xv = past_key_value.key, past_key_value.value
