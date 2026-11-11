@@ -120,6 +120,7 @@ struct Stream {
     bool pair;         // tile list g0,u0,g1,u1,... (nm == 2)
     int64_t tiles;     // total tiles over all matrices
     int ksplit;        // K chunks per tile (power of two)
+    bool tiled;        // tile-major W4 copy (resident weights) or the checkpoint's row-major layout
 };
 
 inline Stream make_stream(const W4* ms, int nm, bool pair) {
@@ -130,6 +131,7 @@ inline Stream make_stream(const W4* ms, int nm, bool pair) {
     for (int i = 0; i < 3; ++i) st.m[i] = ms[i < nm ? i : 0];
     for (int i = 0; i < nm; ++i) st.tiles += ms[i].n / 16;
     st.ksplit = 1;
+    st.tiled = true;
     return st;
 }
 
@@ -164,6 +166,7 @@ inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st
     const int total = mine * steps;
     const int8_t* q0 = st.m[0].q; const int8_t* q1 = st.m[1].q; const int8_t* q2 = st.m[2].q;
     const fp8* s0 = st.m[0].s; const fp8* s1 = st.m[1].s; const fp8* s2 = st.m[2].s;
+    const bool tiled = st.tiled;
     // tile-major weights (see the W4 layout note): a sub-group's K32 step is one contiguous 256 B block
     auto tile_of = [&](int u, int& which) {
         int tile;
@@ -176,7 +179,8 @@ inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st
         const int64_t tile = tile_of(u, which);
         const int kk = (u & kmask) * klen + ls * 32;
         const int8_t* q = which == 0 ? q0 : (which == 1 ? q1 : q2);
-        return reinterpret_cast<const uint32_t*>(q + ((tile * (K / 32) + kk / 32) * 16 + lane) * 16);
+        return reinterpret_cast<const uint32_t*>(tiled ? q + ((tile * (K / 32) + kk / 32) * 16 + lane) * 16
+                                                       : q + (tile * 16 + lane) * (K / 2) + kk / 2);
     };
     auto sptr = [&](int su, int sb) {  // 16 B = scale pairs of one block (8 steps)
         const int u = sgi + su * MSG;
@@ -184,7 +188,8 @@ inline void stream_gemv(sycl::nd_item<1>& it, const int8_t* xq, const Stream& st
         const int64_t tile = tile_of(u, which);
         const int kk = (u & kmask) * klen + sb * 256;
         const fp8* s = which == 0 ? s0 : (which == 1 ? s1 : s2);
-        return reinterpret_cast<const uint32_t*>(s + ((tile * (K / 256) + kk / 256) * 16 + lane) * 16);
+        return reinterpret_cast<const uint32_t*>(tiled ? s + ((tile * (K / 256) + kk / 256) * 16 + lane) * 16
+                                                       : s + (tile * 16 + lane) * (K / 16) + kk / 16);
     };
     constexpr int PF = 4;
     sycl::vec<uint32_t, 4> ring[PF], scur, snxt;

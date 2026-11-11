@@ -13,6 +13,7 @@ Every segment is bit-identical to the eager kernels, so tokens do not change. An
 """
 from __future__ import annotations
 
+import contextlib
 import threading
 
 import torch
@@ -48,75 +49,107 @@ def _constants(device):
     return c
 
 
-def _w4(lin):
-    from .mono import _w4 as w4
-    return w4(lin)
+def _vbar(mod, device):
+    """DynamicVRAM-managed module whose weight lives off-device between uses."""
+    return hasattr(mod, "_v") and getattr(mod, "weight", None) is not None and mod.weight.device != device
 
 
-def _plan(block):
-    """Per-block cached kernel arguments, or None when the block is not eligible."""
-    cached = getattr(block, "_cmdx_plan", None)
+def _static_plan(block):
+    """Per-block structural checks, done once (they read only host-side module state)."""
+    cached = getattr(block, "_cmdx_static", None)
     if cached is not None:
-        key, plan = cached
-        if key == _key(block):
-            return plan
-    plan = _build_plan(block)
-    block._cmdx_plan = (_key(block), plan)
-    return plan
-
-
-def _key(block):
-    mlp = block.mlp
-    return tuple(getattr(getattr(l, "weight", None), "_qdata", None) is not None and l.weight._qdata.data_ptr()
-                 for l in (mlp.gate_proj, mlp.up_proj, mlp.down_proj))
-
-
-def _build_plan(block):
+        return cached[0]
+    from .mono import _static_ok
     gdn = block.layer_type == "linear_attention"
     mix = block.linear_attn if gdn else block.self_attn
     pre = [mix.in_proj_qkv, mix.in_proj_z] if gdn else [mix.q_proj, mix.k_proj, mix.v_proj]
     out = mix.out_proj if gdn else mix.o_proj
     mlp = block.mlp
-    if getattr(mlp, "merged_mlp", False):
-        return None
-    parts = [_w4(l) for l in pre + [out, mlp.gate_proj, mlp.up_proj, mlp.down_proj]]
+    lins = pre + [out, mlp.gate_proj, mlp.up_proj, mlp.down_proj]
+    plan = None
+    ok = not getattr(mlp, "merged_mlp", False) and all(_static_ok(l) for l in lins)
+    if ok:
+        cb = lins[0].weight._params.codebook
+        ok = all(torch.equal(cb.cpu(), l.weight._params.codebook.cpu()) for l in lins[1:])
+    for n in (block.input_layernorm, block.post_attention_layernorm):
+        ok = ok and n.weight.dtype == torch.bfloat16 and n.weight.numel() == 4096
+    if gdn:
+        ok = ok and mix.num_key_heads * mix.key_head_dim == mix.key_dim and mix.value_dim == 4096
+        ok = ok and mix.conv1d.bias is None and not getattr(mix.conv1d, "weight_function", None)
+        for lin in (mix.in_proj_a, mix.in_proj_b):
+            ok = ok and getattr(lin, "bias", None) is None and not getattr(lin, "weight_function", None)
+    else:
+        ok = ok and mix.num_heads * mix.head_dim == 4096
+    if ok:
+        plan = {"gdn": gdn, "mix": mix, "lins": lins, "npre": len(pre)}
+    block._cmdx_static = (plan,)
+    return plan
+
+
+def _norm_weight(norm, device):
+    # RMSNorm(add=True) weight + 1 (BF16, as the eager scale()), cached on the compute device
+    w = norm.weight
+    cached = getattr(norm, "_cmdx_w1", None)
+    key = (w.data_ptr(), w.device, device)
+    if cached is None or cached[0] != key:
+        cached = (key, comfy_cast(norm.scale(), device).contiguous())
+        norm._cmdx_w1 = cached
+    return cached[1]
+
+
+def comfy_cast(t, device):
+    import comfy.model_management
+    return comfy.model_management.cast_to(t, dtype=t.dtype, device=device)
+
+
+def _cast(es, mod, x):
+    """The module weight for this call: resident tensor, or the DynamicVRAM cast (held until es exits)."""
+    import comfy.ops
+    if _vbar(mod, x.device):
+        w, _ = es.enter_context(comfy.ops.CastBiasWeightContext(mod, x, offloadable=True, compute_dtype=x.dtype))
+        return w, True
+    return mod.weight, False
+
+
+def _args(block, sp, x, es):
+    """Kernel arguments for this call, or None (fall back)."""
+    from .mono import _w4
+    from comfy_kitchen.tensor import QuantizedTensor
+    lins, npre, mix = sp["lins"], sp["npre"], sp["mix"]
+    dev = x.device
+    tiled = not any(_vbar(l, dev) for l in lins)
+    if tiled:
+        parts = [_w4(l) for l in lins]  # cached tile-major copies of resident weights
+    else:
+        parts = []
+        for l in lins:
+            w, _ = _cast(es, l, x)
+            parts.append(_w4(l, w))
     if any(p is None for p in parts):
         return None
-    cb = parts[0][3]
-    if not all(torch.equal(cb, p[3]) for p in parts[1:]):
-        return None
-    for n in (block.input_layernorm, block.post_attention_layernorm):
-        if n.weight.device.type != "xpu" or n.weight.dtype != torch.bfloat16 or n.weight.numel() != 4096:
-            return None
-    if gdn and not (mix.num_key_heads * mix.key_head_dim == mix.key_dim and mix.value_dim == 4096):
-        return None
-    if not gdn and mix.num_heads * mix.head_dim != 4096:
-        return None
-    extra = None
-    if gdn:
-        from comfy_kitchen.tensor import QuantizedTensor
+    a = {"tiled": tiled, "pre": sum(parts[:npre], []), "out": parts[npre], "mlp": sum(parts[npre + 1:], []),
+         "norm_in": (_norm_weight(block.input_layernorm, dev), block.input_layernorm.eps),
+         "norm_post": (_norm_weight(block.post_attention_layernorm, dev), block.post_attention_layernorm.eps)}
+    if sp["gdn"]:
         ws = []
         for lin in (mix.in_proj_a, mix.in_proj_b):
-            w = lin.weight
-            if getattr(lin, "weight_function", None) or getattr(lin, "bias", None) is not None or w.device.type != "xpu":
-                return None
-            w = w.dequantize() if isinstance(w, QuantizedTensor) else w
-            if w.dtype != torch.bfloat16 or tuple(w.shape) != (mix.num_value_heads, 4096):
+            w, cast = _cast(es, lin, x)
+            if not cast:
+                cached = getattr(lin, "_cmdx_bf16", None)
+                if cached is None or cached[0] is not w:
+                    cached = (w, (w.dequantize() if isinstance(w, QuantizedTensor) else w).contiguous())
+                    lin._cmdx_bf16 = cached
+                w = cached[1]
+            elif isinstance(w, QuantizedTensor):
+                w = w.dequantize()  # as the eager GDN decode branch does on every call
+            if w.device != dev or w.dtype != torch.bfloat16 or tuple(w.shape) != (mix.num_value_heads, 4096):
                 return None
             ws.append(w.contiguous())
-        cw = mix.conv1d.weight
-        if cw.device.type != "xpu" or cw.dtype != torch.bfloat16 or mix.conv1d.bias is not None or getattr(mix.conv1d, "weight_function", None):
+        cw, _ = _cast(es, mix.conv1d, x)
+        if cw.device != dev or cw.dtype != torch.bfloat16:
             return None
-        extra = {"wa": ws[0], "wb": ws[1], "conv_w": cw.contiguous()}
-    return {
-        "gdn": gdn,
-        "extra": extra,
-        "pre": sum(parts[:len(pre)], []),
-        "out": parts[len(pre)],
-        "mlp": sum(parts[len(pre) + 1:], []),
-        "norm_in": (block.input_layernorm.scale().contiguous(), block.input_layernorm.eps),
-        "norm_post": (block.post_attention_layernorm.scale().contiguous(), block.post_attention_layernorm.eps),
-    }
+        a["extra"] = {"wa": ws[0], "wb": ws[1], "conv_w": cw.contiguous()}
+    return a
 
 
 def _gdn_core(mix, xn, proj, z, kv):
@@ -226,10 +259,19 @@ def install():
             return original(self, x, attention_mask, freqs_cis, optimized_attention, past_key_value)
         if not gdn and not (S <= SPEC_ROWS and attention_mask is None):
             return original(self, x, attention_mask, freqs_cis, optimized_attention, past_key_value)
-        plan = _plan(self)
-        if plan is None:
+        sp = _static_plan(self)
+        if sp is None:
             _fallback("weights")
             return original(self, x, attention_mask, freqs_cis, optimized_attention, past_key_value)
+        with contextlib.ExitStack() as es:
+            plan = _args(self, sp, x, es)
+            if plan is not None:
+                return _run(self, plan, x, S, gdn, attention_mask, freqs_cis, optimized_attention, past_key_value)
+        _fallback("weights")
+        return original(self, x, attention_mask, freqs_cis, optimized_attention, past_key_value)
+
+    def _run(self, plan, x, S, gdn, attention_mask, freqs_cis, optimized_attention, past_key_value):
+        tiled = plan["tiled"]
         h, silu, sig = _constants(x.device)
         x2 = x.view(S, 4096)
         if gdn and _single_gdn:
@@ -239,13 +281,13 @@ def install():
             _C.layer_gdn(x2, nin, ein, h, plan["pre"] + plan["out"] + plan["mlp"], ex["wa"], ex["wb"], ex["conv_w"],
                          kv.conv_state, kv.proj_buf, kv.qkv_buf, kv.ctl, kv.dt_bias, kv.g_decay, kv.recurrent_state,
                          kv.gates_buf, kv.sumsq_buf, kv.norm_weight, mix.norm.eps, mix.key_head_dim ** -0.5,
-                         mix.num_key_heads, npo, epo, silu, 0, 11)
+                         mix.num_key_heads, npo, epo, silu, 0, 11, tiled)
             with _lock:
                 _stats["layer"] += 1
                 _stats["gdn1"] = _stats.get("gdn1", 0) + 1
             return x, past_key_value
         nw, eps = plan["norm_in"]
-        outs = _C.layer_pre(x2, nw, eps, h, plan["pre"], 0)
+        outs = _C.layer_pre(x2, nw, eps, h, plan["pre"], 0, tiled)
         gate = None
         if gdn:
             mix = self.linear_attn
@@ -258,7 +300,7 @@ def install():
                            attention_mask, freqs_cis, optimized_attention, past_key_value).reshape(S, 4096)
             gate = outs[1]
         nw, eps = plan["norm_post"]
-        _C.layer_post(x2, y.contiguous(), gate, sig, *plan["out"], nw, eps, h, silu, *plan["mlp"], 0, 6)
+        _C.layer_post(x2, y.contiguous(), gate, sig, *plan["out"], nw, eps, h, silu, *plan["mlp"], 0, 6, tiled)
         with _lock:
             _stats["layer"] += 1
         return x, past_key_value

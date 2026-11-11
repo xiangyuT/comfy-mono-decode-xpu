@@ -68,7 +68,7 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                         torch::Tensor conv_state, torch::Tensor proj_buf, torch::Tensor qkv_buf, torch::Tensor ctl,
                         torch::Tensor dt_bias, torch::Tensor g_decay, torch::Tensor rec_state, torch::Tensor gates_buf,
                         torch::Tensor sums_buf, torch::Tensor gnorm_w, double gnorm_eps, double qscale, int64_t hk,
-                        torch::Tensor norm_post, double eps_post, torch::Tensor silu_lut, int64_t nwg, int64_t stop) {
+                        torch::Tensor norm_post, double eps_post, torch::Tensor silu_lut, int64_t nwg, int64_t stop, bool tiled) {
     using T = bf16;
     TORCH_CHECK(x.is_xpu() && x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.size(-1) == 4096, "x bf16 [..., 4096]");
     const int R = static_cast<int>(x.numel() / 4096);
@@ -95,6 +95,7 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
     const W4 pre[2] = {QKV, Z}, gu[2] = {G, U};
     Stream SP = make_stream(pre, 2, false), SO = make_stream(&O, 1, false), SG = make_stream(gu, 2, true), SD = make_stream(&Dn, 1, false);
     for (Stream* st : {&SP, &SO, &SG, &SD}) {
+        st->tiled = tiled;
         int64_t a0, a1;
         stream_range(*st, 0, NW, a0, a1);
         TORCH_CHECK((a1 - a0) * 128 <= ACC, "SLM accumulators");

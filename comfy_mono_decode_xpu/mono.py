@@ -40,28 +40,48 @@ def _constants(device):
     return c
 
 
-def _w4(lin):
-    w = getattr(lin, "weight", None)
+def _layout_ok(w):
     p = getattr(w, "_params", None)
     q = getattr(w, "_qdata", None)
-    if p is None or q is None or w.device.type != "xpu":
+    if p is None or q is None:
+        return False
+    return not (getattr(p, "mma_packed", False) or getattr(p, "transposed", False) or p.group_size != 16
+                or p.convrot_groupsize != 256 or p.correction is not None or p.codebook is None
+                or q.dtype != torch.int8 or q.dim() != 2 or not q.is_contiguous()
+                or p.scale.dtype != torch.float8_e4m3fn or not p.scale.is_contiguous()
+                or q.shape[0] % 16 or (2 * q.shape[1]) % 256)
+
+
+def _static_ok(lin):
+    """Module-level contract, checked once on the module's own (possibly host-side) weight: no bias or
+    weight functions, and FP8 scale bytes inside the pair table (0x00-0x7F, non-negative)."""
+    cached = getattr(lin, "_cmdx_static", None)
+    w = getattr(lin, "weight", None)
+    key = id(getattr(w, "_qdata", None))
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    ok = (_layout_ok(w) and getattr(lin, "bias", None) is None and not getattr(lin, "weight_function", None)
+          and not getattr(lin, "bias_function", None) and int(w._params.scale.view(torch.uint8).max()) < 128)
+    lin._cmdx_static = (key, ok)
+    return ok
+
+
+def _w4(lin, w=None):
+    """Kernel arguments for a packed W4A8 linear. Resident weights (w None): a cached tile-major copy.
+    A DynamicVRAM weight cast for this call (w given): the checkpoint's row-major tensors, no copy."""
+    if w is not None:
+        if not _static_ok(lin) or w.device.type != "xpu" or not _layout_ok(w):
+            return None
+        p = w._params
+        return [w._qdata, p.scale, p.s_channel.float().contiguous(), p.codebook.float().contiguous()]
+    w = getattr(lin, "weight", None)
+    if w is None or w.device.type != "xpu" or not _static_ok(lin):
         return None
-    if (getattr(p, "mma_packed", False) or getattr(p, "transposed", False) or p.group_size != 16
-            or p.convrot_groupsize != 256 or p.correction is not None or p.codebook is None
-            or q.dtype != torch.int8 or q.dim() != 2 or not q.is_contiguous()
-            or p.scale.dtype != torch.float8_e4m3fn or not p.scale.is_contiguous()):
-        return None
-    if getattr(lin, "bias", None) is not None or getattr(lin, "weight_function", None) or getattr(lin, "bias_function", None):
-        return None
+    q, p = w._qdata, w._params
     cache = getattr(lin, "_cmdx_w4", None)
     if cache is None or cache[0] is not q:
-        # the kernel's pair table covers FP8 scale bytes 0x00-0x7F (non-negative scales)
-        n, k2 = q.shape
-        ok = int(p.scale.view(torch.uint8).max()) < 128 and n % 16 == 0 and (2 * k2) % 256 == 0
-        parts = None
-        if ok:
-            parts = [tile_major(q, 16), tile_major(p.scale.view(torch.uint8), 16).view(torch.float8_e4m3fn),
-                     p.s_channel.float().contiguous(), p.codebook.float().contiguous()]
+        parts = [tile_major(q, 16), tile_major(p.scale.view(torch.uint8), 16).view(torch.float8_e4m3fn),
+                 p.s_channel.float().contiguous(), p.codebook.float().contiguous()]
         cache = (q, parts)
         lin._cmdx_w4 = cache
     return cache[1]

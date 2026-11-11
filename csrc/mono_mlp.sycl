@@ -36,7 +36,7 @@ torch::Tensor mono_mlp_debug() { return g_dbg; }
 torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor silu_lut,
                        torch::Tensor gq, torch::Tensor gs, torch::Tensor gsc, torch::Tensor gcb,
                        torch::Tensor uq, torch::Tensor us, torch::Tensor usc, torch::Tensor ucb,
-                       torch::Tensor dq, torch::Tensor ds, torch::Tensor dsc, torch::Tensor dcb, int64_t nwg, int64_t stop) {
+                       torch::Tensor dq, torch::Tensor ds, torch::Tensor dsc, torch::Tensor dcb, int64_t nwg, int64_t stop, bool tiled) {
     TORCH_CHECK(xn.is_xpu() && xn.scalar_type() == at::kBFloat16 && xn.is_contiguous(), "xn bf16");
     const int64_t K1 = xn.size(-1), R = xn.numel() / K1, N1 = gq.size(0), N2 = dq.size(0);
     TORCH_CHECK(R >= 1 && R <= 8, "1..8 rows");
@@ -90,6 +90,7 @@ torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor s
     const int VARIANT = static_cast<int>(stop / 10);  // experiments only; 0 = exact
     const W4 gu[2] = {G, U};
     Stream SG = make_stream(gu, 2, true), SD = make_stream(&D, 1, false);
+    SG.tiled = SD.tiled = tiled;
     {
         int64_t a0, a1, d0, d1;
         stream_range(SG, 0, NW, a0, a1);

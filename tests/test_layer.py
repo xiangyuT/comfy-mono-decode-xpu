@@ -38,7 +38,7 @@ with comfy.ops.use_quantized_matmul(clip.cond_stage_model, dev), torch.no_grad()
                 xn_ref = L.input_layernorm(x)
                 refs = [lin(xn_ref.view(1, R, 4096)).view(R, -1) for lin in pre_lins]
                 mats = sum([wp(l) for l in pre_lins], [])
-                outs = C.layer_pre(x, nw_in, L.input_layernorm.eps, H, mats, 0)
+                outs = C.layer_pre(x, nw_in, L.input_layernorm.eps, H, mats, 0, True)
                 tot["pre.xn"] = tot.get("pre.xn", 0) + bad(outs[0], xn_ref)
                 for i, r in enumerate(refs): tot[f"pre.{i}"] = tot.get(f"pre.{i}", 0) + bad(outs[1 + i], r)
                 # post
@@ -48,7 +48,7 @@ with comfy.ops.use_quantized_matmul(clip.cond_stage_model, dev), torch.no_grad()
                 x1 = x + olin(yy.view(1, R, 4096)).view(R, 4096)
                 x2 = x1 + mlp(x1.view(1, R, 4096), norm=L.post_attention_layernorm).view(R, 4096)
                 xo = x.clone()
-                C.layer_post(xo, y.contiguous(), gate, SIG, *wp(olin), nw_post, L.post_attention_layernorm.eps, H, SILU, *mm, 0, 6)
+                C.layer_post(xo, y.contiguous(), gate, SIG, *wp(olin), nw_post, L.post_attention_layernorm.eps, H, SILU, *mm, 0, 6, True)
                 tot["post"] = tot.get("post", 0) + bad(xo, x2)
         print("layer", li, "gdn" if gdn else "attn", tot, flush=True)
     # timing (layer 0 GDN, layer 3 attn), R=8
@@ -59,8 +59,8 @@ with comfy.ops.use_quantized_matmul(clip.cond_stage_model, dev), torch.no_grad()
         mats = sum([wp(l) for l in pre_lins], []); mm = wp(L.mlp.gate_proj) + wp(L.mlp.up_proj) + wp(L.mlp.down_proj)
         x = xs(8, "normal", 0.5); y = xs(8, "normal", 0.3)
         nw_in = L.input_layernorm.scale().contiguous(); nw_post = L.post_attention_layernorm.scale().contiguous()
-        fns = {"pre": lambda: C.layer_pre(x, nw_in, 1e-6, H, mats, 0),
-               "post": lambda: C.layer_post(x.clone(), y, None, SIG, *wp(olin), nw_post, 1e-6, H, SILU, *mm, 0, 6)}
+        fns = {"pre": lambda: C.layer_pre(x, nw_in, 1e-6, H, mats, 0, True),
+               "post": lambda: C.layer_post(x.clone(), y, None, SIG, *wp(olin), nw_post, 1e-6, H, SILU, *mm, 0, 6, True)}
         for n, fn in fns.items():
             for _ in range(5): fn()
             torch.xpu.synchronize()
