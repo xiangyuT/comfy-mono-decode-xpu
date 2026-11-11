@@ -56,9 +56,14 @@ keeping every output bit unchanged.
 - Each call takes the linear's GPU weight from `comfy.ops.CastBiasWeightContext`, the same VBAR
   cast the eager forward uses. The weight stays pinned until the kernel is enqueued.
 - Module-level contract checks (layout, scale range, codebook) run once, on host-side metadata.
-- While a generate runs, each weight seen is copied tile-major once, keyed by module and address.
-  This only happens when free VRAM allows; the copies are dropped at the end. This closed the gap to
-  resident mode.
+- Resident and DynamicVRAM copies have the same per-generate owner. They are keyed by the canonical
+  module weight, so a new temporary VBAR cast address reuses the copy. Layout is chosen after
+  prefill from actual weight storage and the live allocator/inference budget, including VBAR
+  residency outside Torch. Component copies and graph/weight caches are dropped on success,
+  cancellation or failure; the global allocator pool is kept.
+- Stateful dispatch is an error-recovery boundary: once KV, recurrent state or x may have been
+  written, the wrapper propagates errors instead of replaying the layer. Only pure operations may
+  retry the stock path after disabling their accelerated route.
 
 ## Exactness
 

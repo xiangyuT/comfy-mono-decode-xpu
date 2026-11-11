@@ -16,6 +16,8 @@ import threading
 
 import torch
 
+from . import guard
+
 CLAIM = "__comfy_mono_decode_xpu__"
 _stats = {"fused": 0, "fallback": 0, "reasons": {}}
 _lock = threading.Lock()
@@ -65,9 +67,14 @@ def install():
 
     def w4a8_linear_prequantized(x_int8, x_scale, packed, relative_scale, channel_scale,
                                  codebook=None, bias=None, group_size=16, out_dtype=torch.bfloat16):
-        if torch.compiler.is_compiling():
+        if guard.off("w4") or torch.compiler.is_compiling():
             return original(x_int8, x_scale, packed, relative_scale, channel_scale, codebook, bias, group_size, out_dtype)
         why = _contract(x_int8, x_scale, packed, relative_scale, channel_scale, codebook, bias, group_size, out_dtype)
+        if why is None and (x_scale.device != x_int8.device or relative_scale.device != x_int8.device
+                            or channel_scale.device != x_int8.device or packed.device != x_int8.device
+                            or (codebook is not None and codebook.device != x_int8.device)
+                            or x_scale.numel() != x_int8.numel() // x_int8.shape[-1]):
+            why = "operands"
         if why is not None:
             _reason(why)
             return original(x_int8, x_scale, packed, relative_scale, channel_scale, codebook, bias, group_size, out_dtype)
@@ -75,11 +82,15 @@ def install():
             if fn is not None:
                 fn()
         k = x_int8.shape[-1]
-        x2 = x_int8.reshape(-1, k)
-        xs = x_scale.reshape(-1).to(torch.float32).contiguous()
-        sc = channel_scale.reshape(-1).to(torch.float32).contiguous()
-        out = _C.w4a8_decode_linear(x2, xs, packed, relative_scale, sc, codebook, None, group_size,
-                                    0 if out_dtype == torch.float32 else 2, 0, False)
+        try:
+            x2 = x_int8.reshape(-1, k)
+            xs = x_scale.reshape(-1).to(torch.float32).contiguous()
+            sc = channel_scale.reshape(-1).to(torch.float32).contiguous()
+            out = _C.w4a8_decode_linear(x2, xs, packed, relative_scale, sc, codebook, None, group_size,
+                                        0 if out_dtype == torch.float32 else 2, 0, False)
+        except Exception as e:  # pure function of its inputs: the original recomputes it
+            guard.failed("w4", e)
+            return original(x_int8, x_scale, packed, relative_scale, channel_scale, codebook, bias, group_size, out_dtype)
         with _lock:
             _stats["fused"] += 1
         return out.reshape(*x_int8.shape[:-1], packed.shape[0])
@@ -87,9 +98,12 @@ def install():
     setattr(w4a8_linear_prequantized, CLAIM, True)
     w4a8_linear_prequantized.__wrapped__ = original
     oint8.w4a8_linear_prequantized = w4a8_linear_prequantized
-    out = os.environ.get("MONO_DECODE_XPU_STATS")
-    if out:
-        atexit.register(lambda: open(out, "w").write(json.dumps(_stats)))
+    output = os.environ.get("MONO_DECODE_XPU_STATS")
+    if output:
+        def export_stats():
+            with open(output, "w") as stream:
+                json.dump(stats(), stream)
+        atexit.register(export_stats)
     return True
 
 
@@ -107,15 +121,20 @@ def install_prep():
 
         def quantize_and_rotate_rowwise(x, h, group_size, stochastic_rounding=0, _original=original):
             k = x.shape[-1] if x.dim() else 0
-            ok = (group_size == 256 and not stochastic_rounding and x.device.type == "xpu"
+            ok = (not guard.off("prep") and group_size == 256 and not stochastic_rounding and x.device.type == "xpu"
                   and x.dtype == torch.bfloat16 and h.dtype == torch.bfloat16 and h.numel() == 65536
                   and k and k % 2048 == 0 and k <= 12288 and 1 <= x.numel() // k <= 8)
             if not ok:
                 _reason("prep")
                 return _original(x, h, group_size, stochastic_rounding)
+            try:
+                out = _C.rot_quant(x.contiguous(), h.contiguous(), 3)
+            except Exception as e:
+                guard.failed("prep", e)
+                return _original(x, h, group_size, stochastic_rounding)
             with _lock:
                 _stats["prep"] = _stats.get("prep", 0) + 1
-            return _C.rot_quant(x.contiguous(), h.contiguous(), 3)
+            return out
 
         setattr(quantize_and_rotate_rowwise, CLAIM, True)
         quantize_and_rotate_rowwise.__wrapped__ = original

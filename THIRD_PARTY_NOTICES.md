@@ -40,12 +40,9 @@ third-party sources. Those sources and their licenses are listed below.
 
 ## Comfy Org workflow_templates (MIT)
 
-- Source: https://github.com/Comfy-Org/workflow_templates.
-- Copyright (c) 2023-present Comfy Org.
-- License: MIT, full text in [licenses/ComfyOrg-workflow_templates-MIT.txt](licenses/ComfyOrg-workflow_templates-MIT.txt).
-- Used in: `tests/moss-api.json`, an API-format export of the official `image_moss_image_t2i`
-  template (templates commit `611c497`), including its prompts, with the values stored in the
-  template. Test scripts set the KSampler seed at run time.
+- Reference workflows: https://github.com/Comfy-Org/workflow_templates.
+- Model validation uses the official MOSS template through the ComfyUI UI. The template JSON and
+  model-running development scripts are not distributed with this package.
 
 ## PyTorch / torch-xpu-ops (BSD-3-Clause)
 

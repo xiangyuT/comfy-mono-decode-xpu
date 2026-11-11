@@ -12,7 +12,6 @@ The variables are read when ComfyUI starts, when the custom node loads. `1` mean
 | `MONO_DECODE_XPU_W4` | same as `MONO_DECODE_XPU` | Fused small-M W4A8 linear for packed linears outside the layer kernels. |
 | `MONO_DECODE_XPU_PREP` | same as `MONO_DECODE_XPU` | ConvRot rotate + row INT8 quantize in one launch (`rot_quant`). |
 | `MONO_DECODE_XPU_GRAPH` | off | Experimental XPU graph over the verify step. Resident weights only, and not needed with `LAYER`. |
-| `MONO_DECODE_XPU_REPO` | the node directory | Where the node imports `comfy_mono_decode_xpu` from. |
 
 A piece set explicitly overrides the master switch, e.g. `MONO_DECODE_XPU=1 MONO_DECODE_XPU_W4=0`.
 
@@ -30,8 +29,8 @@ These all default to `1`. Set `0` to fall back to the stock code for that part o
 | `MONO_DECODE_XPU_LOGITS` | Exact single-launch top-k / argmax on draft and first-token logits. |
 | `MONO_DECODE_XPU_PICK` | Argmax and top-8 in one pass, reused by the topk that follows. |
 | `MONO_DECODE_XPU_TILED` | Tile-major W4 copies. `0` makes the kernels read row-major weights even when resident. |
-| `MONO_DECODE_XPU_SESSION_TILES` | Per-generate tile-major copies under DynamicVRAM. |
-| `MONO_DECODE_XPU_TILE_MARGIN_GB` | Default `3`. Free VRAM kept beyond the ~5 GB copy before session tiles are made. |
+| `MONO_DECODE_XPU_SESSION_TILES` | Per-generate tile-major copies in resident and DynamicVRAM modes. |
+| `MONO_DECODE_XPU_TILE_MARGIN_GB` | Default `3`. Free VRAM kept beyond the actual model-copy requirement and inference reserve. |
 
 ## Other
 

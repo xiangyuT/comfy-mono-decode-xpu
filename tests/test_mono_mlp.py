@@ -1,54 +1,41 @@
 # SPDX-License-Identifier: Apache-2.0
-import sys, time, json
-sys.path.insert(0, "/artifacts/scripts"); sys.path.insert(0, "/work")
-from load_te import load
-clip, tm = load()
-import torch, torch.nn.functional as F
-from comfy_mono_decode_xpu import _C as C
-from comfy_kitchen.tensor.int8_utils import _build_hadamard
-dev = torch.device("xpu")
-H = _build_hadamard(256, device=dev, dtype=torch.bfloat16)
-allbf = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).to(dev)
-LUT = F.silu(allbf).contiguous()
-def wparts(lin):
-    w = lin.weight; p = w._params
-    return [w._qdata.contiguous(), p.scale.contiguous(), p.s_channel.float().contiguous(), p.codebook.float().contiguous()]
-def eager(mlp, xn):
-    return mlp.down_proj(F.silu(mlp.gate_proj(xn)) * mlp.up_proj(xn))
-def chain(xn2, a):
-    q1, s1 = C.rot_quant(xn2, H, 3)
-    gq, gs, gsc, gcb, uq, us, usc, ucb, dq, ds, dsc, dcb = a
-    gt = C.w4a8_decode_linear(q1, s1.view(-1), gq, gs, gsc, gcb, None, 16, 2, 0, False)
-    up = C.w4a8_decode_linear(q1, s1.view(-1), uq, us, usc, ucb, None, 16, 2, 0, False)
-    h = (LUT[gt.view(torch.int16).long() & 0xffff].float() * up.float()).to(torch.bfloat16)
-    hh = (F.silu(gt) * up)
-    q2, s2 = C.rot_quant(h.contiguous(), H, 3)
-    return C.w4a8_decode_linear(q2, s2.view(-1), dq, ds, dsc, dcb, None, 16, 2, 0, False), torch.equal(h, hh)
-res = {}
-g = torch.Generator(device="cpu").manual_seed(3)
-bad_total = 0
-for li in (0, 3, 17, 31):
-    mlp = tm.model.layers[li].mlp
-    a = wparts(mlp.gate_proj) + wparts(mlp.up_proj) + wparts(mlp.down_proj)
-    for R in (1, 3, 8):
-        for kind in ("normal", "outlier", "wide"):
-            x = torch.randn(R, 4096, generator=g)
-            if kind == "outlier": x[:, torch.randint(0, 4096, (8,), generator=g)] *= 200
-            if kind == "wide": x = x * torch.exp(torch.randn(R, 4096, generator=g) * 2)
-            xn = x.to(torch.bfloat16).to(dev)
-            ch, _ = chain(xn, a)
-            mo = C.mono_mlp(xn, H, LUT, *a, 32, 4, False)
-            b = (mo.view(torch.int16) != ch.view(torch.int16)).sum().item(); bad_total += b
-    print(f"MONO layer {li}: mismatches vs chain so far {bad_total}", flush=True)
-mlp = tm.model.layers[0].mlp; a = wparts(mlp.gate_proj) + wparts(mlp.up_proj) + wparts(mlp.down_proj)
-for R in (1, 8):
-    xn = torch.randn(R, 4096, dtype=torch.bfloat16, device=dev)
-    for name, fn in [("chain", lambda: chain(xn, a))] + [(f"mono-stop{st}", (lambda st: lambda: C.mono_mlp(xn, H, LUT, *a, 32, st, False))(st)) for st in (1, 2, 3, 4)]:
-        for _ in range(10): fn()
-        torch.xpu.synchronize()
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.XPU]) as p:
-            for _ in range(20): fn()
-            torch.xpu.synchronize()
-        ks = [e for e in p.events() if e.device_type == torch.autograd.DeviceType.XPU]
-        tot = sum(e.device_time_total for e in ks) / 20
-        print(f"TIME R{R} {name}: kernels/call={len(ks)/20:.0f} kernel_us={tot:.1f}", flush=True)
+"""mono_mlp (one launch) against the chain of separately tested kernels it fuses:
+rot_quant -> w4a8 gate/up -> SiLU(gate) * up -> rot_quant -> w4a8 down. Row-major and tile-major
+weight layouts must give the same bits."""
+import pytest
+import torch
+import torch.nn.functional as F
+
+from comfy_mono_decode_xpu.tiles import tile_major
+from conftest import bits_equal
+from test_w4a8_linear import random_w4
+
+
+def test_mono_mlp_matches_chain(C):
+    pytest.importorskip("comfy_kitchen")
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard
+    g = torch.Generator(device="cpu").manual_seed(1)
+    H = _build_hadamard(256, device="xpu", dtype=torch.bfloat16)
+    allbf = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16).xpu()
+    lut = F.silu(allbf).contiguous()
+    gate, up, down = random_w4(12288, 4096, g), random_w4(12288, 4096, g), random_w4(4096, 12288, g)
+    up = (up[0], up[1], up[2], gate[3])      # one shared codebook, as the kernels require
+    down = (down[0], down[1], down[2], gate[3])
+    tiled = [(tile_major(q, 16), tile_major(s.view(torch.uint8), 16).view(torch.float8_e4m3fn), c, cb)
+             for q, s, c, cb in (gate, up, down)]
+
+    def lin(q8, s8, w):
+        return C.w4a8_decode_linear(q8, s8.view(-1), w[0], w[1], w[2], w[3], None, 16, 2, 0, False)
+
+    for M in (1, 3, 8):
+        xn = (torch.randn(M, 4096, generator=g)).to(torch.bfloat16).xpu()
+        q1, s1 = C.rot_quant(xn, H, 3)
+        gt, u = lin(q1, s1, gate), lin(q1, s1, up)
+        h = (lut[gt.view(torch.int16).long() & 0xFFFF].float() * u.float()).to(torch.bfloat16)
+        q2, s2 = C.rot_quant(h.contiguous(), H, 3)
+        ref = lin(q2, s2, down)
+        args = [t for w in (gate, up, down) for t in w]
+        out = C.mono_mlp(xn, H, lut, *args, 0, 4, False)
+        assert bits_equal(out, ref), ("row-major", M)
+        out_t = C.mono_mlp(xn, H, lut, *[t for w in tiled for t in w], 0, 4, True)
+        assert bits_equal(out_t, ref), ("tile-major", M)

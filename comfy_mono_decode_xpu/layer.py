@@ -14,35 +14,45 @@ whose projections are all packed W4A8 (G16, FP8 group scales, ConvRot 256, one c
 
 Also installed here: the attention port for FixedKVCache.attend, the BF16 MTP draft block's attention
 through the same rope_kv/attn_core path, RMSNorm scale caching, the fast logits picks (logits.py) and
-per-generate tile-major weight copies under DynamicVRAM.
+the per-generate tile-major weight copies (tiles.py).
 
 Every launch is bit-identical to the eager kernels it replaces, so tokens do not change. Any other
-call (prefill, offloaded or differently quantized weights) runs the original forward.
+call (prefill, offloaded or differently quantized weights) runs the original forward. A fast path
+that raises is switched off (guard.py) and the call runs the original code, unless the layer state
+was already updated in place, in which case the error is re-raised.
 """
 from __future__ import annotations
 
 import contextlib
+import logging
+import os
 import threading
 
 import torch
 import torch.nn.functional as F
 
+from . import guard, tiles
+
 CLAIM = "__comfy_mono_decode_xpu_layer__"
 _stats = {"layer": 0, "fallback": {}}
 _lock = threading.Lock()
 _consts = {}
-_single_gdn = __import__("os").environ.get("MONO_DECODE_XPU_GDN1", "1") == "1"
-_attn_port = __import__("os").environ.get("MONO_DECODE_XPU_ATTN", "1") == "1"
-_gdn_split = __import__("os").environ.get("MONO_DECODE_XPU_GDN_SPLIT", "1") == "1"
-_tiled_ok = __import__("os").environ.get("MONO_DECODE_XPU_TILED", "1") == "1"  # 0: row-major even when resident (A/B)
-_rope_fused = __import__("os").environ.get("MONO_DECODE_XPU_ROPE", "1") == "1"
+_single_gdn = os.environ.get("MONO_DECODE_XPU_GDN1", "1") == "1"
+_attn_port = os.environ.get("MONO_DECODE_XPU_ATTN", "1") == "1"
+_gdn_split = os.environ.get("MONO_DECODE_XPU_GDN_SPLIT", "1") == "1"
+_rope_fused = os.environ.get("MONO_DECODE_XPU_ROPE", "1") == "1"
 _rope_state = {"ok": None}  # fused rope + KV write: None until the one-time check against the live path
 
 
 def stats():
     with _lock:
-        return {"layer": _stats["layer"], "gdn1": _stats.get("gdn1", 0), "attn": _stats.get("attn", 0),
-                "session_tile_bytes": _stats.get("session_tile_bytes", 0), "rope": _stats.get("rope", 0), "fallback": dict(_stats["fallback"])}
+        out = {"layer": _stats["layer"], "gdn1": _stats.get("gdn1", 0), "attn": _stats.get("attn", 0),
+               "rope": _stats.get("rope", 0), "fallback": dict(_stats["fallback"])}
+    t = tiles.stats()
+    out.update(session_tile_bytes=t["tile_bytes"], session_tile_oom=t["tile_oom"],
+               session_tile_live_bytes=t["live_bytes"], session_active=t["active"],
+               weight_layout=t["budget"], disabled=guard.disabled())
+    return out
 
 
 def _fallback(why):
@@ -67,10 +77,20 @@ def _vbar(mod, device):
 
 
 def _static_plan(block):
-    """Per-block structural checks, done once (they read only host-side module state)."""
+    """Per-block structural checks, done once (they read only host-side module state). Any unexpected
+    structure means "not supported" (None), never an exception."""
     cached = getattr(block, "_mono_decode_xpu_static", None)
     if cached is not None:
         return cached[0]
+    try:
+        plan = _static_plan_uncached(block)
+    except Exception:
+        plan = None
+    block._mono_decode_xpu_static = (plan,)
+    return plan
+
+
+def _static_plan_uncached(block):
     from .mono import _static_ok
     gdn = block.layer_type == "linear_attention"
     mix = block.linear_attn if gdn else block.self_attn
@@ -94,19 +114,14 @@ def _static_plan(block):
         ok = ok and mix.num_heads * mix.head_dim == 4096
     if ok:
         plan = {"gdn": gdn, "mix": mix, "lins": lins, "npre": len(pre)}
-    block._mono_decode_xpu_static = (plan,)
     return plan
 
 
 def _norm_weight(norm, device):
     # RMSNorm(add=True) weight + 1 (BF16, as the eager scale()), cached on the compute device
     w = norm.weight
-    cached = getattr(norm, "_mono_decode_xpu_w1", None)
-    key = (w.data_ptr(), w.device, device)
-    if cached is None or cached[0] != key:
-        cached = (key, comfy_cast(norm.scale(), device).contiguous())
-        norm._mono_decode_xpu_w1 = cached
-    return cached[1]
+    return tiles.cached(("norm", id(norm), id(w), w.data_ptr(), w.device, device),
+                        lambda: comfy_cast(norm.scale(), device).contiguous())
 
 
 def comfy_cast(t, device):
@@ -123,69 +138,23 @@ def _cast(es, mod, x):
     return mod.weight, False
 
 
-# DynamicVRAM: tile-major copies live only for one generate (built on first use, dropped at the end),
-# and only when the device has room for them; otherwise the engine reads the row-major cast weights.
-_session = {"active": False, "tiles": {}, "ok": False, "bytes": 0}
-_session_margin = int(float(__import__("os").environ.get("MONO_DECODE_XPU_TILE_MARGIN_GB", "3")) * (1 << 30))
-
-
-def session_begin(device):
-    _session["active"] = True
-    _session["tiles"] = {}
-    _session["bytes"] = 0
-    ok = False
-    if _tiled_ok and __import__("os").environ.get("MONO_DECODE_XPU_SESSION_TILES", "1") == "1":
-        try:
-            free, _total = torch.xpu.mem_get_info(device)
-            ok = free > 5 * (1 << 30) + _session_margin  # W4 weights + scales of the 9B text model
-        except Exception:
-            ok = False
-    _session["ok"] = ok
-
-
-def session_end():
-    had = bool(_session["tiles"])
-    _session.update(active=False, tiles={}, ok=False, bytes=0)
-    if had:
-        torch.xpu.empty_cache()
-
-
-def _session_tiles(lin, w):
-    from .mono import tile_major
-    q, p = w._qdata, w._params
-    key = (id(lin), q.data_ptr())  # a module re-faulted elsewhere, or another module at this address: new copy
-    hit = _session["tiles"].get(key)
-    if hit is None or hit[1][0].shape != q.shape:
-        parts = [tile_major(q, 16), tile_major(p.scale.view(torch.uint8), 16).view(torch.float8_e4m3fn),
-                 p.s_channel.float().contiguous(), p.codebook.float().contiguous()]
-        hit = (q, parts)
-        _session["tiles"][key] = hit
-        _session["bytes"] += q.numel() + p.scale.numel()
-        _stats["session_tile_bytes"] = _stats.get("session_tile_bytes", 0) + q.numel() + p.scale.numel()
-    return hit[1]
-
-
 def _args(block, sp, x, es):
-    """Kernel arguments for this call, or None (fall back)."""
+    """Kernel arguments for this call, or None (fall back). Reads each linear's device weight (resident,
+    or the DynamicVRAM cast held until `es` exits); uses this generate's tile-major copies when there is
+    room for all of them, the row-major tensors otherwise."""
     from .mono import _w4
     from comfy_kitchen.tensor import QuantizedTensor
     lins, npre, mix = sp["lins"], sp["npre"], sp["mix"]
     dev = x.device
-    tiled = _tiled_ok and not any(_vbar(l, dev) for l in lins)
-    if tiled:
-        parts = [_w4(l) for l in lins]  # cached tile-major copies of resident weights
-    else:
-        use_tiles = _session["active"] and _session["ok"]
-        parts = []
-        for l in lins:
-            w, _ = _cast(es, l, x)
-            p = _w4(l, w)
-            if p is not None and use_tiles:
-                p = _session_tiles(l, w)
-            parts.append(p)
-        tiled = use_tiles
+    weights = [_cast(es, l, x)[0] for l in lins]
+    parts = [_w4(l, w) for l, w in zip(lins, weights)]
     if any(p is None for p in parts):
         return None
+    tiled = False
+    if tiles.tiles_enabled():
+        t = [tiles.tiled(l, w) for l, w in zip(lins, weights)]
+        if all(p is not None for p in t):
+            parts, tiled = t, True
     a = {"tiled": tiled, "pre": sum(parts[:npre], []), "out": parts[npre], "mlp": sum(parts[npre + 1:], []),
          "norm_in": (_norm_weight(block.input_layernorm, dev), block.input_layernorm.eps),
          "norm_post": (_norm_weight(block.post_attention_layernorm, dev), block.post_attention_layernorm.eps)}
@@ -193,14 +162,9 @@ def _args(block, sp, x, es):
         ws = []
         for lin in (mix.in_proj_a, mix.in_proj_b):
             w, cast = _cast(es, lin, x)
-            if not cast:
-                cached = getattr(lin, "_mono_decode_xpu_bf16", None)
-                if cached is None or cached[0] is not w:
-                    cached = (w, (w.dequantize() if isinstance(w, QuantizedTensor) else w).contiguous())
-                    lin._mono_decode_xpu_bf16 = cached
-                w = cached[1]
-            elif isinstance(w, QuantizedTensor):
-                w = w.dequantize()  # as the eager GDN decode branch does on every call
+            if isinstance(w, QuantizedTensor):  # as the eager GDN decode branch does on every call
+                w = (tiles.cached(("bf16", id(lin), w._qdata.data_ptr()), lambda w=w: w.dequantize().contiguous())
+                     if not cast else w.dequantize())
             if w.device != dev or w.dtype != torch.bfloat16 or tuple(w.shape) != (mix.num_value_heads, 4096):
                 return None
             ws.append(w.contiguous())
@@ -232,7 +196,8 @@ def _gdn_core(mix, xn, proj, z, kv):
 
 def _rope_eligible(mix, qn, kn, xv4, freqs, kv):
     from comfy.text_encoders import llama
-    if not _rope_fused or _rope_state["ok"] is False or type(kv) is not llama.FixedKVCache or qn.shape[0] != 1:
+    if (not _rope_fused or guard.off("rope") or _rope_state["ok"] is False or type(kv) is not llama.FixedKVCache
+            or qn.shape[0] != 1):
         return False
     half = mix.rotary_dim // 2
     return (qn.device.type == "xpu" and qn.dtype == torch.bfloat16 and qn.is_contiguous() and kn.is_contiguous()
@@ -275,16 +240,22 @@ def _rope_write(mix, qn, kn, xv4, freqs, kv):
     from comfy.text_encoders import qwen35 as q35
     from . import _C
     S = qn.shape[1]
-    q, k = _C.rope_kv(qn[0], kn[0], xv4[0], freqs.reshape(S, -1, 2, 2), kv.key, kv.value, kv.position[:S],
-                      mix.rotary_dim)
-    if _rope_state["ok"] is None:
-        rq, rk = q35.apply_partial_rope(qn.transpose(1, 2), kn.transpose(1, 2), freqs, mix.rotary_dim)
-        ok = _same(q, rq) and _same(k, rk) and _rope_selfcheck(qn.device, mix.rotary_dim, qn.shape[2], kn.shape[2])
-        _rope_state["ok"] = ok
-        if not ok:  # rewrite the slots the eager way and keep the eager results
-            _fallback("rope_check")
-            kv.write(rk, xv4.transpose(1, 2))
-            return rq, rk
+    try:
+        q, k = _C.rope_kv(qn[0], kn[0], xv4[0], freqs.reshape(S, -1, 2, 2), kv.key, kv.value, kv.position[:S],
+                          mix.rotary_dim)
+        if _rope_state["ok"] is None:
+            rq, rk = q35.apply_partial_rope(qn.transpose(1, 2), kn.transpose(1, 2), freqs, mix.rotary_dim)
+            ok = _same(q, rq) and _same(k, rk) and _rope_selfcheck(qn.device, mix.rotary_dim, qn.shape[2], kn.shape[2])
+            _rope_state["ok"] = ok
+            if not ok:  # rewrite the slots the eager way and keep the eager results
+                _fallback("rope_check")
+                kv.write(rk, xv4.transpose(1, 2))
+                return rq, rk
+    except Exception as e:
+        # The native call can have written KV before reporting an error.
+        # This is different from the successful numerical self-check above.
+        guard.failed("rope", e, can_fallback=False)
+        raise
     with _lock:
         _stats["rope"] = _stats.get("rope", 0) + 1
     return q, k
@@ -339,7 +310,7 @@ def _install_attend():
     def attend(self, xq, xk, xv):
         tree = self.tracker.get("tree") if isinstance(self.tracker, dict) else None
         S = xq.shape[2] if xq.dim() == 4 else 0
-        if (_attn_port and xq.device.type == "xpu" and xq.dtype == torch.bfloat16 and xq.shape[0] == 1
+        if (_attn_port and not guard.off("attn") and xq.device.type == "xpu" and xq.dtype == torch.bfloat16 and xq.shape[0] == 1
                 and xq.shape[-1] == 256 and self.key.dtype == torch.bfloat16 and self.key.is_contiguous()
                 and self.value.is_contiguous() and 1 <= S <= 8 and self.seqlen.dtype == torch.int32):
             if tree is not None and tree.mask.numel() == S and tree.mask.dtype == torch.int32:
@@ -351,9 +322,14 @@ def _install_attend():
             else:
                 mask = None
             if mask is not None:
+                try:
+                    out = _C.attn_core(xq, self.key, self.value, self.seqlen, xk, xv, mask, 0)
+                except Exception as e:  # reads the cache only: the original recomputes it
+                    guard.failed("attn", e)
+                    return original(self, xq, xk, xv)
                 with _lock:
                     _stats["attn"] = _stats.get("attn", 0) + 1
-                return _C.attn_core(xq, self.key, self.value, self.seqlen, xk, xv, mask, 0)
+                return out
         return original(self, xq, xk, xv)
 
     setattr(attend, CLAIM, True)
@@ -401,14 +377,9 @@ def _install_norm_scale():
 
     def scale(self):
         w = self.weight
-        if not self.add or w.device.type != "xpu":
+        if not self.add or w.device.type != "xpu" or (torch.is_grad_enabled() and w.requires_grad):
             return original(self)
-        key = (id(w), w.data_ptr(), w.dtype)
-        cached = self.__dict__.get("_mono_decode_xpu_scale")
-        if cached is None or cached[0] != key:
-            cached = (key, original(self))
-            self.__dict__["_mono_decode_xpu_scale"] = cached
-        return cached[1]
+        return tiles.cached(("scale", id(self), id(w), w.data_ptr(), w.device), lambda: original(self))
 
     setattr(scale, CLAIM, True)
     scale.__wrapped__ = original
@@ -416,41 +387,20 @@ def _install_norm_scale():
     return True
 
 
-def _install_session():
-    from comfy.text_encoders import qwen35 as q35, llama
-    targets = [(q35.Qwen35, "_generate_mtp"), (llama.BaseGenerate, "generate")]
-    for cls, name in targets:
-        original = getattr(cls, name)
-        if getattr(original, CLAIM, False):
-            continue
-
-        def wrapped(self, *a, _original=original, **k):
-            if _session["active"]:
-                return _original(self, *a, **k)
-            try:
-                dev = next(self.parameters()).device
-                session_begin(dev if dev.type == "xpu" else torch.device("xpu"))
-            except Exception:
-                session_begin(torch.device("xpu"))
-            try:
-                return _original(self, *a, **k)
-            finally:
-                session_end()
-
-        setattr(wrapped, CLAIM, True)
-        wrapped.__wrapped__ = original
-        setattr(cls, name, wrapped)
-
-
 def install():
     from comfy.text_encoders import qwen35 as q35
+    from .mono import comfyui_has_combined_linear
+    if comfyui_has_combined_linear():
+        logging.warning("[mono_decode_xpu] this ComfyUI fuses projections (CombinedLinear, v0.45+); the layer "
+                        "hooks are not adapted to it yet and stay off")
+        return False
     _install_attend()
-    _install_session()
+    tiles.install()
     if _rope_fused:
         _install_gated_attention()
-    if __import__("os").environ.get("MONO_DECODE_XPU_NORM_CACHE", "1") == "1":
+    if os.environ.get("MONO_DECODE_XPU_NORM_CACHE", "1") == "1":
         _install_norm_scale()
-    if __import__("os").environ.get("MONO_DECODE_XPU_LOGITS", "1") == "1":
+    if os.environ.get("MONO_DECODE_XPU_LOGITS", "1") == "1":
         from . import logits
         logits.install()
     from comfy.text_encoders.llama import SPEC_ROWS
@@ -463,7 +413,7 @@ def install():
 
     def forward(self, x, attention_mask=None, freqs_cis=None, optimized_attention=None, past_key_value=None):
         B, S = (x.shape[0], x.shape[1]) if x.dim() == 3 else (0, 0)
-        if (past_key_value is None or x.device.type != "xpu" or x.dtype != torch.bfloat16 or B != 1
+        if (guard.off("layer") or past_key_value is None or x.device.type != "xpu" or x.dtype != torch.bfloat16 or B != 1
                 or not 1 <= S <= 8 or x.shape[-1] != 4096 or not x.is_contiguous()):
             return original(self, x, attention_mask, freqs_cis, optimized_attention, past_key_value)
         gdn = self.layer_type == "linear_attention"
@@ -475,14 +425,22 @@ def install():
         if sp is None:
             _fallback("weights")
             return original(self, x, attention_mask, freqs_cis, optimized_attention, past_key_value)
-        with contextlib.ExitStack() as es:
-            plan = _args(self, sp, x, es)
-            if plan is not None:
-                return _run(self, plan, x, S, gdn, attention_mask, freqs_cis, optimized_attention, past_key_value)
+        state = {"mutated": False}  # set once a launch has updated layer state in place (GDN state, x)
+        try:
+            with contextlib.ExitStack() as es:
+                plan = _args(self, sp, x, es)
+                if plan is not None:
+                    return _run(self, plan, x, S, gdn, attention_mask, freqs_cis, optimized_attention,
+                                past_key_value, state)
+        except Exception as e:
+            guard.failed("layer", e, can_fallback=not state["mutated"])
+            if state["mutated"]:
+                raise  # the recurrent state or x already changed: replaying the block would be wrong
+            return original(self, x, attention_mask, freqs_cis, optimized_attention, past_key_value)
         _fallback("weights")
         return original(self, x, attention_mask, freqs_cis, optimized_attention, past_key_value)
 
-    def _run(self, plan, x, S, gdn, attention_mask, freqs_cis, optimized_attention, past_key_value):
+    def _run(self, plan, x, S, gdn, attention_mask, freqs_cis, optimized_attention, past_key_value, state):
         tiled = plan["tiled"]
         h, silu, sig = _constants(x.device)
         x2 = x.view(S, 4096)
@@ -490,10 +448,13 @@ def install():
             # the whole GDN block in one launch
             mix, kv, ex = self.linear_attn, past_key_value, plan["extra"]
             (nin, ein), (npo, epo) = plan["norm_in"], plan["norm_post"]
-            _C.layer_gdn(x2, nin, ein, h, plan["pre"] + plan["out"] + plan["mlp"], ex["wa"], ex["wb"], ex["conv_w"],
-                         kv.conv_state, kv.proj_buf, kv.qkv_buf, kv.ctl, kv.dt_bias, kv.g_decay, kv.recurrent_state,
-                         kv.gates_buf, kv.sumsq_buf, kv.norm_weight, mix.norm.eps, mix.key_head_dim ** -0.5,
-                         mix.num_key_heads, npo, epo, silu, 0, 5 if _gdn_split else 11, tiled)
+            args = (x2, nin, ein, h, plan["pre"] + plan["out"] + plan["mlp"], ex["wa"], ex["wb"], ex["conv_w"],
+                    kv.conv_state, kv.proj_buf, kv.qkv_buf, kv.ctl, kv.dt_bias, kv.g_decay, kv.recurrent_state,
+                    kv.gates_buf, kv.sumsq_buf, kv.norm_weight, mix.norm.eps, mix.key_head_dim ** -0.5,
+                    mix.num_key_heads, npo, epo, silu, 0, 5 if _gdn_split else 11, tiled)
+            # Mark before dispatch: a failure does not prove that nothing ran.
+            state["mutated"] = True
+            _C.layer_gdn(*args)
             if _gdn_split:  # GDN core in one launch, the post block (out proj .. MLP) in layer_post
                 y = _C.layer_gdn_core(x2, S)
                 _C.layer_post(x2, y, None, sig, *plan["out"], npo, epo, h, silu, *plan["mlp"], 0, 6, tiled)
@@ -507,14 +468,17 @@ def install():
         if gdn:
             mix = self.linear_attn
             xn = outs[0].view(1, S, 4096)
+            state["mutated"] = True  # the Kitchen deferred GDN calls advance the state in place
             core = _gdn_core(mix, xn, outs[1].view(1, S, -1), outs[2].view(1, S, -1), past_key_value)
             y = core.reshape(S, 4096)
         else:
             mix = self.self_attn
+            state["mutated"] = True  # attention writes KV before attending
             y = _attn_core(mix, outs[1].view(1, S, -1), outs[2].view(1, S, -1), outs[3].view(1, S, -1),
                            attention_mask, freqs_cis, optimized_attention, past_key_value).reshape(S, 4096)
             gate = outs[1]
         nw, eps = plan["norm_post"]
+        state["mutated"] = True  # layer_post updates x in place
         _C.layer_post(x2, y.contiguous(), gate, sig, *plan["out"], nw, eps, h, silu, *plan["mlp"], 0, 6, tiled)
         with _lock:
             _stats["layer"] += 1

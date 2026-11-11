@@ -55,7 +55,7 @@ give about 29 dB). D gets there faster: end to end 45.8 → 33.8 s, prompt enhan
 ![Time per stage: omni vs omni + mono](docs/demo/stages-cd-en.png)
 
 Nearly all of the saved time is prompt enhance. Prompt-enhance seconds depend on how long the
-enhanced prompt is (265–450 tokens across these runs). Decode tok/s does not depend on length.
+enhanced prompt is (265–450 tokens across these runs). Decode tok/s normalizes output length, but context length and speculative-tree work still affect it.
 
 Under `auto`, the enhanced prompt itself depends on speed. `auto` chooses the speculative tree from
 measured draft and verify times (`best_widths` in ComfyUI's qwen35), and with sampling on the tree
@@ -193,6 +193,13 @@ The log should show `[mono_decode_xpu] layer installed=True`. Without `MONO_DECO
 installed and ComfyUI runs the stock path. Both resident (`--gpu-only --disable-dynamic-vram`) and
 the default DynamicVRAM mode are supported. Calls the kernels do not cover fall back to the original
 code. These include prefill, other quantizations, LoRA weight functions, and batch size above 1.
+A failed pure operation is logged and disabled before trying the stock operation. After a dispatch
+that may have changed KV, recurrent state or the input in place, the error is propagated without
+replaying the layer. Cancellation propagates without disabling the kernels.
+
+ComfyUI builds with `CombinedLinear` expose a projection interface this version has not adapted:
+the MLP/layer hooks stay off with a warning. The tested interface is the v0.43.0 stack above.
+See [tests/README.md](tests/README.md) for unit tests and model validation through the ComfyUI UI.
 
 For normal use, set only `MONO_DECODE_XPU=1`. The pieces below can be set one by one, mainly for
 A/B tests. An explicit `1` or `0` on a piece wins over the master switch: for example,
@@ -239,23 +246,22 @@ install.py / install.sh  build the extension in place (ComfyUI-Manager runs inst
 build_icpx.sh            the single-invocation icpx build
 pyproject.toml           Comfy Registry metadata
 THIRD_PARTY_NOTICES.md   third-party sources and licenses (full texts in licenses/)
-tests/                   exactness tests and benchmarks (written for the dev container mounts:
-                         repo at /work, scripts at /artifacts/scripts)
+tests/                   no-model pytest unit tests; UI model-validation instructions
 ```
 
 ## Limits
 
 - Batch 1, 1–8 decode rows, and the Qwen3.5-9B shapes (hidden 4096, head dim 256).
 - Packed W4A8 G16 with FP8 group scales, ConvRot 256 and one shared codebook. Anything else falls back.
-- Resident mode keeps a tile-major copy of the W4 decode weights, about 3.9 GB of extra VRAM.
-  DynamicVRAM makes the same copy per generate when free VRAM exceeds 5 GB plus
-  `MONO_DECODE_XPU_TILE_MARGIN_GB` (3 GB by default). Otherwise it reads the row-major weights,
-  which is slightly slower. The copy is freed when the generate ends.
+- Both resident and DynamicVRAM modes own tile copies for one generate call. After prefill, the
+  decision uses the actual packed storage size, allocator pool, inference reserve and free-memory
+  margin. VBAR model residency is budgeted outside Torch's pool. If copies do not fit, the kernels
+  read the original row-major weights. Copies, graph references and component weight caches are
+  released on return or error without flushing Torch's global cache.
 - Single XPU device per process.
 
 ## License
 
 Apache License 2.0, see [LICENSE](LICENSE). `csrc/attn_port.sycl` and `csrc/mono_gdn.sycl` contain code
-ported from MIT-licensed Strata kernels (through intel/llm-scaler). `tests/moss-api.json` is an export of
-an MIT-licensed Comfy Org template. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
+ported from MIT-licensed Strata kernels (through intel/llm-scaler). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
 [licenses/](licenses/).
