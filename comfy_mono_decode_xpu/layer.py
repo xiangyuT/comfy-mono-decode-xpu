@@ -477,6 +477,9 @@ def install():
     if os.environ.get("MONO_DECODE_XPU_AUTOTREE", "1") == "1":
         from . import autotree
         autotree.install()
+    if os.environ.get("MONO_DECODE_XPU_DRAFT", "1") == "1":
+        from . import draft
+        draft.install()
     from comfy.text_encoders.llama import SPEC_ROWS
     from . import _C
 

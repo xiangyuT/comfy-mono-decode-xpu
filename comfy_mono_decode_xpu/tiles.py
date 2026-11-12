@@ -99,6 +99,10 @@ def end():
     _session.update(active=False, ok=False, tiles={}, cache={}, plans={}, bytes=0, model=None, budget=None)
 
 
+def session_active():
+    return _session["active"]
+
+
 def tiles_enabled():
     return _session["active"] and _session["ok"]
 
