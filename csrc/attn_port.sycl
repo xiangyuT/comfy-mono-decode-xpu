@@ -141,7 +141,11 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
             // row sgi of a tile for all four rows; sub-group g < 4 runs row g's tile softmax
             const int sgi = t / 16, ga = t / D, da = t % D;
             for (int task = wg; task < tasksA; task += NW) {
-                const int split = task % splits, pack = (task / splits) % packs, kh = task / (splits * packs);
+                // split varies slowest: the live splits (those below the current length) form the first
+                // tasks and are dealt round-robin to all work-groups. With split fastest and splits == NW,
+                // work-group w always drew split w, so a short prefix kept two or three work-groups busy.
+                const int unit = task % (HK * packs), split = task / (HK * packs);
+                const int pack = unit % packs, kh = unit / packs;
                 const int begin = split * split_tiles * TILE;
                 const int end = sycl::min(cap, begin + split_tiles * TILE);
                 const int max_limit = rows > 0 && length > 0 ? int(length) : 0;  // non-causal: every row sees the prefix
