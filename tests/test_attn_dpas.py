@@ -44,6 +44,7 @@ def _kitchen(q, k, v, sl, xk, xv, mask_t):
     (63, 4096, [-1, 0, 1, 2, 3, 4, 5, 6]),
     (777, 4096, [-1, 0, 0, 0, 0, 1, 1, 1]),
     (3500, 11400, [-1, 0, 1, 2, 3, 4, 5, 6]),
+    (4096, 12416, [-1, 0, 1, 2, 3, 4, 5]),  # largest padded query pack with seven live rows
     (11392, 11400, [-1, 0, 0, 1, 1]),  # the cache's last partial tile
     (1000, 4096, None),  # the MTP draft's single row, no tree
     (8000, 11400, None),
