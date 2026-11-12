@@ -24,7 +24,10 @@
 namespace mono_decode_xpu {
 namespace {
 using BF16 = sycl::ext::oneapi::bfloat16;
-constexpr int TEAM = 256, TILE = 64, ROWS = 4, AWG = 1024, TEAMS = AWG / TEAM, D = 256;
+constexpr int TEAM = 256, TILE = 64, AWG = 1024, TEAMS = AWG / TEAM, D = 256;
+// Phase A runs up to RP query rows of one kv head (RP / 4 Kitchen packs of four rows) per key tile, so a
+// tile is staged once for all of them; work-item t owns dimension t % D of rows t / D + 4 i (i < RP / 4)
+// and reads each value once for those rows. Every row keeps the Kitchen arithmetic and order.
 
 struct V4 {  // [B, H, S, D] strided bf16 view
     const BF16* p;
@@ -62,12 +65,16 @@ inline float warp_sum32(sycl::sub_group sg, float lo, float hi) {
     return sycl::group_broadcast(sg, a, 0);
 }
 
+template <int RP>
 class AttnCoreKernel;
 torch::Tensor g_prefix, g_lse, g_clk;
 }  // namespace
 
-torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,
-                        torch::Tensor xk, torch::Tensor xv, torch::Tensor mask, int64_t nwg) {
+namespace {
+template <int RP>
+torch::Tensor attn_core_rp(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,
+                           torch::Tensor xk, torch::Tensor xv, torch::Tensor mask, int64_t nwg) {
+    constexpr int NA = RP * D / AWG;
     const bool debug = nwg < 0;  // negative nwg: also write the combined prefix / LSE and phase clocks
     if (debug) nwg = -nwg;
     TORCH_CHECK(q.is_xpu() && q.scalar_type() == at::kBFloat16 && q.dim() == 4 && q.size(3) == D, "q bf16 [B, H, S, 256]");
@@ -78,7 +85,7 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
     // row (causal and non-causal agree at S = 1), the MTP draft's attention
     const bool merge = mask.numel() > 0;
     TORCH_CHECK(B == 1 && S >= 1 && S <= 8 && H % HK == 0 && (merge ? mask.numel() == S : S == 1), "batch 1, 1..8 rows");
-    const int groups = H / HK, rows = groups * S, packs = (rows + ROWS - 1) / ROWS;
+    const int groups = H / HK, rows = groups * S, packs = (rows + RP - 1) / RP;
     const int splits = std::min(32, std::max(1, (cap + 255) / 256));
     const int split_tiles = ((cap + TILE - 1) / TILE + splits - 1) / splits;
     // Kitchen computes 1/sqrt(D) on the host from the runtime head size; icpx's default fast-math host
@@ -121,12 +128,12 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
     const int tasksA = HK * packs * splits;
     const int itemsB = B * H * S, tasksB = (itemsB + TEAMS - 1) / TEAMS;
     queue.submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 2> sq(sycl::range<2>(ROWS, D), cgh);
-        sycl::local_accessor<float, 2> sp(sycl::range<2>(ROWS, TILE), cgh);
-        sycl::local_accessor<float, 1> bm(ROWS, cgh), bs(ROWS, cgh);
+        sycl::local_accessor<float, 2> sq(sycl::range<2>(RP, D), cgh);
+        sycl::local_accessor<float, 2> sp(sycl::range<2>(RP, TILE), cgh);
+        sycl::local_accessor<float, 1> bm(RP, cgh), bs(RP, cgh);
         sycl::local_accessor<BF16, 1> vs(TILE * D, cgh);
         sycl::local_accessor<float, 2> score(sycl::range<2>(TEAMS, 8), cgh);
-        cgh.parallel_for<AttnCoreKernel>(sycl::nd_range<1>(NW * AWG, AWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        cgh.parallel_for<AttnCoreKernel<RP>>(sycl::nd_range<1>(NW * AWG, AWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
 #pragma clang fp contract(off)
             auto sg = it.get_sub_group();
             const int t = it.get_local_id(0), team = t / TEAM, tt = t % TEAM;
@@ -136,35 +143,42 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
             const int64_t raw_length = lens[0];
             const int64_t length = raw_length < 0 ? 0 : (raw_length > cap ? cap : raw_length);
             if (clk && t == 0) clk[wg * 4] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
-            // ---- phase A: DecodeChunks, one (kv head, pack, split) unit per work-group ----
-            // work-item t owns accumulator (row g = t / 256, dim = t % 256); sub-group sgi scores key
-            // row sgi of a tile for all four rows; sub-group g < 4 runs row g's tile softmax
+            // ---- phase A: DecodeChunks, one (kv head, row pack, split) unit per work-group ----
+            // sub-group sgi scores key row sgi of a tile for every row of the pack; sub-group g < prow
+            // runs row g's tile softmax; work-item (ga, da) accumulates dimension da of rows ga + 4 i
             const int sgi = t / 16, ga = t / D, da = t % D;
             for (int task = wg; task < tasksA; task += NW) {
-                const int split = task % splits, pack = (task / splits) % packs, kh = task / (splits * packs);
+                // split varies slowest: the live splits (those below the current length) form the first
+                // tasks and are dealt round-robin to all work-groups. With split fastest and splits == NW,
+                // work-group w always drew split w, so a short prefix kept two or three work-groups busy.
+                const int unit = task % (HK * packs), split = task / (HK * packs);
+                const int pack = unit % packs, kh = unit / packs;
                 const int begin = split * split_tiles * TILE;
                 const int end = sycl::min(cap, begin + split_tiles * TILE);
                 const int max_limit = rows > 0 && length > 0 ? int(length) : 0;  // non-causal: every row sees the prefix
+                const int prow = sycl::min(RP, rows - pack * RP);  // live rows of this pack (uniform)
                 if (!(begin < end && begin < max_limit)) {  // nothing to attend: the Kitchen kernel writes 0 / -inf
-                    const int row = pack * ROWS + ga;
-                    if (row < rows) {
-                        const int h = kh * groups + row / S, s = row % S;
-                        const int64_t pos = (int64_t(h) * S + s) * splits + split;
-                        part[pos * D + da] = 0.f;
-                        if (da == 0) st[pos] = -INFINITY;
+#pragma unroll
+                    for (int i = 0; i < NA; ++i) {
+                        const int g = ga + 4 * i;
+                        if (g < prow) {
+                            const int row = pack * RP + g, h = kh * groups + row / S, s = row % S;
+                            const int64_t pos = (int64_t(h) * S + s) * splits + split;
+                            part[pos * D + da] = 0.f;
+                            if (da == 0) st[pos] = -INFINITY;
+                        }
                     }
                     continue;
                 }
-                {
-                    const int row = pack * ROWS + ga, h = kh * groups + row / S, s = row % S;
-                    sq[ga][da] = row < rows ? Q.at(0, h, s, da) : 0.f;
-                }
-                int limit[ROWS];
 #pragma unroll
-                for (int g = 0; g < ROWS; ++g) limit[g] = pack * ROWS + g < rows ? max_limit : 0;
+                for (int i = 0; i < NA; ++i) {
+                    const int g = ga + 4 * i, row = pack * RP + g;
+                    sq[g][da] = g < prow ? Q.at(0, kh * groups + row / S, row % S, da) : 0.f;
+                }
                 sycl::group_barrier(it.get_group());
-                float acc = 0.f, maximum = -INFINITY, denominator = 0.f;
-                const bool row_ok = pack * ROWS + ga < rows;
+                float acc[NA], maximum[NA], denominator[NA];
+#pragma unroll
+                for (int i = 0; i < NA; ++i) { acc[i] = 0.f; maximum[i] = -INFINITY; denominator[i] = 0.f; }
                 for (int base = begin; base < end && base < max_limit; base += TILE) {
                     // stage this tile's values in SLM with one 32 B load per work-item (64 keys x 256 dims)
                     const int nk = sycl::max(0, sycl::min(TILE, max_limit - base));
@@ -177,7 +191,6 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
                         pk.store(0, sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
                             reinterpret_cast<uint32_t*>(&vs[key * D + part16 * 16])));
                     }
-#ifndef EXP_NOSCORE
                     {
                         const int r = sgi;  // 64 sub-groups, 64 keys per tile
                         const bool live = base + r < max_limit;
@@ -189,23 +202,21 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
                             k1[d] = live ? float(krow[16 + 32 * d]) : 0.f;
                         }
 #pragma unroll
-                        for (int g = 0; g < ROWS; ++g) {
-                            float d0 = k0[0] * sq[g][lane], d1 = k1[0] * sq[g][lane + 16];
+                        for (int g = 0; g < RP; ++g) {
+                            if (g < prow) {
+                                float d0 = k0[0] * sq[g][lane], d1 = k1[0] * sq[g][lane + 16];
 #pragma unroll
-                            for (int d = 1; d < 8; ++d) {
-                                d0 = sycl::fma(k0[d], sq[g][lane + 32 * d], d0);
-                                d1 = sycl::fma(k1[d], sq[g][lane + 16 + 32 * d], d1);
+                                for (int d = 1; d < 8; ++d) {
+                                    d0 = sycl::fma(k0[d], sq[g][lane + 32 * d], d0);
+                                    d1 = sycl::fma(k1[d], sq[g][lane + 16 + 32 * d], d1);
+                                }
+                                const float dot = warp_sum32(sg, d0, d1);
+                                if (lane == 0) sp[g][r] = live ? dot * scale : -INFINITY;
                             }
-                            const float dot = warp_sum32(sg, d0, d1);
-                            if (lane == 0) sp[g][r] = base + r < limit[g] ? dot * scale : -INFINITY;
                         }
                     }
-#else
-                    if (t < ROWS * TILE) sp[t / TILE][t % TILE] = 0.25f;
-#endif
                     sycl::group_barrier(it.get_group());
-#ifndef EXP_NOSOFT
-                    if (sgi < ROWS) {
+                    if (sgi < prow) {
                         const int g = sgi;
                         const float a0 = sp[g][lane], a1 = sp[g][lane + 16];
                         const float c0 = sp[g][lane + 32], c1 = sp[g][lane + 48];
@@ -219,43 +230,55 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
                         const float sum = warp_sum32(sg, pa0 + pc0, pa1 + pc1);
                         if (lane == 0) { bm[g] = m; bs[g] = sum; }
                     }
-#else
-                    if (t < ROWS) { bm[t] = 0.5f; bs[t] = 3.f; }
-#endif
                     sycl::group_barrier(it.get_group());
                     {
-                        const float m = sycl::fmax(maximum, bm[ga]);
-                        const float old = maximum == -INFINITY ? 0.f : sycl::exp(maximum - m);
-                        const float factor = bm[ga] == -INFINITY ? 0.f : sycl::exp(bm[ga] - m);
-                        acc = acc * old;
-                        // Kitchen ISA: den = fma(den, old, bs * factor)
-                        const float bf = bs[ga] * factor;
-                        denominator = sycl::fma(denominator, old, bf);
-                        maximum = m;
-#ifndef EXP_NOACC
-                        auto spl = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(&sp[ga][0]);
-                        for (int j0 = 0; j0 < nk; j0 += 8) {
-                            sycl::vec<float, 8> pr;
-                            pr.load(0, spl + j0);  // all lanes read the same 32 B: one broadcast message
-                            float vv[8];
+                        float factor[NA];
 #pragma unroll
-                            for (int j = 0; j < 8; ++j) vv[j] = float(vs[(j0 + j) * D + da]);
-#pragma unroll
-                            for (int j = 0; j < 8; ++j) {
-                                const float weight = j0 + j < nk ? pr[j] * factor : 0.f;
-                                const float upd = sycl::fma(weight, vv[j], acc);
-                                acc = weight > 0 ? upd : acc;
+                        for (int i = 0; i < NA; ++i) {
+                            const int g = ga + 4 * i;
+                            factor[i] = 0.f;
+                            if (g < prow) {
+                                const float m = sycl::fmax(maximum[i], bm[g]);
+                                const float old = maximum[i] == -INFINITY ? 0.f : sycl::exp(maximum[i] - m);
+                                factor[i] = bm[g] == -INFINITY ? 0.f : sycl::exp(bm[g] - m);
+                                acc[i] = acc[i] * old;
+                                // Kitchen ISA: den = fma(den, old, bs * factor)
+                                const float bf = bs[g] * factor[i];
+                                denominator[i] = sycl::fma(denominator[i], old, bf);
+                                maximum[i] = m;
                             }
                         }
-#endif
+                        for (int j0 = 0; j0 < nk; j0 += 8) {
+                            float vv[8];
+#pragma unroll
+                            for (int j = 0; j < 8; ++j) vv[j] = float(vs[(j0 + j) * D + da]);  // one read for NA rows
+#pragma unroll
+                            for (int i = 0; i < NA; ++i) {
+                                const int g = ga + 4 * i;
+                                if (g >= prow) continue;
+                                sycl::vec<float, 8> pr;
+                                pr.load(0, sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                                    &sp[g][j0]));  // all lanes read the same 32 B: one broadcast message
+#pragma unroll
+                                for (int j = 0; j < 8; ++j) {
+                                    const float weight = j0 + j < nk ? pr[j] * factor[i] : 0.f;
+                                    const float upd = sycl::fma(weight, vv[j], acc[i]);
+                                    acc[i] = weight > 0 ? upd : acc[i];
+                                }
+                            }
+                        }
                     }
                     sycl::group_barrier(it.get_group());
                 }
-                if (row_ok) {
-                    const int row = pack * ROWS + ga, h = kh * groups + row / S, s = row % S;
-                    const int64_t pos = (int64_t(h) * S + s) * splits + split;
-                    part[pos * D + da] = denominator > 0 ? acc / denominator : 0.f;
-                    if (da == 0) st[pos] = denominator > 0 ? maximum + sycl::log(denominator) : -INFINITY;
+#pragma unroll
+                for (int i = 0; i < NA; ++i) {
+                    const int g = ga + 4 * i;
+                    if (g < prow) {
+                        const int row = pack * RP + g, h = kh * groups + row / S, s = row % S;
+                        const int64_t pos = (int64_t(h) * S + s) * splits + split;
+                        part[pos * D + da] = denominator[i] > 0 ? acc[i] / denominator[i] : 0.f;
+                        if (da == 0) st[pos] = denominator[i] > 0 ? maximum[i] + sycl::log(denominator[i]) : -INFINITY;
+                    }
                 }
                 sycl::group_barrier(it.get_group());
             }
@@ -326,5 +349,18 @@ torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value,
         });
     });
     return merged;
+}
+}  // namespace
+
+torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,
+                        torch::Tensor xk, torch::Tensor xv, torch::Tensor mask, int64_t nwg) {
+    // rows of one kv head: the draft's single row (4) keeps one row per work-item; verify rows share tiles
+    const int64_t rows = key.size(1) > 0 ? q.size(1) / key.size(1) * q.size(2) : 0;
+#ifdef ATTN_RP_VERIFY
+    if (rows > 4) return attn_core_rp<ATTN_RP_VERIFY>(q, key, value, seqlen, xk, xv, mask, nwg);
+#else
+    if (rows > 4) return attn_core_rp<16>(q, key, value, seqlen, xk, xv, mask, nwg);
+#endif
+    return attn_core_rp<4>(q, key, value, seqlen, xk, xv, mask, nwg);
 }
 }  // namespace mono_decode_xpu

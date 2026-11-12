@@ -249,6 +249,11 @@ replaying the layer. The fused RoPE routes check their first call per generate a
 operators; on a mismatch they rewrite KV from the live result and switch themselves off.
 Cancellation propagates without disabling the kernels.
 
+With `auto` MTP, ComfyUI picks the speculative tree from measured step costs. Off CUDA it measures with
+host clocks, which on XPU undercount the draft; the node feeds it XPU device timings instead
+(`MONO_DECODE_XPU_AUTOTREE=0` restores upstream's clocks). Like any speed change, this changes which
+tree `auto` picks and so the sampled text; fixed MTP modes are unaffected.
+
 ComfyUI owns prefetch policy through its existing CLI switches. When a combined group is prepared,
 `comfy_mono_decode_xpu.mono.stats()["combined"]` counts borrowed member views. A zero count is
 expected when no group is prepared, including the default XPU transfer policy.

@@ -31,6 +31,8 @@ These all default to `1`. Set `0` to fall back to the stock code for that part o
 | `MONO_DECODE_XPU_TILED` | Tile-major W4 copies. `0` makes the kernels read row-major weights even when resident. |
 | `MONO_DECODE_XPU_SESSION_TILES` | Per-generate tile-major copies in resident and DynamicVRAM modes. |
 | `MONO_DECODE_XPU_TILE_MARGIN_GB` | Default `3`. Free VRAM kept beyond the actual model-copy requirement and inference reserve. |
+| `MONO_DECODE_XPU_DRAFT` | Keep the MTP draft head's BF16 weights for the generate (DynamicVRAM: one copy, about 0.5 GB, when free memory allows) instead of recasting them on every draft. The first reuse is compared bit for bit with comfy's forward. |
+| `MONO_DECODE_XPU_AUTOTREE` | Time ComfyUI's auto MTP tree on the XPU device (upstream uses host clocks off CUDA) and, inside MTP generates, let the sampling filters run without waiting for the device. Unlike the rest of this table, this changes which tree `auto` picks, so `auto` text differs; fixed modes are unaffected apart from the removed wait. |
 
 ## Other
 
@@ -43,7 +45,8 @@ These all default to `1`. Set `0` to fall back to the stock code for that part o
 ## Checking what ran
 
 Each module exposes `stats()`: `comfy_mono_decode_xpu.layer.stats()`, `.logits.stats()`,
-`.mono.stats()` and `.patch.stats()`. They report call counts and the fallback reasons. Typical
+`.mono.stats()`, `.patch.stats()`, `.autotree.stats()` (the device-timed draft / verify cost that
+`auto` uses) and `.draft.stats()`. They report call counts and the fallback reasons. Typical
 fixed-tree output:
 `{"layer": 12512, "gdn1": 9384, "attn": 4692, "rope": 4692, "fallback": {"weights": 1564}}`.
 Here `weights` counts the BF16 MTP block, which runs eagerly apart from its attention.
