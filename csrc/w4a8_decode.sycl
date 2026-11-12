@@ -1,0 +1,372 @@
+// SPDX-License-Identifier: Apache-2.0
+// Fused small-M W4A8 decode linear for Intel Xe2 (BMG).
+//
+// out[m, n] = cast(float(int32_dot(x_q[m], decode(w[n]))) * x_scale[m] * s_channel[n]) (+ residual)
+//
+// The integer grid follows omni_xpu_kernel's packed W4A8 contract exactly:
+//   w_int8 = isnan(r) ? 0 : clamp(r, -127, 127),  r = rint(codebook[code] * s_rel)
+// and the INT32 dot is accumulated modulo 2^32, so any summation order is
+// bit-identical. The epilogue reproduces fused_scaleback (FP32 multiply by the
+// row scale, then by the channel scale) followed by a single output cast, so a
+// fused call is bit-identical to mm_w4a8 -> fused_scaleback -> .to(dtype).
+#include <cstdint>
+#include <optional>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/ext/oneapi/dot_product.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+#include <c10/util/Float8_e4m3fn.h>
+
+namespace mono_decode_xpu {
+namespace {
+
+constexpr int kLanes = 16;  // sub-group size
+constexpr int kChunk = 32;  // weights per lane per step (16 packed bytes)
+constexpr int kSG = 4;      // sub-groups per work-group
+
+template <typename Scale>
+inline float scale_at(const Scale* s, int64_t i) { return static_cast<float>(s[i]); }
+
+// Exact general decode: four consecutive codes starting at nibble `shift` -> int8x4.
+template <typename CB>
+inline int32_t decode4(uint32_t word, int shift, const CB& cb, float scale) {
+    uint32_t packed = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int code = (word >> (4 * (shift + i))) & 15;
+        const float r = sycl::rint(cb[code] * scale);
+        const int32_t q = sycl::isnan(r) ? 0 : static_cast<int32_t>(sycl::clamp(r, -127.f, 127.f));
+        packed |= (static_cast<uint32_t>(q) & 0xFFu) << (8 * i);
+    }
+    return static_cast<int32_t>(packed);
+}
+
+// Contract-gated fast decode: the caller proved max|codebook| * max|s_rel| <= 127 and
+// finite scales for this weight, so clamp/NaN handling is a no-op and rint == cvt.rte.
+template <typename CB>
+inline int32_t decode4_fast(uint32_t word, int shift, const CB& cb, float scale) {
+    // codebook lives in SLM: a private-array or sub-group-shuffle lookup costs ~3x more on Xe2
+    sycl::vec<float, 4> v;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = cb[(word >> (4 * (shift + i))) & 15] * scale;
+    return sycl::bit_cast<int32_t>(v.template convert<int8_t, sycl::rounding_mode::rte>());
+}
+
+template <typename Scale, typename Out, int M, int COLS, bool FAST, int KS>
+class W4A8DecodeKernel;
+constexpr int kU = 4;  // packets preloaded per column per block
+
+template <typename Scale, typename Out, int M, int COLS, bool FAST, int KS>
+void launch(const int8_t* x, const float* xs, const int8_t* w, const Scale* srel, const float* sch,
+            const float* codebook, const Out* residual, Out* out, int64_t rows, int64_t N, int64_t K,
+            int64_t G, sycl::queue& q) {
+    // one work-group = KS sub-groups sharing COLS output columns; sub-group s owns K slice s.
+    const int64_t wgs = (N + COLS - 1) / COLS;
+    const int64_t groups_per_row = K / G;
+    const int64_t slice = K / KS;  // multiple of kLanes * kChunk * kU checked by caller
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> part(KS * M * COLS, h);
+        sycl::local_accessor<float, 1> cb(16, h);
+        h.parallel_for<W4A8DecodeKernel<Scale, Out, M, COLS, FAST, KS>>(
+            sycl::nd_range<1>(wgs * KS * kLanes, KS * kLanes),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                auto sg = it.get_sub_group();
+                const int lane = sg.get_local_id()[0];
+                const int sgi = sg.get_group_id()[0];
+                const int64_t col0 = it.get_group(0) * COLS;
+                if (it.get_local_id(0) < 16) {
+                    const int i = it.get_local_id(0);
+                    cb[i] = codebook ? codebook[i] : float(i - 8);
+                }
+                sycl::group_barrier(it.get_group());
+                uint32_t acc[M][COLS];
+#pragma unroll
+                for (int r = 0; r < M; ++r)
+#pragma unroll
+                    for (int c = 0; c < COLS; ++c) acc[r][c] = 0;
+                const int64_t kbeg = sgi * slice, kend = kbeg + slice;
+                for (int64_t kb = kbeg; kb < kend; kb += kU * kLanes * kChunk) {
+                    sycl::vec<uint32_t, 4> pk[COLS][kU];
+                    float sc[COLS][kU][2];
+#pragma unroll
+                    for (int c = 0; c < COLS; ++c) {
+                        const int64_t n = sycl::min<int64_t>(col0 + c, N - 1);
+#pragma unroll
+                        for (int u = 0; u < kU; ++u) {
+                            const int64_t k0 = kb + (int64_t(u) * kLanes + lane) * kChunk;
+                            pk[c][u].load(0, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                                      sycl::access::decorated::no>(
+                                                 reinterpret_cast<const uint32_t*>(w + n * (K / 2) + k0 / 2)));
+                            sc[c][u][0] = scale_at(srel, n * groups_per_row + k0 / G);
+                            sc[c][u][1] = scale_at(srel, n * groups_per_row + (k0 + 16) / G);
+                        }
+                    }
+#pragma unroll
+                    for (int u = 0; u < kU; ++u) {
+                        const int64_t k0 = kb + (int64_t(u) * kLanes + lane) * kChunk;
+                        int32_t xa[M][8];
+#pragma unroll
+                        for (int r = 0; r < M; ++r) {
+                            const int rr = r < rows ? r : 0;
+                            sycl::vec<int32_t, 8> v;
+                            v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                               sycl::access::decorated::no>(
+                                          reinterpret_cast<const int32_t*>(x + rr * K + k0)));
+#pragma unroll
+                            for (int j = 0; j < 8; ++j) xa[r][j] = v[j];
+                        }
+#pragma unroll
+                        for (int c = 0; c < COLS; ++c) {
+#pragma unroll
+                            for (int j = 0; j < 8; ++j) {
+                                int32_t wq;
+                                if constexpr (FAST) wq = decode4_fast(pk[c][u][j / 2], (j & 1) * 4, cb, sc[c][u][j >> 2]);
+                                else wq = decode4(pk[c][u][j / 2], (j & 1) * 4, cb, sc[c][u][j >> 2]);
+#pragma unroll
+                                for (int r = 0; r < M; ++r) {
+                                    const int32_t d = sycl::ext::oneapi::dot_acc(
+                                        sycl::bit_cast<sycl::vec<int8_t, 4>>(xa[r][j]),
+                                        sycl::bit_cast<sycl::vec<int8_t, 4>>(wq), 0);
+                                    acc[r][c] += static_cast<uint32_t>(d);
+                                }
+                            }
+                        }
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < M; ++r)
+#pragma unroll
+                    for (int c = 0; c < COLS; ++c) {
+                        const uint32_t s = sycl::reduce_over_group(sg, acc[r][c], sycl::plus<uint32_t>());
+                        if (lane == 0) part[(sgi * M + r) * COLS + c] = s;
+                    }
+                sycl::group_barrier(it.get_group());
+                const int t = it.get_local_id(0);
+                if (t < M * COLS) {
+                    const int r = t / COLS, c = t % COLS;
+                    const int64_t n = col0 + c;
+                    if (r < rows && n < N) {
+                        uint32_t s = 0;
+#pragma unroll
+                        for (int i = 0; i < KS; ++i) s += part[(i * M + r) * COLS + c];
+                        float f = static_cast<float>(sycl::bit_cast<int32_t>(s));
+                        f = f * xs[r];
+                        f = f * sch[n];
+                        if (residual) {
+                            const Out lin = static_cast<Out>(f);
+                            out[r * N + n] = static_cast<Out>(static_cast<float>(residual[r * N + n]) +
+                                                              static_cast<float>(lin));
+                        } else {
+                            out[r * N + n] = static_cast<Out>(f);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+// Eight-row verify: one INT8 8x32x16 DPAS tile per sub-group and K32 packet. Each packed
+// packet is decoded once (SLM codebook) and reused by all eight rows; Split sub-groups
+// share the K range of a 16-column tile and are summed (mod 2^32) through SLM.
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+template <typename Scale, typename Out, bool FAST, int Split>
+class W4A8DpasKernel;
+
+template <typename Scale, typename Out, bool FAST, int Split>
+void launch_dpas(const int8_t* x, const float* xs, const int8_t* w, const Scale* srel, const float* sch,
+                 const float* codebook, const Out* residual, Out* out, int64_t N, int64_t K, int64_t G,
+                 sycl::queue& q) {
+    const int64_t tiles = (N + 15) / 16;
+    const int64_t groups_per_row = K / G;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int32_t, 1> partials(Split * 8 * 16, h);
+        sycl::local_accessor<float, 1> cb(16, h);
+        h.parallel_for<W4A8DpasKernel<Scale, Out, FAST, Split>>(
+            sycl::nd_range<1>(tiles * Split * 16, Split * 16),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                auto sg = it.get_sub_group();
+                const int split = it.get_local_id(0) / 16;
+                const int lane = it.get_local_id(0) % 16;
+                if (it.get_local_id(0) < 16) cb[lane] = codebook ? codebook[lane] : float(lane - 8);
+                sycl::group_barrier(it.get_group());
+                const int64_t column = it.get_group(0) * 16 + lane;
+                const int64_t ncol = column < N ? column : N - 1;
+                jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> a;
+                jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 16, jm::layout::ext_intel_packed> b;
+                jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 16> c;
+                jm::joint_matrix_fill(sg, c, 0);
+                const int8_t* wrow = w + ncol * (K / 2);
+                const Scale* srow = srel + ncol * groups_per_row;
+                sycl::vec<uint32_t, 4> next(0);
+                int64_t k = split * 32;
+                if (k < K) next.load(0, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                                 sycl::access::decorated::no>(
+                                            reinterpret_cast<const uint32_t*>(wrow + k / 2)));
+                for (; k < K; k += Split * 32) {
+                    const auto packet = next;
+                    const int64_t nk = k + Split * 32;
+                    if (nk < K) next.load(0, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                                      sycl::access::decorated::no>(
+                                                 reinterpret_cast<const uint32_t*>(wrow + nk / 2)));
+                    const float s0 = scale_at(srow, k / G), s1 = scale_at(srow, (k + 16) / G);
+                    jm::joint_matrix_load(sg, a,
+                                          sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                                   sycl::access::decorated::no>(x + k),
+                                          K);
+                    // packed B: work-item `lane` owns column `lane`; its 32 K values arrive in
+                    // order, so element i of the slice is code i of this column's packet.
+                    int32_t dec[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        if constexpr (FAST) dec[j] = decode4_fast(packet[j / 2], (j & 1) * 4, cb, j < 4 ? s0 : s1);
+                        else dec[j] = decode4(packet[j / 2], (j & 1) * 4, cb, j < 4 ? s0 : s1);
+                    }
+                    int e = 0;
+                    jm::joint_matrix_apply(sg, b, [&](int8_t& v) {
+                        const int i = e++;
+                        v = static_cast<int8_t>((dec[i >> 2] >> (8 * (i & 3))) & 0xFF);
+                    });
+                    jm::joint_matrix_mad(sg, c, a, b, c);
+                }
+                auto local = sycl::address_space_cast<sycl::access::address_space::local_space,
+                                                      sycl::access::decorated::no>(
+                    partials.template get_multi_ptr<sycl::access::decorated::no>().get() + split * 128);
+                jm::joint_matrix_store(sg, c, local, 16, jm::layout::row_major);
+                sycl::group_barrier(it.get_group());
+                for (int i = it.get_local_id(0); i < 128; i += Split * 16) {
+                    uint32_t sum = 0;
+#pragma unroll
+                    for (int t = 0; t < Split; ++t) sum += static_cast<uint32_t>(partials[t * 128 + i]);
+                    const int r = i / 16;
+                    const int64_t n = it.get_group(0) * 16 + i % 16;
+                    if (n < N) {
+                        float f = static_cast<float>(sycl::bit_cast<int32_t>(sum));
+                        f = f * xs[r];
+                        f = f * sch[n];
+                        if (residual) {
+                            const Out lin = static_cast<Out>(f);
+                            out[r * N + n] = static_cast<Out>(static_cast<float>(residual[r * N + n]) +
+                                                              static_cast<float>(lin));
+                        } else {
+                            out[r * N + n] = static_cast<Out>(f);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+template <typename Scale, typename Out>
+void dispatch(const torch::Tensor& x, const torch::Tensor& xs, const torch::Tensor& w,
+              const torch::Tensor& srel, const torch::Tensor& sch, const float* cb, const Out* res,
+              torch::Tensor& out, int64_t G, int64_t cfg, bool fast) {
+    auto& q = c10::xpu::getCurrentXPUStream().queue();
+    const int64_t rows = x.size(0), K = x.size(1), N = w.size(0);
+    // cfg 0: automatic; 100+S: DPAS with Split S (rows == 8); otherwise COLS + 10 * KS.
+    if (rows == 8 && K % 32 == 0 && (cfg == 0 || cfg >= 100)) {
+        int64_t split = cfg >= 100 ? cfg - 100 : 0;
+        if (split == 0) {
+            const auto units = q.get_device().get_info<sycl::info::device::max_compute_units>();
+            split = (N + 15) / 16 < int64_t(units) ? 16 : 8;
+        }
+        auto go = [&](auto s) {
+            constexpr int S = decltype(s)::value;
+            if (fast)
+                launch_dpas<Scale, Out, true, S>(x.data_ptr<int8_t>(), xs.data_ptr<float>(), w.data_ptr<int8_t>(),
+                                                 srel.data_ptr<Scale>(), sch.data_ptr<float>(), cb, res,
+                                                 static_cast<Out*>(out.data_ptr()), N, K, G, q);
+            else
+                launch_dpas<Scale, Out, false, S>(x.data_ptr<int8_t>(), xs.data_ptr<float>(), w.data_ptr<int8_t>(),
+                                                  srel.data_ptr<Scale>(), sch.data_ptr<float>(), cb, res,
+                                                  static_cast<Out*>(out.data_ptr()), N, K, G, q);
+        };
+        if (split >= 16) go(std::integral_constant<int, 16>{});
+        else if (split >= 8) go(std::integral_constant<int, 8>{});
+        else go(std::integral_constant<int, 4>{});
+        return;
+    }
+    if (cfg == 0) cfg = 12;
+    int64_t ks = cfg / 10, cols = cfg % 10;
+    while (ks > 1 && (K / ks) % (kLanes * kChunk * kU) != 0) ks /= 2;
+    if (K % (kLanes * kChunk * kU) != 0) ks = 1;
+    TORCH_CHECK((K / ks) % (kLanes * kChunk * kU) == 0, "K slice must be a multiple of 2048");
+    auto go = [&](auto m, auto c, auto k) {
+        constexpr int MM = decltype(m)::value, CC = decltype(c)::value, KK = decltype(k)::value;
+        if (fast)
+            launch<Scale, Out, MM, CC, true, KK>(x.data_ptr<int8_t>(), xs.data_ptr<float>(), w.data_ptr<int8_t>(),
+                                                 srel.data_ptr<Scale>(), sch.data_ptr<float>(), cb, res,
+                                                 static_cast<Out*>(out.data_ptr()), rows, N, K, G, q);
+        else
+            launch<Scale, Out, MM, CC, false, KK>(x.data_ptr<int8_t>(), xs.data_ptr<float>(), w.data_ptr<int8_t>(),
+                                                  srel.data_ptr<Scale>(), sch.data_ptr<float>(), cb, res,
+                                                  static_cast<Out*>(out.data_ptr()), rows, N, K, G, q);
+    };
+    using I1 = std::integral_constant<int, 1>;
+    using I2 = std::integral_constant<int, 2>;
+    using I4 = std::integral_constant<int, 4>;
+    using I8 = std::integral_constant<int, 8>;
+    auto with_ks = [&](auto m, auto c) {
+        if (ks >= 4) go(m, c, I4{}); else if (ks == 2) go(m, c, I2{}); else go(m, c, I1{});
+    };
+    auto with_cols = [&](auto m) {
+        if (cols >= 4) with_ks(m, I4{}); else if (cols == 2) with_ks(m, I2{}); else with_ks(m, I1{});
+    };
+    if (rows == 1) with_cols(I1{});
+    else if (rows == 2) with_cols(I2{});
+    else if (rows <= 4) with_cols(I4{});
+    else with_cols(I8{});
+}
+
+}  // namespace
+
+torch::Tensor w4a8_decode_linear(torch::Tensor x, torch::Tensor x_scale, torch::Tensor packed,
+                                 torch::Tensor s_rel, torch::Tensor s_channel,
+                                 std::optional<torch::Tensor> codebook, std::optional<torch::Tensor> residual,
+                                 int64_t group_size, int64_t out_dtype_code, int64_t cols, bool fast) {
+    TORCH_CHECK(x.is_xpu() && x.scalar_type() == at::kChar && x.dim() == 2 && x.is_contiguous(),
+                "x must be contiguous XPU int8 [M, K]");
+    const int64_t M = x.size(0), K = x.size(1), N = packed.size(0);
+    TORCH_CHECK(M >= 1 && M <= 8, "1 <= M <= 8");
+    TORCH_CHECK(K % (kLanes * kChunk * kU) == 0, "K must be a multiple of 2048");
+    TORCH_CHECK(group_size == 16 || (group_size % 32 == 0 && K % group_size == 0), "G16 or G%32");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 32 == 0, "x must be 32-byte aligned");
+    TORCH_CHECK(packed.scalar_type() == at::kChar && packed.is_contiguous() && packed.dim() == 2 &&
+                    packed.size(1) == K / 2 && reinterpret_cast<uintptr_t>(packed.data_ptr()) % 16 == 0,
+                "packed must be contiguous 16B-aligned int8 [N, K/2]");
+    TORCH_CHECK(s_rel.is_contiguous() && s_rel.dim() == 2 && s_rel.size(0) == N && s_rel.size(1) == K / group_size,
+                "s_rel must be contiguous [N, K/G]");
+    TORCH_CHECK(x_scale.scalar_type() == at::kFloat && x_scale.is_contiguous() && x_scale.numel() == M,
+                "x_scale f32 [M]");
+    TORCH_CHECK(s_channel.scalar_type() == at::kFloat && s_channel.is_contiguous() && s_channel.numel() == N,
+                "s_channel f32 [N]");
+    const float* cb = nullptr;
+    if (codebook) {
+        TORCH_CHECK(codebook->scalar_type() == at::kFloat && codebook->numel() == 16 && codebook->is_contiguous(),
+                    "codebook f32 [16]");
+        cb = codebook->data_ptr<float>();
+    }
+    TORCH_CHECK(out_dtype_code == 0 || out_dtype_code == 2, "out dtype fp32 or bf16");
+    const auto dtype = out_dtype_code == 0 ? at::kFloat : at::kBFloat16;
+    auto out = torch::empty({M, N}, x.options().dtype(dtype));
+    if (residual) {
+        TORCH_CHECK(residual->scalar_type() == dtype && residual->is_contiguous() && residual->numel() == M * N,
+                    "residual must match output");
+    }
+    auto run = [&](auto out_tag) {
+        using Out = decltype(out_tag);
+        const Out* res = residual ? reinterpret_cast<const Out*>(residual->data_ptr()) : nullptr;
+        if (s_rel.scalar_type() == at::kFloat8_e4m3fn)
+            dispatch<c10::Float8_e4m3fn, Out>(x, x_scale, packed, s_rel, s_channel, cb, res, out, group_size, cols, fast);
+        else if (s_rel.scalar_type() == at::kFloat)
+            dispatch<float, Out>(x, x_scale, packed, s_rel, s_channel, cb, res, out, group_size, cols, fast);
+        else
+            TORCH_CHECK(false, "s_rel must be fp32 or fp8 e4m3");
+    };
+    if (dtype == at::kFloat) run(float{}); else run(sycl::ext::oneapi::bfloat16{});
+    return out;
+}
+
+}  // namespace mono_decode_xpu

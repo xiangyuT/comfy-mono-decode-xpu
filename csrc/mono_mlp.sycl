@@ -1,0 +1,192 @@
+// SPDX-License-Identifier: Apache-2.0
+// Persistent single-launch MLP block for Qwen3.5 W4A8 decode (rows <= 8).
+//
+//   q1, s1 = rot_quant(xn)                       phase 1   (one work-group per row)
+//   h      = bf16(silu(gate(q1)) * up(q1))       phase 2   (16-column tiles, K split over sub-groups)
+//   q2, s2 = rot_quant(h)                        phase 3
+//   out    = down(q2)                            phase 4
+//
+// Every phase reproduces the eager kernels bit for bit: ConvRot rotation by in-order BF16 DPAS,
+// packed W4 decode onto the INT8 grid with a modular INT32 dot, FP32 scale-back then one BF16
+// cast, and SiLU through a 65536-entry table produced by torch's own F.silu. Phases are separated
+// by a device-wide barrier; the launch must keep every work-group resident (nwg <= resident WGs).
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <tuple>
+
+#include <c10/util/Float8_e4m3fn.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/experimental/clock.hpp>
+#include <torch/extension.h>
+
+#include "mono_common.hpp"
+
+namespace mono_decode_xpu {
+namespace {
+using namespace mono;
+class MonoMlpKernel;
+}  // namespace
+
+torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor silu_lut,
+                       torch::Tensor gq, torch::Tensor gs, torch::Tensor gsc, torch::Tensor gcb,
+                       torch::Tensor uq, torch::Tensor us, torch::Tensor usc, torch::Tensor ucb,
+                       torch::Tensor dq, torch::Tensor ds, torch::Tensor dsc, torch::Tensor dcb, int64_t nwg, int64_t stop, bool tiled) {
+    TORCH_CHECK(xn.is_xpu() && xn.scalar_type() == at::kBFloat16 && xn.is_contiguous(), "xn bf16");
+    const int64_t K1 = xn.size(-1), R = xn.numel() / K1, N1 = gq.size(0), N2 = dq.size(0);
+    TORCH_CHECK(R >= 1 && R <= 8, "1..8 rows");
+    TORCH_CHECK(K1 % 2048 == 0 && N1 % 2048 == 0 && N1 <= MAXK && K1 <= MAXK && N2 % 16 == 0, "shape contract");
+    TORCH_CHECK(gq.size(1) * 2 == K1 && uq.sizes() == gq.sizes() && dq.size(1) * 2 == N1, "weight shapes");
+    for (auto* t : {&gs, &us, &ds})
+        TORCH_CHECK(t->scalar_type() == at::kFloat8_e4m3fn && t->is_contiguous(), "fp8 group scales (G16)");
+    TORCH_CHECK(gs.size(1) * 16 == K1 && ds.size(1) * 16 == N1, "G16 scales");
+    auto opts = xn.options();
+    // persistent scratch (stable addresses for graph replay); pad rows of q1/q2 stay zero and the
+    // barrier counter returns to zero at the end of every launch
+    struct Scratch { torch::Tensor q1, q2, s12, h, cnt, dbg; };
+    static std::map<std::tuple<int, int64_t, int64_t>, Scratch> cache;
+    auto key = std::make_tuple(static_cast<int>(xn.get_device()), K1, N1);
+    auto found = cache.find(key);
+    if (found == cache.end()) {
+        Scratch sc{torch::zeros({8, K1}, opts.dtype(at::kChar)), torch::zeros({8, N1}, opts.dtype(at::kChar)),
+                   torch::zeros({16}, opts.dtype(at::kFloat)), torch::zeros({8, N1}, opts),
+                   torch::zeros({2}, opts.dtype(at::kInt)), torch::zeros({64 * 8}, opts.dtype(at::kLong))};
+        found = cache.emplace(key, sc).first;
+    }
+    auto& q1 = found->second.q1;
+    auto& q2 = found->second.q2;
+    auto& s12 = found->second.s12;
+    auto& hbuf = found->second.h;
+    auto& counter = found->second.cnt;
+    auto* dbg = reinterpret_cast<uint64_t*>(found->second.dbg.data_ptr());
+    auto out = torch::empty({R, N2}, opts);
+    const W4 G{gq.data_ptr<int8_t>(), reinterpret_cast<const fp8*>(gs.data_ptr()), gsc.data_ptr<float>(),
+               gcb.data_ptr<float>(), N1, K1};
+    const W4 U{uq.data_ptr<int8_t>(), reinterpret_cast<const fp8*>(us.data_ptr()), usc.data_ptr<float>(),
+               ucb.data_ptr<float>(), N1, K1};
+    const W4 D{dq.data_ptr<int8_t>(), reinterpret_cast<const fp8*>(ds.data_ptr()), dsc.data_ptr<float>(),
+               dcb.data_ptr<float>(), N2, N1};
+    const auto* xp = reinterpret_cast<const bf16*>(xn.data_ptr());
+    const auto* hp = reinterpret_cast<const bf16*>(hadamard.data_ptr());
+    const auto* lut = reinterpret_cast<const bf16*>(silu_lut.data_ptr());
+    auto* q1p = q1.data_ptr<int8_t>();
+    auto* q2p = q2.data_ptr<int8_t>();
+    auto* sp = s12.data_ptr<float>();
+    auto* hb = reinterpret_cast<bf16*>(hbuf.data_ptr());
+    auto* op = reinterpret_cast<bf16*>(out.data_ptr());
+    auto* cnt = reinterpret_cast<uint32_t*>(counter.data_ptr());
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    // co-residency: at most one ~65 KB-SLM work-group per Xe core (64 x 32 KB measured to hang)
+    const int64_t cores = queue.get_device().get_info<sycl::info::device::max_compute_units>() / 8;
+    if (nwg <= 0 || nwg > cores) nwg = cores;
+    const uint32_t NW = static_cast<uint32_t>(nwg);
+    const int ST = static_cast<int>(stop % 10);
+    const int VARIANT = static_cast<int>(stop / 10);  // experiments only; 0 = exact
+    const W4 gu[2] = {G, U};
+    Stream SG = make_stream(gu, 2, true), SD = make_stream(&D, 1, false);
+    stream_finalize(SG, NW);
+    SG.tiled = SD.tiled = tiled;
+    {
+        int64_t a0, a1, d0, d1;
+        stream_range(SG, 0, NW, a0, a1);
+        stream_range(SD, 0, NW, d0, d1);
+        TORCH_CHECK((a1 - a0) * 128 <= ACC && (d1 - d0) * 128 <= ACC, "tiles per work-group exceed the SLM accumulators");
+        SG.ksplit = choose_ksplit(a1 - a0, K1);
+        SD.ksplit = choose_ksplit(d1 - d0, N1);
+    }
+    queue.submit([&](sycl::handler& cgh) {
+        // one 64 KB region holds either the rot_quant row (FP32, phases 1/3) or the pair table (2/4)
+        sycl::local_accessor<uint32_t, 1> region(TAB / 2, cgh);
+        sycl::local_accessor<float, 1> red(MSG, cgh);
+        sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
+        sycl::local_accessor<float, 1> cbl(16, cgh);
+        cgh.parallel_for<MonoMlpKernel>(
+            sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                auto sg = it.get_sub_group();
+                const int t = it.get_local_id(0), sgi = sg.get_group_id()[0];
+                const uint32_t wg = it.get_group(0);
+                uint32_t epoch = 0;
+                uint32_t* rraw = region.template get_multi_ptr<sycl::access::decorated::no>().get();
+                const LPtrF xr = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(reinterpret_cast<float*>(rraw));
+                const LPtrU16 tab = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(reinterpret_cast<uint16_t*>(rraw));
+                if (t < 16) cbl[t] = G.cb[t];  // the three projections share one codebook (host-checked)
+                const SlmCb cb{cbl, 0};
+                auto lacc = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                    acc.template get_multi_ptr<sycl::access::decorated::no>().get());
+                if (t == 0) dbg[wg * 8 + 0] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- phase 1: rot_quant(xn) ----
+                for (int64_t r = wg; r < R; r += NW) rot_quant_row(it, xp + r * K1, hp, q1p + r * K1, sp + r, K1, xr, red);
+                if (t == 0) dbg[wg * 8 + 1] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 8 + 2] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                if (ST >= 2)
+                // ---- phase 2: h = silu(gate) * up through the stream engine (gate/up tiles paired) ----
+                {
+                    int64_t t0, t1;
+                    stream_range(SG, wg, NW, t0, t1);
+                    build_pair_table(it, tab, cb);
+                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) acc[i] = 0;
+                    sycl::group_barrier(it.get_group());
+                    if (VARIANT == 1) stream_gemv<1>(it, q1p, SG, t0, t1, tab, lacc);
+                    else stream_gemv(it, q1p, SG, t0, t1, tab, lacc);
+                    sycl::group_barrier(it.get_group());
+                    for (int64_t i = t; i < (t1 - t0) / 2 * 128; i += MWG) {
+                        const int64_t tl = i / 128;
+                        const int e = i % 128, r = e / 16;
+                        if (r >= R) continue;
+                        const int64_t n = (t0 / 2 + tl) * 16 + e % 16;
+                        float fg = static_cast<float>(acc[(2 * tl) * 128 + e]);
+                        fg = fg * sp[r];
+                        fg = fg * G.sc[n];
+                        float fu = static_cast<float>(acc[(2 * tl + 1) * 128 + e]);
+                        fu = fu * sp[r];
+                        fu = fu * U.sc[n];
+                        const bf16 g = static_cast<bf16>(fg);
+                        const float act = static_cast<float>(lut[sycl::bit_cast<uint16_t>(g)]);
+                        hb[r * N1 + n] = static_cast<bf16>(act * static_cast<float>(static_cast<bf16>(fu)));
+                    }
+                }
+                if (t == 0) dbg[wg * 8 + 3] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 8 + 4] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- phase 3: rot_quant(h) ----
+                if (ST >= 3) for (int64_t r = wg; r < R; r += NW) rot_quant_row(it, hb + r * N1, hp, q2p + r * N1, sp + 8 + r, N1, xr, red);
+                grid_sync(it, cnt, NW, epoch);
+                if (t == 0) dbg[wg * 8 + 5] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // ---- phase 4: out = down(q2); a work-group owns TPW tiles, KS sub-groups split each K ----
+                if (ST >= 4) {
+                    int64_t t0, t1;
+                    stream_range(SD, wg, NW, t0, t1);
+                    if (int64_t(wg) < R || ST < 2) build_pair_table(it, tab, cb);  // phase 3 rot_quant reused the region
+                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) acc[i] = 0;
+                    sycl::group_barrier(it.get_group());
+                    if (VARIANT == 1) stream_gemv<1>(it, q2p, SD, t0, t1, tab, lacc);
+                    else stream_gemv(it, q2p, SD, t0, t1, tab, lacc);
+                    sycl::group_barrier(it.get_group());
+                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
+                        const int64_t tl = i / 128;
+                        const int e = i % 128, r = e / 16;
+                        if (r >= R) continue;
+                        const int64_t n = (t0 + tl) * 16 + e % 16;
+                        float f = static_cast<float>(acc[tl * 128 + e]);
+                        f = f * sp[8 + r];
+                        f = f * D.sc[n];
+                        op[r * N2 + n] = static_cast<bf16>(f);
+                    }
+                }
+                if (t == 0) dbg[wg * 8 + 6] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
+                // self-reset of the barrier counter: the last work-group to finish knows nobody polls
+                sycl::group_barrier(it.get_group());
+                if (t == 0) {
+                    sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                     sycl::access::address_space::global_space> done(cnt[1]), c0(cnt[0]);
+                    if (done.fetch_add(1u) == NW - 1) { c0.store(0u); done.store(0u); }
+                }
+            });
+    });
+    return out;
+}
+}  // namespace mono_decode_xpu

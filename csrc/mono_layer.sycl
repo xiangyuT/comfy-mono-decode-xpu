@@ -1,0 +1,326 @@
+// SPDX-License-Identifier: Apache-2.0
+// Persistent layer segments for Qwen3.5 W4A8 decode (rows <= 8), bit-identical to the eager ops.
+//
+// layer_pre:  xn = RMSNorm(x) (input_layernorm), q = rot_quant(xn), outs[m] = W4_m(q) for up to three
+//             projections that read the same activation (GDN: in_proj_qkv, in_proj_z; attention:
+//             q_proj, k_proj, v_proj).
+// layer_post: y' = y * sigmoid(gate) (attention only), x1 = x + W4_o(rot_quant(y')),
+//             x  = x1 + MLP(RMSNorm(x1)) (post_attention_layernorm), written in place into x.
+// Phases are separated by device-wide barriers; every work-group stays resident (nwg <= Xe cores).
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <tuple>
+#include <vector>
+
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+#include "mono_common.hpp"
+
+namespace mono_decode_xpu {
+namespace {
+using namespace mono;
+
+W4 w4_of(const torch::Tensor& q, const torch::Tensor& s, const torch::Tensor& sc, const torch::Tensor& cb) {
+    TORCH_CHECK(q.is_xpu() && q.scalar_type() == at::kChar && q.dim() == 2 && q.is_contiguous(), "packed W4 int8 [N, K/2]");
+    TORCH_CHECK(s.scalar_type() == at::kFloat8_e4m3fn && s.is_contiguous() && s.size(1) * 16 == q.size(1) * 2, "FP8 G16 scales");
+    TORCH_CHECK(sc.scalar_type() == at::kFloat && sc.numel() == q.size(0) && cb.scalar_type() == at::kFloat && cb.numel() == 16,
+                "FP32 channel scales / codebook");
+    TORCH_CHECK(q.size(0) % 16 == 0 && (q.size(1) * 2) % 2048 == 0, "N % 16, K % 2048");
+    return W4{q.data_ptr<int8_t>(), reinterpret_cast<const fp8*>(s.data_ptr()), sc.data_ptr<float>(), cb.data_ptr<float>(),
+              q.size(0), q.size(1) * 2};
+}
+
+struct Scratch {
+    torch::Tensor q1, q2, s, x1, xn, yb, h, cnt;
+};
+Scratch& scratch(const torch::Tensor& like) {
+    static std::map<int, Scratch> cache;
+    const int dev = like.get_device();
+    auto found = cache.find(dev);
+    if (found == cache.end()) {
+        auto o = like.options();
+        Scratch sc{torch::zeros({8, MAXK}, o.dtype(at::kChar)), torch::zeros({8, MAXK}, o.dtype(at::kChar)),
+                   torch::zeros({32}, o.dtype(at::kFloat)), torch::zeros({8, 4096}, o.dtype(at::kBFloat16)),
+                   torch::zeros({8, 4096}, o.dtype(at::kBFloat16)), torch::zeros({8, 4096}, o.dtype(at::kBFloat16)),
+                   torch::zeros({8, MAXK}, o.dtype(at::kBFloat16)), torch::zeros({2}, o.dtype(at::kInt))};
+        found = cache.emplace(dev, sc).first;
+    }
+    return found->second;
+}
+
+uint32_t resident_wgs(sycl::queue& queue, int64_t nwg) {
+    // co-residency: at most one ~100 KB-SLM work-group per Xe core
+    const int64_t cores = queue.get_device().get_info<sycl::info::device::max_compute_units>() / 8;
+    if (nwg <= 0 || nwg > cores) nwg = cores;
+    return static_cast<uint32_t>(nwg);
+}
+
+inline void finish(sycl::nd_item<1>& it, uint32_t* cnt, uint32_t NW) {
+    // self-reset of the barrier counter: the last work-group to finish knows nobody polls
+    sycl::group_barrier(it.get_group());
+    if (it.get_local_id(0) == 0) {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space> done(cnt[1]), c0(cnt[0]);
+        if (done.fetch_add(1u) == NW - 1) { c0.store(0u); done.store(0u); }
+    }
+}
+
+class LayerPreKernel;
+class LayerPostKernel;
+}  // namespace
+
+std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, double eps, torch::Tensor hadamard,
+                                     std::vector<torch::Tensor> mats, int64_t nwg, bool tiled) {
+    TORCH_CHECK(x.is_xpu() && x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.size(-1) == 4096, "x bf16 [..., 4096]");
+    const int64_t R = x.numel() / 4096;
+    TORCH_CHECK(R >= 1 && R <= 8, "1..8 rows");
+    TORCH_CHECK(norm_w.scalar_type() == at::kBFloat16 && norm_w.is_contiguous() && norm_w.numel() == 4096, "norm weight bf16 [4096]");
+    TORCH_CHECK(mats.size() % 4 == 0 && mats.size() >= 4 && mats.size() <= 12, "1..3 W4 matrices (q, s, sc, cb)");
+    const int nm = static_cast<int>(mats.size() / 4);
+    W4 ws[3];
+    for (int m = 0; m < nm; ++m) {
+        ws[m] = w4_of(mats[4 * m], mats[4 * m + 1], mats[4 * m + 2], mats[4 * m + 3]);
+        TORCH_CHECK(ws[m].k == 4096, "K = hidden");
+    }
+    for (int m = nm; m < 3; ++m) ws[m] = ws[0];
+    auto& S = scratch(x);
+    auto xn = torch::empty({R, 4096}, x.options());
+    std::vector<torch::Tensor> outs{xn};
+    bf16* op[3];
+    for (int m = 0; m < 3; ++m) {
+        if (m < nm) {
+            outs.push_back(torch::empty({R, ws[m].n}, x.options()));
+            op[m] = reinterpret_cast<bf16*>(outs.back().data_ptr());
+        } else {
+            op[m] = op[0];
+        }
+    }
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    const uint32_t NW = resident_wgs(queue, nwg);
+    Stream st = make_stream(ws, nm, false);
+    st.tiled = tiled;
+    {
+        int64_t a0, a1;
+        stream_range(st, 0, NW, a0, a1);
+        TORCH_CHECK((a1 - a0) * 128 <= ACC, "tiles per work-group exceed the SLM accumulators");
+        st.ksplit = choose_ksplit(a1 - a0, 4096);
+    }
+    const auto* xp = reinterpret_cast<const bf16*>(x.data_ptr());
+    const auto* wp = reinterpret_cast<const bf16*>(norm_w.data_ptr());
+    const auto* hp = reinterpret_cast<const bf16*>(hadamard.data_ptr());
+    auto* xnp = reinterpret_cast<bf16*>(xn.data_ptr());
+    auto* q1p = S.q1.data_ptr<int8_t>();
+    auto* sp = S.s.data_ptr<float>();
+    auto* cnt = reinterpret_cast<uint32_t*>(S.cnt.data_ptr());
+    const float e = static_cast<float>(eps);
+    bf16* o0 = op[0]; bf16* o1 = op[1]; bf16* o2 = op[2];
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<uint32_t, 1> region(TAB / 2, cgh);
+        sycl::local_accessor<float, 1> red(MSG, cgh);
+        sycl::local_accessor<float, 1> nred(1056, cgh);
+        sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
+        sycl::local_accessor<float, 1> cbl(16, cgh);
+        cgh.parallel_for<LayerPreKernel>(
+            sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                const int t = it.get_local_id(0);
+                const uint32_t wg = it.get_group(0);
+                uint32_t epoch = 0;
+                uint32_t* rraw = region.template get_multi_ptr<sycl::access::decorated::no>().get();
+                const LPtrF xr = lptr(reinterpret_cast<float*>(rraw));
+                const LPtrU16 tab = lptr(reinterpret_cast<uint16_t*>(rraw));
+                auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
+                auto lred = lptr(nred.template get_multi_ptr<sycl::access::decorated::no>().get());
+                if (t < 16) cbl[t] = st.m[0].cb[t];
+                const SlmCb cb{cbl, 0};
+                // ---- phase 1: xn = RMSNorm(x); q = rot_quant(xn) ----
+                for (int64_t r = wg; r < R; r += NW) {
+                    rms_norm_row(it, xp + r * 4096, wp, xnp + r * 4096, e, lred);
+                    rot_quant_row(it, xnp + r * 4096, hp, q1p + r * 4096, sp + r, 4096, xr, red);
+                }
+                grid_sync(it, cnt, NW, epoch);
+                // ---- phase 2: projections ----
+                int64_t t0, t1;
+                stream_range(st, wg, NW, t0, t1);
+                build_pair_table(it, tab, cb);
+                for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) acc[i] = 0;
+                sycl::group_barrier(it.get_group());
+                stream_gemv(it, q1p, st, t0, t1, tab, lacc);
+                sycl::group_barrier(it.get_group());
+                for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
+                    const int e2 = i % 128, r = e2 / 16;
+                    if (r >= R) continue;
+                    int tile;
+                    const int m = stream_which(st, int(t0 + i / 128), tile);
+                    const int64_t n = int64_t(tile) * 16 + e2 % 16;
+                    const float* scm = m == 0 ? st.m[0].sc : (m == 1 ? st.m[1].sc : st.m[2].sc);
+                    const int64_t N = m == 0 ? st.m[0].n : (m == 1 ? st.m[1].n : st.m[2].n);
+                    bf16* o = m == 0 ? o0 : (m == 1 ? o1 : o2);
+                    o[r * N + n] = scaleback(acc[i], sp[r], scm[n]);
+                }
+                finish(it, cnt, NW);
+            });
+    });
+    return outs;
+}
+
+torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::Tensor> gate, torch::Tensor sig_lut,
+                         torch::Tensor oq, torch::Tensor os, torch::Tensor osc, torch::Tensor ocb,
+                         torch::Tensor norm_w, double eps, torch::Tensor hadamard, torch::Tensor silu_lut,
+                         torch::Tensor gq, torch::Tensor gs, torch::Tensor gsc, torch::Tensor gcb,
+                         torch::Tensor uq, torch::Tensor us, torch::Tensor usc, torch::Tensor ucb,
+                         torch::Tensor dq, torch::Tensor ds, torch::Tensor dsc, torch::Tensor dcb, int64_t nwg, int64_t stop, bool tiled) {
+    TORCH_CHECK(x.is_xpu() && x.scalar_type() == at::kBFloat16 && x.is_contiguous() && x.size(-1) == 4096, "x bf16 [..., 4096]");
+    const int64_t R = x.numel() / 4096;
+    TORCH_CHECK(R >= 1 && R <= 8, "1..8 rows");
+    TORCH_CHECK(y.scalar_type() == at::kBFloat16 && y.is_contiguous() && y.numel() == R * 4096, "y bf16 [R, 4096]");
+    // gate: contiguous [R, 4096], or the q_proj output [R, 8192] whose head h holds (query 256 | gate 256)
+    if (gate) TORCH_CHECK(gate->scalar_type() == at::kBFloat16 && gate->is_contiguous() && (gate->numel() == R * 4096 || gate->numel() == R * 8192), "gate bf16");
+    const W4 O = w4_of(oq, os, osc, ocb), G = w4_of(gq, gs, gsc, gcb), U = w4_of(uq, us, usc, ucb), D = w4_of(dq, ds, dsc, dcb);
+    TORCH_CHECK(O.k == 4096 && O.n == 4096 && G.k == 4096 && U.n == G.n && D.k == G.n && D.n == 4096 && G.n <= MAXK, "shapes");
+    auto& S = scratch(x);
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    const uint32_t NW = resident_wgs(queue, nwg);
+    Stream SO = make_stream(&O, 1, false);
+    const W4 gu[2] = {G, U};
+    Stream SG = make_stream(gu, 2, true), SD = make_stream(&D, 1, false);
+    stream_finalize(SG, NW);
+    SO.tiled = SG.tiled = SD.tiled = tiled;
+    {
+        int64_t a0, a1;
+        stream_range(SO, 0, NW, a0, a1);
+        TORCH_CHECK((a1 - a0) * 128 <= ACC, "SLM accumulators");
+        SO.ksplit = choose_ksplit(a1 - a0, O.k);
+        stream_range(SG, 0, NW, a0, a1);
+        TORCH_CHECK((a1 - a0) * 128 <= ACC, "SLM accumulators");
+        SG.ksplit = choose_ksplit(a1 - a0, G.k);
+        stream_range(SD, 0, NW, a0, a1);
+        TORCH_CHECK((a1 - a0) * 128 <= ACC, "SLM accumulators");
+        SD.ksplit = choose_ksplit(a1 - a0, D.k);
+    }
+    const int64_t N1 = G.n;
+    const bool ginter = gate && gate->numel() == R * 8192;
+    auto* xp = reinterpret_cast<bf16*>(x.data_ptr());
+    const auto* yp = reinterpret_cast<const bf16*>(y.data_ptr());
+    const auto* gp = gate ? reinterpret_cast<const bf16*>(gate->data_ptr()) : nullptr;
+    const auto* sig = reinterpret_cast<const bf16*>(sig_lut.data_ptr());
+    const auto* wp = reinterpret_cast<const bf16*>(norm_w.data_ptr());
+    const auto* hp = reinterpret_cast<const bf16*>(hadamard.data_ptr());
+    const auto* lut = reinterpret_cast<const bf16*>(silu_lut.data_ptr());
+    auto* q1p = S.q1.data_ptr<int8_t>();
+    auto* q2p = S.q2.data_ptr<int8_t>();
+    auto* sp = S.s.data_ptr<float>();
+    auto* x1p = reinterpret_cast<bf16*>(S.x1.data_ptr());
+    auto* xnp = reinterpret_cast<bf16*>(S.xn.data_ptr());
+    auto* ybp = reinterpret_cast<bf16*>(S.yb.data_ptr());
+    auto* hb = reinterpret_cast<bf16*>(S.h.data_ptr());
+    auto* cnt = reinterpret_cast<uint32_t*>(S.cnt.data_ptr());
+    const float e = static_cast<float>(eps);
+    const int ST = static_cast<int>(stop);
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<uint32_t, 1> region(TAB / 2, cgh);
+        sycl::local_accessor<float, 1> red(MSG, cgh);
+        sycl::local_accessor<float, 1> nred(1056, cgh);
+        sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
+        sycl::local_accessor<float, 1> cbl(16, cgh);
+        cgh.parallel_for<LayerPostKernel>(
+            sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                const int t = it.get_local_id(0);
+                const uint32_t wg = it.get_group(0);
+                uint32_t epoch = 0;
+                uint32_t* rraw = region.template get_multi_ptr<sycl::access::decorated::no>().get();
+                const LPtrF xr = lptr(reinterpret_cast<float*>(rraw));
+                const LPtrU16 tab = lptr(reinterpret_cast<uint16_t*>(rraw));
+                auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
+                auto lred = lptr(nred.template get_multi_ptr<sycl::access::decorated::no>().get());
+                if (t < 16) cbl[t] = O.cb[t];  // one codebook for all projections (host-checked)
+                const SlmCb cb{cbl, 0};
+                bool tab_ok = false;
+                auto table = [&]() {
+                    if (!tab_ok) { build_pair_table(it, tab, cb); tab_ok = true; }
+                    sycl::group_barrier(it.get_group());
+                };
+                auto gemv = [&](const Stream& st, const int8_t* xq, int64_t& t0, int64_t& t1) {
+                    stream_range(st, wg, NW, t0, t1);
+                    table();
+                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) acc[i] = 0;
+                    sycl::group_barrier(it.get_group());
+                    stream_gemv(it, xq, st, t0, t1, tab, lacc);
+                    sycl::group_barrier(it.get_group());
+                };
+                // ---- phase 1: y' = y * sigmoid(gate); q1 = rot_quant(y') ----
+                for (int64_t r = wg; r < R; r += NW) {
+                    const bf16* src = yp + r * 4096;
+                    if (gp != nullptr) {
+                        for (int i = t; i < 4096; i += MWG) {
+                            const bf16 g = ginter ? gp[r * 8192 + (i >> 8) * 512 + 256 + (i & 255)] : gp[r * 4096 + i];
+                            ybp[r * 4096 + i] = bf16_mul(src[i], sig[sycl::bit_cast<uint16_t>(g)]);
+                        }
+                        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group);
+                        sycl::group_barrier(it.get_group());
+                        src = ybp + r * 4096;
+                    }
+                    rot_quant_row(it, src, hp, q1p + r * 4096, sp + r, 4096, xr, red);
+                    tab_ok = false;
+                }
+                grid_sync(it, cnt, NW, epoch);
+                // ---- phase 2: x1 = x + o_proj(q1) ----
+                if (ST >= 2) {
+                    int64_t t0, t1;
+                    gemv(SO, q1p, t0, t1);
+                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
+                        const int e2 = i % 128, r = e2 / 16;
+                        if (r >= R) continue;
+                        const int64_t n = (t0 + i / 128) * 16 + e2 % 16;
+                        x1p[r * 4096 + n] = bf16_add(xp[r * 4096 + n], scaleback(acc[i], sp[r], O.sc[n]));
+                    }
+                }
+                grid_sync(it, cnt, NW, epoch);
+                // ---- phase 3: q1 = rot_quant(RMSNorm(x1)) ----
+                if (ST >= 3)
+                    for (int64_t r = wg; r < R; r += NW) {
+                        rms_norm_row(it, x1p + r * 4096, wp, xnp + r * 4096, e, lred);
+                        rot_quant_row(it, xnp + r * 4096, hp, q1p + r * 4096, sp + 8 + r, 4096, xr, red);
+                        tab_ok = false;
+                    }
+                grid_sync(it, cnt, NW, epoch);
+                // ---- phase 4: h = silu(gate) * up ----
+                if (ST >= 4) {
+                    int64_t t0, t1;
+                    gemv(SG, q1p, t0, t1);
+                    for (int64_t i = t; i < (t1 - t0) / 2 * 128; i += MWG) {
+                        const int64_t tl = i / 128;
+                        const int e2 = i % 128, r = e2 / 16;
+                        if (r >= R) continue;
+                        const int64_t n = (t0 / 2 + tl) * 16 + e2 % 16;
+                        const bf16 g = scaleback(acc[(2 * tl) * 128 + e2], sp[8 + r], G.sc[n]);
+                        const bf16 u = scaleback(acc[(2 * tl + 1) * 128 + e2], sp[8 + r], U.sc[n]);
+                        hb[r * N1 + n] = bf16_mul(lut[sycl::bit_cast<uint16_t>(g)], u);
+                    }
+                }
+                grid_sync(it, cnt, NW, epoch);
+                // ---- phase 5: q2 = rot_quant(h) ----
+                if (ST >= 5)
+                    for (int64_t r = wg; r < R; r += NW) {
+                        rot_quant_row(it, hb + r * N1, hp, q2p + r * N1, sp + 16 + r, N1, xr, red);
+                        tab_ok = false;
+                    }
+                grid_sync(it, cnt, NW, epoch);
+                // ---- phase 6: x = x1 + down(q2) ----
+                if (ST >= 6) {
+                    int64_t t0, t1;
+                    gemv(SD, q2p, t0, t1);
+                    for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
+                        const int e2 = i % 128, r = e2 / 16;
+                        if (r >= R) continue;
+                        const int64_t n = (t0 + i / 128) * 16 + e2 % 16;
+                        xp[r * 4096 + n] = bf16_add(x1p[r * 4096 + n], scaleback(acc[i], sp[16 + r], D.sc[n]));
+                    }
+                }
+                finish(it, cnt, NW);
+            });
+    });
+    return x;
+}
+}  // namespace mono_decode_xpu

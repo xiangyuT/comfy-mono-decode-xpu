@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: Apache-2.0
+// Fused ConvRot activation rotation + row-wise INT8 quantization for decode rows.
+//
+// Reproduces comfy_kitchen's eager quantize_and_rotate_rowwise for BF16 input:
+//   x_rot  = bf16(x_grouped @ H)                          (BF16 DPAS, K blocks of 16 in order)
+//   amax   = max |x_rot| over the row                     (exact)
+//   scale  = max(float(amax) / 127, 1e-30)                (FP32, returned)
+//   s_bf   = bf16(scale), zero -> bf16 tiny
+//   q      = int8(clamp(rint(bf16(float(x_rot) / float(s_bf))), -128, 127))
+// The rotation uses the same INT/BF16 DPAS accumulation order as the oneDNN matmul the eager
+// path calls; tests compare bitwise against the eager result across decode shapes.
+#include <cstdint>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+namespace mono_decode_xpu {
+namespace {
+using bf16 = sycl::ext::oneapi::bfloat16;
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+constexpr int GS = 256;      // ConvRot group
+constexpr int PWG = 512;     // threads per row work-group (32 sub-groups)
+constexpr int MAXK = 12288;  // SLM row buffer
+
+class RotQuantDpas;
+
+void launch(const bf16* x, const bf16* h, int8_t* q, float* scale, int64_t rows, int64_t K, sycl::queue& queue) {
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> xr(MAXK, cgh);
+        sycl::local_accessor<float, 1> red(PWG / 16, cgh);
+        cgh.parallel_for<RotQuantDpas>(
+            sycl::nd_range<1>(rows * PWG, PWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                auto sg = it.get_sub_group();
+                const int64_t r = it.get_group(0);
+                const int t = it.get_local_id(0);
+                const int sgi = sg.get_group_id()[0];
+                const int64_t groups = K / GS;
+                const int64_t tiles = (groups / 8) * (GS / 16);
+                const bf16* xrow = x + r * K;
+                for (int64_t tile = sgi; tile < tiles; tile += PWG / 16) {
+                    const int64_t gb = tile / (GS / 16);
+                    const int cb = tile % (GS / 16);
+                    jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a;
+                    jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::row_major> b;
+                    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> c;
+                    jm::joint_matrix_fill(sg, c, 0.f);
+                    for (int k = 0; k < GS; k += 16) {
+                        jm::joint_matrix_load(
+                            sg, a,
+                            sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                     sycl::access::decorated::no>(xrow + gb * 8 * GS + k),
+                            GS);
+                        jm::joint_matrix_load(
+                            sg, b,
+                            sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                     sycl::access::decorated::no>(h + k * GS + cb * 16),
+                            GS);
+                        jm::joint_matrix_mad(sg, c, a, b, c);
+                    }
+                    jm::joint_matrix_store(
+                        sg, c,
+                        sycl::address_space_cast<sycl::access::address_space::local_space,
+                                                 sycl::access::decorated::no>(
+                            xr.template get_multi_ptr<sycl::access::decorated::no>().get() + gb * 8 * GS + cb * 16),
+                        GS, jm::layout::row_major);
+                }
+                sycl::group_barrier(it.get_group());
+                float amax = 0.f;
+                for (int64_t i = t; i < K; i += PWG) {
+                    const float v = static_cast<float>(static_cast<bf16>(xr[i]));
+                    xr[i] = v;
+                    amax = sycl::fmax(amax, sycl::fabs(v));
+                }
+                const float m = sycl::reduce_over_group(sg, amax, sycl::maximum<float>());
+                if (sg.get_local_id()[0] == 0) red[sgi] = m;
+                sycl::group_barrier(it.get_group());
+                float rmax = 0.f;
+#pragma unroll
+                for (int i = 0; i < PWG / 16; ++i) rmax = sycl::fmax(rmax, red[i]);
+                const float s = sycl::fmax(rmax / 127.0f, 1e-30f);
+                if (t == 0) scale[r] = s;
+                bf16 sb = static_cast<bf16>(s);
+                if (static_cast<float>(sb) == 0.f) sb = sycl::bit_cast<bf16>(uint16_t(0x0080));  // finfo(bf16).tiny
+                const float sbf = static_cast<float>(sb);
+                for (int64_t i = t; i < K; i += PWG) {
+                    const float d = static_cast<float>(static_cast<bf16>(xr[i] / sbf));
+                    q[r * K + i] = static_cast<int8_t>(sycl::clamp(sycl::rint(d), -128.f, 127.f));
+                }
+            });
+    });
+}
+}  // namespace
+
+std::tuple<torch::Tensor, torch::Tensor> rot_quant(torch::Tensor x, torch::Tensor h, int64_t /*order*/) {
+    TORCH_CHECK(x.is_xpu() && x.scalar_type() == at::kBFloat16 && x.is_contiguous(), "x bf16 contiguous");
+    TORCH_CHECK(h.scalar_type() == at::kBFloat16 && h.is_contiguous() && h.numel() == GS * GS, "H bf16 [256,256]");
+    const int64_t K = x.size(-1), rows = x.numel() / K;
+    TORCH_CHECK(K % (8 * GS) == 0 && K <= MAXK, "K must be a multiple of 2048 and <= 12288");
+    auto q = torch::empty(x.sizes(), x.options().dtype(at::kChar));
+    auto sizes = x.sizes().vec();
+    sizes.back() = 1;
+    auto scale = torch::empty(sizes, x.options().dtype(at::kFloat));
+    if (rows == 0) return {q, scale};
+    launch(reinterpret_cast<const bf16*>(x.data_ptr()), reinterpret_cast<const bf16*>(h.data_ptr()),
+           q.data_ptr<int8_t>(), scale.data_ptr<float>(), rows, K, c10::xpu::getCurrentXPUStream().queue());
+    return {q, scale};
+}
+}  // namespace mono_decode_xpu

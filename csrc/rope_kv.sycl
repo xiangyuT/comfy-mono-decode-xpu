@@ -1,0 +1,246 @@
+// SPDX-License-Identifier: Apache-2.0
+// Partial split-half RoPE on q and k plus the KV cache write, one launch (decode rows S <= 8).
+//
+// Replaces q35.apply_partial_rope (comfy_kitchen apply_rope_split_half on the first rotary_dim lanes,
+// served by the OmniXPU kitchen backend, then torch.cat with the pass-through lanes) and
+// FixedKVCache.write (index_copy_ of k and v at the device-side positions). Per pair j < half:
+//   o0 = t[j] * f[j][0][0] + t[j + half] * f[j][0][1]
+//   o1 = t[j + half] * f[j][1][1] + t[j] * f[j][1][0]
+// each product rounded to float on its own (no FMA), the sum rounded once to BF16. Matches the live
+// dispatch bit for bit; the kitchen eager backend differs (its addcmul_ is an FMA), so layer.py
+// self-checks against the live path once before using this.
+#include <cstdint>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+#pragma clang fp contract(off)
+
+namespace mono_decode_xpu {
+namespace {
+using bf16 = sycl::ext::oneapi::bfloat16;
+class RopeKvKernel;
+class NormRopeKvKernel;
+
+inline float norm_sum32(sycl::sub_group sg, float lo, float hi) {
+    float sum = lo + hi;
+    for (int offset = 8; offset; offset /= 2)
+        sum = sum + sycl::shift_group_left(sg, sum, offset);
+    return sycl::group_broadcast(sg, sum, 0);
+}
+
+inline float norm_hw_rsqrt(float x) {
+#if defined(__SYCL_DEVICE_ONLY__)
+    float result;
+    __asm__ volatile("rsqrt (M1, 16) %0(0,0)<1> %1(0,0)<1;1,0>" : "=rw"(result) : "rw"(x));
+    return result;
+#else
+    return x;
+#endif
+}
+
+// z is a runtime 0: the XOR keeps IGC from fusing b * fb into the add (it contracts mul+add into mad
+// even with contract(off)), so both products round on their own as in the live omni rotary kernel.
+inline float rope_pair(float a, float fa, float b, float fb, uint32_t z) {
+#pragma clang fp contract(off)
+    const float o = a * fa;
+    const float p = sycl::bit_cast<float>(sycl::bit_cast<uint32_t>(b * fb) ^ z);
+    const float q = sycl::bit_cast<float>(sycl::bit_cast<uint32_t>(o) ^ z);
+    return q + p;
+}
+}  // namespace
+
+// qn [S, Hq, D], kn [S, Hk, D], vn [S, Hk, D] (contiguous, BF16); freqs [S, rd/2, 2, 2] float with row
+// stride fs (elements, last three dims contiguous); key/value [1, Hk, cap, D]; position int64 [>= S].
+// Returns (q [1, Hq, S, D], k [1, Hk, S, D]) contiguous, as the eager cat outputs.
+std::vector<torch::Tensor> rope_kv(torch::Tensor qn, torch::Tensor kn, torch::Tensor vn, torch::Tensor freqs,
+                                   torch::Tensor key, torch::Tensor value, torch::Tensor position, int64_t rd) {
+    TORCH_CHECK(qn.is_xpu() && qn.scalar_type() == at::kBFloat16 && kn.scalar_type() == at::kBFloat16 &&
+                    vn.scalar_type() == at::kBFloat16, "bf16 q/k/v");
+    TORCH_CHECK(qn.is_contiguous() && kn.is_contiguous() && vn.is_contiguous(), "contiguous [S, H, D] q/k/v");
+    TORCH_CHECK(key.is_contiguous() && value.is_contiguous() && key.scalar_type() == at::kBFloat16 &&
+                    value.scalar_type() == at::kBFloat16 && key.dim() == 4 && key.size(0) == 1, "bf16 [1, Hk, cap, D] cache");
+    TORCH_CHECK(freqs.scalar_type() == at::kFloat && position.scalar_type() == at::kLong, "float freqs, int64 position");
+    const int64_t S = qn.size(0), Hq = qn.size(1), D = qn.size(2), Hk = kn.size(1), cap = key.size(2);
+    TORCH_CHECK(S >= 1 && S <= 8 && kn.size(0) == S && vn.size(0) == S && kn.size(2) == D && key.size(1) == Hk &&
+                    key.size(3) == D && rd % 2 == 0 && rd <= D && position.numel() >= S, "shapes");
+    const int64_t half = rd / 2;
+    TORCH_CHECK(freqs.size(-1) == 2 && freqs.size(-2) == 2 && freqs.size(-3) == half && freqs.stride(-1) == 1 &&
+                    freqs.stride(-2) == 2 && freqs.stride(-3) == 4, "freqs [.., S, rd/2, 2, 2]");
+    TORCH_CHECK(freqs.numel() / (half * 4) == S, "one freqs row per decode row");
+    const int64_t fs = freqs.stride(-4);
+    auto q = torch::empty({1, Hq, S, D}, qn.options());
+    auto k = torch::empty({1, Hk, S, D}, qn.options());
+    const auto* qp = reinterpret_cast<const bf16*>(qn.data_ptr());
+    const auto* kp = reinterpret_cast<const bf16*>(kn.data_ptr());
+    const auto* vp = reinterpret_cast<const bf16*>(vn.data_ptr());
+    const float* fp = freqs.data_ptr<float>();
+    const int64_t* pp = position.data_ptr<int64_t>();
+    auto* oq = reinterpret_cast<bf16*>(q.data_ptr());
+    auto* ok = reinterpret_cast<bf16*>(k.data_ptr());
+    auto* kc = reinterpret_cast<bf16*>(key.data_ptr());
+    auto* vc = reinterpret_cast<bf16*>(value.data_ptr());
+    const uint32_t z = static_cast<uint32_t>(rd >> 20);  // 0 at run time, opaque to the compiler
+    const int64_t H = Hq + 2 * Hk;  // q heads, then k heads, then v heads
+    c10::xpu::getCurrentXPUStream().queue().parallel_for<RopeKvKernel>(
+        sycl::range<3>(S, H, D), [=](sycl::item<3> it) {
+            const int64_t s = it.get_id(0), h = it.get_id(1), d = it.get_id(2);
+            if (h >= Hq + Hk) {  // v: cache write only
+                const int64_t hv = h - Hq - Hk;
+                vc[(hv * cap + pp[s]) * D + d] = vp[(s * Hk + hv) * D + d];
+                return;
+            }
+            const bool isq = h < Hq;
+            const int64_t hh = isq ? h : h - Hq, nh = isq ? Hq : Hk;
+            const bf16* src = (isq ? qp : kp) + (s * nh + hh) * D;
+            bf16 r = src[d];
+            if (d < rd) {
+                const float* f = fp + s * fs;
+                const int64_t j = d < half ? d : d - half;
+                const float lo = static_cast<float>(src[j]), hi = static_cast<float>(src[j + half]);
+                const float* m = f + j * 4;  // [[f00, f01], [f10, f11]]
+                const float o = d < half ? rope_pair(lo, m[0], hi, m[1], z) : rope_pair(hi, m[3], lo, m[2], z);
+                r = static_cast<bf16>(o);
+            }
+            if (isq) oq[(hh * S + s) * D + d] = r;
+            else {
+                ok[(hh * S + s) * D + d] = r;
+                kc[(hh * cap + pp[s]) * D + d] = r;
+            }
+        });
+    return {q, k};
+}
+
+// Q is the first half of each [query, gate] head. Its live Torch RMSNorm uses
+// vec4 / two SIMD32 subgroups at D256. K is dense and uses Omni's eight BS32
+// block reduction. Preserve both trees and the BF16 normalized intermediate.
+// The caller owns in-range cache positions, as for rope_kv above.
+std::vector<torch::Tensor> qk_norm_rope_kv(
+    torch::Tensor rawq, torch::Tensor rawk, torch::Tensor vn,
+    torch::Tensor weightq, torch::Tensor weightk, torch::Tensor freqs,
+    torch::Tensor key, torch::Tensor value, torch::Tensor position,
+    double epsq, double epsk, int64_t rd) {
+    TORCH_CHECK(rawq.is_xpu() && rawq.scalar_type() == at::kBFloat16 && rawq.dim() == 4 &&
+                    rawq.size(0) == 1 && rawq.size(3) == 256, "Q: BF16 [1, S, Hq, 256]");
+    for (const auto& tensor : {rawk, vn, weightq, weightk, key, value})
+        TORCH_CHECK(tensor.device() == rawq.device() && tensor.scalar_type() == at::kBFloat16,
+                    "BF16 operands on the Q device");
+    TORCH_CHECK(rawk.dim() == 4 && rawk.size(0) == 1 && rawk.size(3) == 256 &&
+                    vn.sizes() == rawk.sizes(), "K/V: BF16 [1, S, Hk, 256]");
+    const int64_t S = rawq.size(1), Hq = rawq.size(2), Hk = rawk.size(2);
+    TORCH_CHECK(S >= 1 && S <= 8 && rawk.size(1) == S && Hq > 0 && Hk > 0,
+                "1..8 rows and nonempty heads");
+    TORCH_CHECK(rawq.stride(3) == 1 && rawq.stride(2) == 512 && rawk.is_contiguous() &&
+                    vn.stride(3) == 1 && vn.stride(2) == 256,
+                "Q is the query half of gated heads; K is dense; V has dense heads");
+    TORCH_CHECK(weightq.dim() == 1 && weightq.numel() == 256 && weightq.is_contiguous() &&
+                    weightk.dim() == 1 && weightk.numel() == 256 && weightk.is_contiguous(),
+                "norm weights: BF16 [256]");
+    TORCH_CHECK(key.dim() == 4 && key.size(0) == 1 && key.size(1) == Hk && key.size(3) == 256 &&
+                    key.size(2) >= S && key.is_contiguous() && value.sizes() == key.sizes() &&
+                    value.is_contiguous(), "K/V cache: BF16 [1, Hk, cap, 256]");
+    TORCH_CHECK(position.device() == rawq.device() && position.scalar_type() == at::kLong &&
+                    position.dim() == 1 && position.is_contiguous() && position.numel() >= S,
+                "cache positions: contiguous INT64 [>=S]");
+    TORCH_CHECK(rd > 0 && rd <= 256 && rd % 2 == 0 && epsq > 0 && epsk > 0,
+                "positive eps and even rotary dimension in 1..256");
+    TORCH_CHECK(freqs.device() == rawq.device() && freqs.scalar_type() == at::kFloat && freqs.dim() == 4 &&
+                    freqs.size(0) == S && freqs.size(1) == rd / 2 && freqs.size(2) == 2 && freqs.size(3) == 2 &&
+                    freqs.stride(3) == 1 && freqs.stride(2) == 2 && freqs.stride(1) == 4,
+                "frequencies: FP32 [S, rd/2, 2, 2] with dense inner dimensions");
+    auto q = torch::empty({1, Hq, S, 256}, rawq.options());
+    auto k = torch::empty({1, Hk, S, 256}, rawq.options());
+    const auto* qp = reinterpret_cast<const bf16*>(rawq.data_ptr());
+    const auto* kp = reinterpret_cast<const bf16*>(rawk.data_ptr());
+    const auto* vp = reinterpret_cast<const bf16*>(vn.data_ptr());
+    const auto* qw = reinterpret_cast<const bf16*>(weightq.data_ptr());
+    const auto* kw = reinterpret_cast<const bf16*>(weightk.data_ptr());
+    auto* oq = reinterpret_cast<bf16*>(q.data_ptr());
+    auto* ok = reinterpret_cast<bf16*>(k.data_ptr());
+    auto* kc = reinterpret_cast<bf16*>(key.data_ptr());
+    auto* vc = reinterpret_cast<bf16*>(value.data_ptr());
+    const auto* pp = position.data_ptr<int64_t>();
+    const auto* fp = freqs.data_ptr<float>();
+    const int64_t qs = rawq.stride(1), qh = rawq.stride(2), ks = rawk.stride(1), kh = rawk.stride(2);
+    const int64_t vs = vn.stride(1), vh = vn.stride(2), fs = freqs.stride(0), cap = key.size(2);
+    const int64_t half = rd / 2, heads = Hq + 2 * Hk;
+    const bool q_torch = !rawq.is_contiguous();
+    const float eq = static_cast<float>(epsq), ek = static_cast<float>(epsk);
+    const uint32_t z = static_cast<uint32_t>(rd >> 20);
+    c10::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> sums(9, cgh);
+        sycl::local_accessor<bf16, 1> normalized(256, cgh);
+        cgh.parallel_for<NormRopeKvKernel>(
+            sycl::nd_range<1>(S * heads * 128, 128),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+#pragma clang fp contract(off)
+                const int t = it.get_local_id(0), sgi = t / 16, lane = t % 16;
+                const int64_t s = it.get_group(0) / heads, h = it.get_group(0) % heads;
+                auto sg = it.get_sub_group();
+                if (h >= Hq + Hk) {
+                    const int64_t hv = h - Hq - Hk;
+                    for (int d = t; d < 256; d += 128)
+                        vc[(hv * cap + pp[s]) * 256 + d] = vp[s * vs + hv * vh + d];
+                    return;
+                }
+                const bool isq = h < Hq;
+                const bool torch_norm = isq && q_torch;
+                const int64_t hh = isq ? h : h - Hq;
+                const bf16* src = (isq ? qp : kp) + s * (isq ? qs : ks) + hh * (isq ? qh : kh);
+                const bf16* weight = isq ? qw : kw;
+                if (torch_norm) {
+                    if (sgi < 2) {
+                        float lo = 0.f, hi = 0.f;
+                        for (int j = 0; j < 4; ++j) {
+                            const float a = static_cast<float>(src[sgi * 128 + lane * 4 + j]);
+                            const float b = static_cast<float>(src[sgi * 128 + (lane + 16) * 4 + j]);
+                            lo = sycl::fma(a, a, lo);
+                            hi = sycl::fma(b, b, hi);
+                        }
+                        const float sum = norm_sum32(sg, lo, hi);
+                        if (lane == 0) sums[sgi] = sum;
+                    }
+                } else {
+                    const float a = static_cast<float>(src[sgi * 32 + lane]);
+                    const float b = static_cast<float>(src[sgi * 32 + lane + 16]);
+                    const float sum = norm_sum32(sg, a * a, b * b) * (1.f / 256.f);
+                    if (lane == 0) sums[sgi] = sum;
+                }
+                sycl::group_barrier(it.get_group());
+                if (torch_norm && sgi == 0 && lane == 0)
+                    sums[8] = sycl::rsqrt((sums[0] + sums[1]) * (1.f / 256.f) + eq);
+                if (!torch_norm && sgi == 0) {
+                    float sum = lane < 8 ? sums[lane] : 0.f;
+                    for (int offset = 4; offset; offset /= 2)
+                        sum = sum + sycl::shift_group_left(sg, sum, offset);
+                    if (lane == 0) sums[8] = norm_hw_rsqrt(sum + (isq ? eq : ek));
+                }
+                sycl::group_barrier(it.get_group());
+                const float scale = sums[8];
+                for (int d = t; d < 256; d += 128)
+                    normalized[d] = static_cast<bf16>((static_cast<float>(src[d]) * scale) *
+                                                     static_cast<float>(weight[d]));
+                sycl::group_barrier(it.get_group());
+                for (int d = t; d < 256; d += 128) {
+                    bf16 result = normalized[d];
+                    if (d < rd) {
+                        const int j = d < half ? d : d - half;
+                        const float* f = fp + s * fs + j * 4;
+                        const float lo = static_cast<float>(normalized[j]);
+                        const float hi = static_cast<float>(normalized[j + half]);
+                        result = static_cast<bf16>(d < half ? rope_pair(lo, f[0], hi, f[1], z)
+                                                           : rope_pair(hi, f[3], lo, f[2], z));
+                    }
+                    if (isq) oq[(hh * S + s) * 256 + d] = result;
+                    else {
+                        ok[(hh * S + s) * 256 + d] = result;
+                        kc[(hh * cap + pp[s]) * 256 + d] = result;
+                    }
+                }
+            });
+    });
+    return {q, k};
+}
+}  // namespace mono_decode_xpu
