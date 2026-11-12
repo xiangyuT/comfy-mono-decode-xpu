@@ -1,7 +1,7 @@
 # comfy-mono-decode-xpu
 
 Decode kernels for ComfyUI prompt enhance (`TextGenerate` / `TextGenerateV2` with MTP) on Intel XPU
-(Xe2 / BMG, Arc Pro B70), for Qwen3.5-9B W4A8 text encoders.
+(Xe2 / BMG, Arc Pro B70 and Arc B580), for Qwen3.5-9B W4A8 text encoders.
 
 The hooks sit at the model's decode step, so official workflows and templates speed up without new
 nodes. Numerical checks compare each kernel with the operator chain it replaces, using identical
@@ -20,12 +20,13 @@ Any workflow whose prompt enhance runs Qwen3.5-9B W4A8 (`qwen3.5_9b_w4a8_gptq`) 
 or `TextGenerateV2` with MTP is supported. The hooks sit at the model's decode step, independent of the
 workflow. Other text encoders are left untouched.
 
-Validated on Arc Pro B70:
+Validated workflows:
 
-| official template | ComfyUI | validation |
-|---|---|---|
-| MOSS Image (`image_moss_image_t2i`) | v0.43 | performance and output, see Results |
-| MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | functional: the default workflow completes in DynamicVRAM, prefetch and ordinary-memory modes |
+| GPU | official template | ComfyUI | validation |
+|---|---|---|---|
+| Arc Pro B70 | MOSS Image (`image_moss_image_t2i`) | v0.43 | performance and output, see Results |
+| Arc Pro B70 | MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | functional: the default workflow completes in DynamicVRAM, prefetch and ordinary-memory modes |
+| Arc B580 | MOSS Image (`image_moss_image_t2i`) | v0.45 | functional: cold and forced prompt expansion, image output and cache cleanup in DynamicVRAM and ordinary-memory modes |
 
 ## Results
 
@@ -178,7 +179,7 @@ The published image `intel/llm-scaler-omni:0.2.0-b2` is older and has not been t
 
 | component | tested version | needed for |
 |---|---|---|
-| GPU | Intel Arc Pro B70 (Xe2 / BMG) | AOT target `bmg` by default; `--target` builds for another Xe2 device |
+| GPU | Intel Arc Pro B70 and Arc B580 (Xe2 / BMG) | AOT target `bmg` by default; `--target` builds for another Xe2 device |
 | ComfyUI | v0.43.0 (`426f5eea`) and v0.45.0 (`989d93d0`) | Qwen3.5 `TextGenerate` / `TextGenerateV2`, including prepared `CombinedLinear` weights |
 | torch | 2.14.0+xpu, Python 3.12 | runtime |
 | oneAPI DPC++ (`icpx`) | 2026.1.1 | building only (`install.py` sources `setvars.sh` if needed) |
@@ -192,6 +193,13 @@ at `3445059be0ba75424babe66620ea07c645673e52`, Kitchen provider
 `f27f58782c51b6ab314b4cc0f6e65c8a6bafa277` and AIMDO provider
 `3bc6afbcb92e10a2d4737e79d170190ed787bf89`. The performance tables above keep their original
 v0.43 environment and measurement identities.
+
+B580 functional checks use llm-scaler source
+[`99daa2f`](https://github.com/intel/llm-scaler/commit/99daa2fec7e7726168816c23c8210d0cc0c184e7)
+with ComfyUI v0.45, Kitchen/provider 0.2.41 and this node installed. Persistent stream kernels size
+their accumulators from the runtime Xe-core count and tile ranges; explicit worker requests that
+exceed the device's cores or local-memory capacity raise before launch.
+This launch-planning update was tested on B580; the B70 results retain their original source revisions.
 
 The kernels reproduce the OmniXPU / Kitchen XPU kernels bit for bit; that is the stack the
 "identical tokens" claim refers to. Without OmniXPU (plain upstream ComfyUI + comfy-kitchen), the
@@ -317,8 +325,8 @@ tests/                   no-model pytest unit tests; UI model-validation instruc
   read the original row-major weights. Copies, graph references and component weight caches are
   released on return or error without flushing Torch's global cache.
 - Single XPU device per process.
-- Validated on Arc Pro B70 only. The default `bmg` build also runs on other BMG cards (e.g. Arc B580),
-  where it is enabled by default but untested; set `MONO_DECODE_XPU=0` if anything looks wrong.
+- The `bmg` build is validated on Arc Pro B70 and Arc B580 within the workflow scopes above.
+  Other BMG cards require separate validation.
 
 ## License
 

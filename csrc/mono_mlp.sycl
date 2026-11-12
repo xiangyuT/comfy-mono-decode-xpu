@@ -23,7 +23,7 @@
 #include <sycl/ext/oneapi/experimental/clock.hpp>
 #include <torch/extension.h>
 
-#include "mono_common.hpp"
+#include "mono_launch.hpp"
 
 namespace mono_decode_xpu {
 namespace {
@@ -79,29 +79,18 @@ torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor s
     auto* op = reinterpret_cast<bf16*>(out.data_ptr());
     auto* cnt = reinterpret_cast<uint32_t*>(counter.data_ptr());
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
-    // co-residency: at most one ~65 KB-SLM work-group per Xe core (64 x 32 KB measured to hang)
-    const int64_t cores = queue.get_device().get_info<sycl::info::device::max_compute_units>() / 8;
-    if (nwg <= 0 || nwg > cores) nwg = cores;
-    const uint32_t NW = static_cast<uint32_t>(nwg);
     const int ST = static_cast<int>(stop % 10);
     const int VARIANT = static_cast<int>(stop / 10);  // experiments only; 0 = exact
     const W4 gu[2] = {G, U};
     Stream SG = make_stream(gu, 2, true), SD = make_stream(&D, 1, false);
-    stream_finalize(SG, NW);
     SG.tiled = SD.tiled = tiled;
-    {
-        int64_t a0, a1, d0, d1;
-        stream_range(SG, 0, NW, a0, a1);
-        stream_range(SD, 0, NW, d0, d1);
-        TORCH_CHECK((a1 - a0) * 128 <= ACC && (d1 - d0) * 128 <= ACC, "tiles per work-group exceed the SLM accumulators");
-        SG.ksplit = choose_ksplit(a1 - a0, K1);
-        SD.ksplit = choose_ksplit(d1 - d0, N1);
-    }
+    const auto launch_plan = plan_launch(queue, xn, nwg, {&SG, &SD}, STREAM_SLM);
+    const uint32_t NW = launch_plan.workers;
     queue.submit([&](sycl::handler& cgh) {
         // one 64 KB region holds either the rot_quant row (FP32, phases 1/3) or the pair table (2/4)
         sycl::local_accessor<uint32_t, 1> region(TAB / 2, cgh);
         sycl::local_accessor<float, 1> red(MSG, cgh);
-        sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
+        sycl::local_accessor<int32_t, 1> acc(launch_plan.accumulator_elements, cgh);
         sycl::local_accessor<float, 1> cbl(16, cgh);
         cgh.parallel_for<MonoMlpKernel>(
             sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {

@@ -18,7 +18,8 @@ keeping every output bit unchanged.
 
 | file | what |
 |---|---|
-| `csrc/mono_common.hpp` | Shared device code for the persistent kernels: grid barrier (atomic RMW polling, ≤ 32 work-groups), stream GEMV engine, RMSNorm and ConvRot rotate/quantize ports. |
+| `csrc/mono_common.hpp` | Shared device code for the persistent kernels: grid barrier (atomic RMW polling), stream GEMV engine, RMSNorm and ConvRot rotate/quantize ports. |
+| `csrc/mono_launch.hpp` | Host launch plan: runtime Xe-core count, paired tile ranges and accumulator SLM size, with explicit worker and memory-capacity checks. |
 | `csrc/mono_gdn.sycl` | `layer_gdn`: input norm, quantize, in-projections, deferred causal conv, gates, gated delta rule, gated RMSNorm. `layer_gdn_core` returns the core rows. |
 | `csrc/mono_layer.sycl` | `layer_pre` (norm + quantize + input projections) and `layer_post` (sigmoid gate, out proj, residual, post norm, MLP, residual). |
 | `csrc/mono_mlp.sycl` | `mono_mlp`: one-launch MLP block, used outside the layer path. |
@@ -41,6 +42,10 @@ keeping every output bit unchanged.
 ### Persistent layer kernels
 
 - A layer is a sequence of phases separated by device-wide barriers inside one launch.
+- Persistent stream kernels use at most one work-group per runtime Xe core. Accumulator storage
+  follows the busiest group's actual tile range, including gate/up pairing. On a 20-core device,
+  the 12288-wide gate/up stream needs 78 tiles per group, beyond the former fixed 64-tile buffer.
+  The launch checks total local storage against the device limit before enqueueing.
 - The GDN layer's single fused kernel spilled 1–3 KB per thread at 128 GRF. It is split into a
   core-only kernel (0 spill) plus `layer_post`, which made it faster.
 - `attn_core` keeps Kitchen's split-K structure (up to 32 splits of the cache capacity, 64-key

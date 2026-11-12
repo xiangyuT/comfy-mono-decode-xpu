@@ -29,7 +29,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/extension.h>
 
-#include "mono_common.hpp"
+#include "mono_launch.hpp"
 
 namespace mono_decode_xpu {
 namespace {
@@ -93,20 +93,13 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
     TORCH_CHECK(ctl.scalar_type() == at::kInt && ctl.numel() == 2 + 3 * SLOT, "ctl");
     auto& S = gscratch(x);
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
-    int64_t cores = queue.get_device().get_info<sycl::info::device::max_compute_units>() / 8;
-    if (nwg <= 0 || nwg > cores) nwg = cores;
-    const uint32_t NW = static_cast<uint32_t>(nwg);
-    TORCH_CHECK(NW * MWG >= uint32_t(C + SLOT * HV), "conv threads");
     const W4 pre[2] = {QKV, Z}, gu[2] = {G, U};
     Stream SP = make_stream(pre, 2, false), SO = make_stream(&O, 1, false), SG = make_stream(gu, 2, true), SD = make_stream(&Dn, 1, false);
-    stream_finalize(SG, NW);
-    for (Stream* st : {&SP, &SO, &SG, &SD}) {
-        st->tiled = tiled;
-        int64_t a0, a1;
-        stream_range(*st, 0, NW, a0, a1);
-        TORCH_CHECK((a1 - a0) * 128 <= ACC, "SLM accumulators");
-        st->ksplit = choose_ksplit(a1 - a0, st->m[0].k);
-    }
+    for (Stream* st : {&SP, &SO, &SG, &SD}) st->tiled = tiled;
+    const size_t fixed_slm = STREAM_SLM + NORM_SLM + (2 * DH + RG * DH + DH) * sizeof(float);
+    const auto launch_plan = plan_launch(queue, x, nwg, {&SP, &SO, &SG, &SD}, fixed_slm);
+    const uint32_t NW = launch_plan.workers;
+    TORCH_CHECK(NW * MWG >= uint32_t(C + SLOT * HV), "conv threads");
     auto* xp = reinterpret_cast<T*>(x.data_ptr());
     const auto* nin = reinterpret_cast<const T*>(norm_in.data_ptr());
     const auto* npost = reinterpret_cast<const T*>(norm_post.data_ptr());
@@ -151,7 +144,7 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
         sycl::local_accessor<uint32_t, 1> region(TAB / 2, cgh);
         sycl::local_accessor<float, 1> red(MSG, cgh);
         sycl::local_accessor<float, 1> nred(1056, cgh);
-        sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
+        sycl::local_accessor<int32_t, 1> acc(launch_plan.accumulator_elements, cgh);
         sycl::local_accessor<float, 1> cbl(16, cgh);
         sycl::local_accessor<float, 2> qk(sycl::range<2>(2, DH), cgh), dred(sycl::range<2>(RG, DH), cgh);
         sycl::local_accessor<float, 1> square(DH, cgh);

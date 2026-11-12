@@ -16,7 +16,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/extension.h>
 
-#include "mono_common.hpp"
+#include "mono_launch.hpp"
 
 namespace mono_decode_xpu {
 namespace {
@@ -48,13 +48,6 @@ Scratch& scratch(const torch::Tensor& like) {
         found = cache.emplace(dev, sc).first;
     }
     return found->second;
-}
-
-uint32_t resident_wgs(sycl::queue& queue, int64_t nwg) {
-    // co-residency: at most one ~100 KB-SLM work-group per Xe core
-    const int64_t cores = queue.get_device().get_info<sycl::info::device::max_compute_units>() / 8;
-    if (nwg <= 0 || nwg > cores) nwg = cores;
-    return static_cast<uint32_t>(nwg);
 }
 
 inline void finish(sycl::nd_item<1>& it, uint32_t* cnt, uint32_t NW) {
@@ -98,15 +91,10 @@ std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, doub
         }
     }
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
-    const uint32_t NW = resident_wgs(queue, nwg);
     Stream st = make_stream(ws, nm, false);
     st.tiled = tiled;
-    {
-        int64_t a0, a1;
-        stream_range(st, 0, NW, a0, a1);
-        TORCH_CHECK((a1 - a0) * 128 <= ACC, "tiles per work-group exceed the SLM accumulators");
-        st.ksplit = choose_ksplit(a1 - a0, 4096);
-    }
+    const auto launch_plan = plan_launch(queue, x, nwg, {&st}, STREAM_SLM + NORM_SLM);
+    const uint32_t NW = launch_plan.workers;
     const auto* xp = reinterpret_cast<const bf16*>(x.data_ptr());
     const auto* wp = reinterpret_cast<const bf16*>(norm_w.data_ptr());
     const auto* hp = reinterpret_cast<const bf16*>(hadamard.data_ptr());
@@ -120,7 +108,7 @@ std::vector<torch::Tensor> layer_pre(torch::Tensor x, torch::Tensor norm_w, doub
         sycl::local_accessor<uint32_t, 1> region(TAB / 2, cgh);
         sycl::local_accessor<float, 1> red(MSG, cgh);
         sycl::local_accessor<float, 1> nred(1056, cgh);
-        sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
+        sycl::local_accessor<int32_t, 1> acc(launch_plan.accumulator_elements, cgh);
         sycl::local_accessor<float, 1> cbl(16, cgh);
         cgh.parallel_for<LayerPreKernel>(
             sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -181,24 +169,12 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
     TORCH_CHECK(O.k == 4096 && O.n == 4096 && G.k == 4096 && U.n == G.n && D.k == G.n && D.n == 4096 && G.n <= MAXK, "shapes");
     auto& S = scratch(x);
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
-    const uint32_t NW = resident_wgs(queue, nwg);
     Stream SO = make_stream(&O, 1, false);
     const W4 gu[2] = {G, U};
     Stream SG = make_stream(gu, 2, true), SD = make_stream(&D, 1, false);
-    stream_finalize(SG, NW);
     SO.tiled = SG.tiled = SD.tiled = tiled;
-    {
-        int64_t a0, a1;
-        stream_range(SO, 0, NW, a0, a1);
-        TORCH_CHECK((a1 - a0) * 128 <= ACC, "SLM accumulators");
-        SO.ksplit = choose_ksplit(a1 - a0, O.k);
-        stream_range(SG, 0, NW, a0, a1);
-        TORCH_CHECK((a1 - a0) * 128 <= ACC, "SLM accumulators");
-        SG.ksplit = choose_ksplit(a1 - a0, G.k);
-        stream_range(SD, 0, NW, a0, a1);
-        TORCH_CHECK((a1 - a0) * 128 <= ACC, "SLM accumulators");
-        SD.ksplit = choose_ksplit(a1 - a0, D.k);
-    }
+    const auto launch_plan = plan_launch(queue, x, nwg, {&SO, &SG, &SD}, STREAM_SLM + NORM_SLM);
+    const uint32_t NW = launch_plan.workers;
     const int64_t N1 = G.n;
     const bool ginter = gate && gate->numel() == R * 8192;
     auto* xp = reinterpret_cast<bf16*>(x.data_ptr());
@@ -222,7 +198,7 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
         sycl::local_accessor<uint32_t, 1> region(TAB / 2, cgh);
         sycl::local_accessor<float, 1> red(MSG, cgh);
         sycl::local_accessor<float, 1> nred(1056, cgh);
-        sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
+        sycl::local_accessor<int32_t, 1> acc(launch_plan.accumulator_elements, cgh);
         sycl::local_accessor<float, 1> cbl(16, cgh);
         cgh.parallel_for<LayerPostKernel>(
             sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {

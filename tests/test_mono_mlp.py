@@ -39,3 +39,8 @@ def test_mono_mlp_matches_chain(C):
         assert bits_equal(out, ref), ("row-major", M)
         out_t = C.mono_mlp(xn, H, lut, *[t for w in tiled for t in w], 0, 4, True)
         assert bits_equal(out_t, ref), ("tile-major", M)
+
+    cores = torch.xpu.get_device_properties(xn.device).gpu_subslice_count
+    for workers, message in ((-1, "Xe cores"), (cores + 1, "Xe cores"), (1, "SLM requirement")):
+        with pytest.raises(RuntimeError, match=message):
+            C.mono_mlp(xn, H, lut, *args, workers, 4, False)
