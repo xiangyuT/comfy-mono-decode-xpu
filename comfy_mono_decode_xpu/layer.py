@@ -153,20 +153,35 @@ def _args(block, sp, x, es):
          "norm_in": (_norm_weight(block.input_layernorm, dev), block.input_layernorm.eps),
          "norm_post": (_norm_weight(block.post_attention_layernorm, dev), block.post_attention_layernorm.eps)}
     if sp["gdn"]:
-        ws = []
-        for lin in (mix.in_proj_a, mix.in_proj_b):
+        ws, borrowed = [], set()
+        for name, lin in (("wa", mix.in_proj_a), ("wb", mix.in_proj_b)):
             w, cast = _cast(es, lin, x)
             if isinstance(w, QuantizedTensor):  # as the eager GDN decode branch does on every call
                 w = (tiles.cached(("bf16", id(lin), w._qdata.data_ptr()), lambda w=w: w.dequantize().contiguous())
                      if not cast else w.dequantize())
+            elif cast:
+                borrowed.add(name)
             if w.device != dev or w.dtype != torch.bfloat16 or tuple(w.shape) != (mix.num_value_heads, 4096):
                 return None
             ws.append(w.contiguous())
-        cw, _ = _cast(es, mix.conv1d, x)
+        cw, cast = _cast(es, mix.conv1d, x)
         if cw.device != dev or cw.dtype != torch.bfloat16:
             return None
+        if cast:
+            borrowed.add("conv_w")
         a["extra"] = {"wa": ws[0], "wb": ws[1], "conv_w": cw.contiguous()}
+        a["borrowed"] = borrowed
     return a
+
+
+def _owned(plan):
+    """A copy of a tiled plan that outlives this call's DynamicVRAM casts: W4 operands are this
+    generate's tile copies already; the GDN BF16 operands borrowed from a cast are copied."""
+    plan = dict(plan)
+    borrowed = plan.pop("borrowed", ())
+    if "extra" in plan:
+        plan["extra"] = {k: (v.clone() if k in borrowed else v) for k, v in plan["extra"].items()}
+    return plan
 
 
 def _gdn_core(mix, xn, proj, z, kv):
@@ -483,9 +498,16 @@ def install():
             return original(self, x, attention_mask, freqs_cis, optimized_attention, past_key_value)
         state = {"mutated": False}  # set once a launch has updated layer state in place (GDN state, x)
         try:
+            # Tiled plans read only this generate's own copies: reuse them without recasting weights.
+            plan = tiles.plan(self)
+            if plan is not None:
+                return _run(self, plan, x, S, gdn, attention_mask, freqs_cis, optimized_attention,
+                            past_key_value, state)
             with contextlib.ExitStack() as es:
                 plan = _args(self, sp, x, es)
                 if plan is not None:
+                    if plan["tiled"]:
+                        tiles.set_plan(self, _owned(plan))
                     return _run(self, plan, x, S, gdn, attention_mask, freqs_cis, optimized_attention,
                                 past_key_value, state)
         except SubpathError:

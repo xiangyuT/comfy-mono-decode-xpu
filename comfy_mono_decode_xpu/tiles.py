@@ -13,7 +13,8 @@ CLAIM = "__comfy_mono_decode_xpu_session__"
 _lock = threading.Lock()
 _tiled_ok = os.environ.get("MONO_DECODE_XPU_TILED", "1") == "1"
 _margin = int(float(os.environ.get("MONO_DECODE_XPU_TILE_MARGIN_GB", "3")) * (1 << 30))
-_session = {"active": False, "ok": False, "tiles": {}, "cache": {}, "bytes": 0, "model": None, "budget": None}
+_session = {"active": False, "ok": False, "tiles": {}, "cache": {}, "plans": {}, "bytes": 0, "model": None,
+            "budget": None}
 _stats = {"tile_bytes": 0, "tile_oom": 0}
 _last_budget = None
 _CACHES = ("_mono_decode_xpu_w4", "_mono_decode_xpu_bf16", "_mono_decode_xpu_w1",
@@ -77,7 +78,7 @@ def _copy_budget(device):
 
 def begin(model):
     _session.update(active=True, ok=_tiled_ok and os.environ.get("MONO_DECODE_XPU_SESSION_TILES", "1") == "1",
-                    tiles={}, cache={}, bytes=0, model=model, budget=None)
+                    tiles={}, cache={}, plans={}, bytes=0, model=model, budget=None)
 
 
 def clear_model_caches(model):
@@ -95,7 +96,7 @@ def end():
     if model is not None:
         clear_model_caches(model)
     # Dropping our references is sufficient; leave Torch's reusable pool intact.
-    _session.update(active=False, ok=False, tiles={}, cache={}, bytes=0, model=None, budget=None)
+    _session.update(active=False, ok=False, tiles={}, cache={}, plans={}, bytes=0, model=None, budget=None)
 
 
 def tiles_enabled():
@@ -131,12 +132,15 @@ def tiled(lin, w):
     hit = _session["tiles"].get(lin)
     if hit is None or hit[0] is not source_key[0] or hit[1] is not source_key[1]:
         try:
+            # Every part is owned by this generate: a DynamicVRAM cast's tensors are only valid within
+            # its call, and FP32 metadata would otherwise be returned as-is by .float().
             parts = [tile_major(q, 16), tile_major(p.scale.view(torch.uint8), 16).view(torch.float8_e4m3fn),
-                     p.s_channel.float().contiguous(), p.codebook.float().contiguous()]
+                     p.s_channel.to(torch.float32, copy=True).contiguous(),
+                     p.codebook.to(torch.float32, copy=True).contiguous()]
         except (torch.OutOfMemoryError, RuntimeError) as e:
             if not isinstance(e, torch.OutOfMemoryError) and "out of memory" not in str(e).lower():
                 raise
-            _session.update(ok=False, tiles={}, bytes=0)
+            _session.update(ok=False, tiles={}, plans={}, bytes=0)
             with _lock:
                 _stats["tile_oom"] += 1
             logging.warning("[mono_decode_xpu] tile allocation failed; reading original row-major weights")
@@ -150,6 +154,16 @@ def tiled(lin, w):
         with _lock:
             _stats["tile_bytes"] += size
     return hit[3]
+
+
+def plan(owner):
+    """This generate's tiled kernel plan for `owner` (a decoder block), if one was recorded."""
+    return _session["plans"].get(owner) if _session["active"] and _session["ok"] else None
+
+
+def set_plan(owner, value):
+    if _session["active"] and _session["ok"]:
+        _session["plans"][owner] = value
 
 
 def cached(key, build):
