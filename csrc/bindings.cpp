@@ -25,6 +25,8 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
 torch::Tensor layer_gdn_core(torch::Tensor like, int64_t rows);
 torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,
                         torch::Tensor xk, torch::Tensor xv, torch::Tensor mask, int64_t nwg);
+torch::Tensor attn_dpas(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,
+                        torch::Tensor xk, torch::Tensor xv, torch::Tensor mask, int64_t chunks);
 
 std::vector<torch::Tensor> fast_topk(torch::Tensor x, int64_t k, bool argmax_order);
 std::vector<torch::Tensor> fast_pick(torch::Tensor x, int64_t k);
@@ -55,6 +57,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("layer_gdn", &mono_decode_xpu::layer_gdn);
     m.def("layer_gdn_core", &mono_decode_xpu::layer_gdn_core);
     m.def("attn_core", &mono_decode_xpu::attn_core);
+    m.def("attn_dpas", &mono_decode_xpu::attn_dpas);
     m.def("fast_topk", &mono_decode_xpu::fast_topk);
     m.def("fast_pick", &mono_decode_xpu::fast_pick);
     m.def("rope_kv", &mono_decode_xpu::rope_kv);
