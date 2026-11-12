@@ -35,6 +35,7 @@ def test_state_write_is_not_replayed(C, monkeypatch, failure):
     monkeypatch.setattr(tiles, "install", lambda: 0)
     monkeypatch.setenv("MONO_DECODE_XPU_NORM_CACHE", "0")
     monkeypatch.setenv("MONO_DECODE_XPU_LOGITS", "0")
+    monkeypatch.setenv("MONO_DECODE_XPU_AUTOTREE", "0")
     monkeypatch.setattr(layer, "_static_plan", lambda block: True)
     monkeypatch.setattr(layer, "_args", lambda *args:
                         dict(tiled=False, norm_in=(None, 0), norm_post=(None, 0), pre=[], out=[], mlp=[]))

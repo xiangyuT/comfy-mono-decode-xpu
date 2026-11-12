@@ -474,6 +474,9 @@ def install():
     if os.environ.get("MONO_DECODE_XPU_LOGITS", "1") == "1":
         from . import logits
         logits.install()
+    if os.environ.get("MONO_DECODE_XPU_AUTOTREE", "1") == "1":
+        from . import autotree
+        autotree.install()
     from comfy.text_encoders.llama import SPEC_ROWS
     from . import _C
 
