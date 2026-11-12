@@ -396,9 +396,9 @@ def _install_attend():
             else:
                 mask = None
             if mask is not None:
-                # tree verify rows: DPAS attention split along the context (not bit-identical to
-                # Kitchen; see attn_dpas.sycl); the draft's single row keeps the exact port
-                dpas = _attn_dpas and tree is not None and not guard.off("attn_dpas")
+                # DPAS attention split along the context, for the tree verify rows and the draft row (not
+                # bit-identical to Kitchen; see attn_dpas.sycl)
+                dpas = _attn_dpas and not guard.off("attn_dpas")
                 try:
                     if dpas:
                         out = _C.attn_dpas(xq, self.key, self.value, self.seqlen, xk, xv, mask, 0)

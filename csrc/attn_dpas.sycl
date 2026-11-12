@@ -8,14 +8,16 @@
 // and partial results are merged in FP32. The softmax is the same function.
 //
 // Kernel 1: work-group = (kv head, context chunk); sub-group = (8-row M tile, half of the head dim).
-//   Per 16-token tile: S = Q K^T (16 DPAS over the head dim), online softmax per row inside the
-//   sub-group, O += P V (8 DPAS for the half). On Xe2 an accumulator, an A and a B fragment all hold
-//   lane = column, element i = row i, so the scores' accumulator is already in the P operand's
-//   layout. K^T is a column-major load of the K rows (about a third of the kernel's time), V a
-//   row-major 2D block load. Elementwise writes into BF16 A/B fragments (joint_matrix_apply) hang the
-//   device with this compiler, so P goes through a small per-sub-group SLM tile and the cache's last
-//   partial tile is staged in SLM with zero rows. (S^T = K Q^T with Q^T from SLM was 2.4x slower.)
-// Kernel 2: per (head, row), merge the chunks' (m, l, O) and the admitted tree rows, write BF16.
+//   Chunks follow the actual length (at least 32 tokens each; work-groups past the last chunk exit).
+//   Per 16-token tile: S = Q K^T (16 DPAS over the head dim; K^T a column-major load of the K rows),
+//   online softmax per row inside the sub-group, O += P V (8 DPAS for the half; V a row-major block
+//   load). On Xe2 an accumulator, an A and a B fragment all hold lane = column, element i = row i, so
+//   the scores are already in the P operand's layout; P still goes through a 256 B SLM tile because
+//   elementwise writes into BF16 A/B fragments (joint_matrix_apply) hang the device with this compiler,
+//   and the cache's last partial tile is staged in SLM with zero rows. Registers: the running max and
+//   sum sit one row per lane and fragments are read through unrolled wi_data loops, which keeps the
+//   kernel at the default 128 GRF (the 256 GRF mode removes the spills but halves occupancy: slower).
+// Kernel 2: per (head, row), merge the active chunks' (m, l, O) and the admitted tree rows, write BF16.
 #include <cmath>
 #include <cstdint>
 #include <type_traits>
@@ -55,6 +57,18 @@ V4 v4(const torch::Tensor& t) {
     return {reinterpret_cast<const bf16*>(t.data_ptr()), t.stride(0), t.stride(1), t.stride(2), t.stride(3)};
 }
 
+#ifndef ATTN_DPAS_MINCH
+#define ATTN_DPAS_MINCH 32
+#endif
+// Chunks actually used for a context of L cached tokens: at least MINCH tokens each (fewer partials
+// for the merge at short contexts), a multiple of the 16-token tile. Same arithmetic on both kernels.
+inline void chunking(int L, int chunks, int& per, int& active) {
+    per = (L + chunks - 1) / chunks;
+    per = per < ATTN_DPAS_MINCH ? ATTN_DPAS_MINCH : per;
+    per = (per + TT - 1) / TT * TT;
+    active = L > 0 ? (L + per - 1) / per : 0;
+}
+
 template <int NMT>
 void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16* Vc, const int* lens, int HK,
                      int groups, int S, int rows, int cap, int chunks, float* part, float* ml) {
@@ -71,8 +85,9 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
                 const int wg = it.get_group(0), kh = wg / chunks, c = wg % chunks;
                 const int64_t raw = lens[0];
                 const int L = raw < 0 ? 0 : (raw > cap ? cap : int(raw));
-                // chunk length: a multiple of the tile, from the actual length (not the capacity)
-                const int per = ((L + chunks - 1) / chunks + TT - 1) / TT * TT;
+                int per, active;
+                chunking(L, chunks, per, active);
+                if (c >= active) return;  // uniform per work-group
                 const int beg = c * per, end = sycl::min(L, beg + per);
                 for (int i = t; i < NMT * 8 * HD; i += NMT * 32) {
                     const int r = i / HD, d = i % HD;
@@ -81,9 +96,7 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
                 sycl::group_barrier(it.get_group());
                 bf16* pslm = &scratch[sgi * (8 * 16 + 16 * 16)];
                 bf16* stage = pslm + 8 * 16;
-                float m[8], l[8];
-#pragma unroll
-                for (int i = 0; i < 8; ++i) { m[i] = -INFINITY; l[i] = 0.f; }
+                float ml_m = -INFINITY, ml_l = 0.f;  // running max / sum of row `lane` (lanes 0-7), one register each
                 jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> o[NT];
 #pragma unroll
                 for (int n = 0; n < NT; ++n) jm::joint_matrix_fill(sg, o[n], 0.f);
@@ -96,7 +109,7 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
                     // S = Q K^T over the head dim
                     jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> s;
                     jm::joint_matrix_fill(sg, s, 0.f);
-#pragma unroll 4
+#pragma unroll 2
                     for (int dc = 0; dc < HD / 16; ++dc) {
                         jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a;
                         jm::joint_matrix_load(sg, a, lp(&qs[(mt * 8) * HD + dc * 16]), HD);
@@ -115,20 +128,22 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
                     // online softmax per row (element i = row i, lane = token)
                     float sv[8];
                     {
-                        int i = 0;
-                        jm::joint_matrix_apply(sg, s, [&](float& x) { sv[i++] = x; });
+                        auto w = sycl::ext::oneapi::detail::get_wi_data(sg, s);  // 8 elements: rows 0-7
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) sv[i] = w[i];
                     }
-                    float alpha[8], p[8];
+                    float alpha[8];
+                    float* p = sv;  // scores become probabilities in place
 #pragma unroll
                     for (int i = 0; i < 8; ++i) {
                         const float v = live ? sv[i] * SCALE : -INFINITY;
                         const float mx = sycl::reduce_over_group(sg, v, sycl::maximum<float>());
-                        const float mn = sycl::fmax(m[i], mx);
-                        alpha[i] = m[i] == -INFINITY ? 0.f : sycl::exp(m[i] - mn);
+                        const float mi = sycl::group_broadcast(sg, ml_m, i), li = sycl::group_broadcast(sg, ml_l, i);
+                        const float mn = sycl::fmax(mi, mx);
+                        alpha[i] = mi == -INFINITY ? 0.f : sycl::exp(mi - mn);
                         p[i] = v == -INFINITY ? 0.f : sycl::exp(v - mn);
                         const float rs = sycl::reduce_over_group(sg, p[i], sycl::plus<float>());
-                        l[i] = l[i] * alpha[i] + rs;
-                        m[i] = mn;
+                        if (lane == i) { ml_m = mn; ml_l = li * alpha[i] + rs; }
                     }
                     // P (lane = token, element i = row i) -> SLM [8][16] -> A fragment
 #pragma unroll
@@ -139,8 +154,9 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
 #pragma unroll
                     for (int n = 0; n < NT; ++n) {
                         {
-                            int i = 0;
-                            jm::joint_matrix_apply(sg, o[n], [&](float& x) { x *= alpha[i++]; });
+                            auto w = sycl::ext::oneapi::detail::get_wi_data(sg, o[n]);
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) w[i] = float(w[i]) * alpha[i];
                         }
                         jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::row_major> vb;
                         const bf16* vp = vbase + int64_t(tb) * HD + dh * HALF + n * 16;
@@ -164,12 +180,8 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
                     jm::joint_matrix_store(sg, o[n], gp(part + (unit * NMT * 8 + mt * 8) * HD + dh * HALF + n * 16), HD,
                                            jm::layout::row_major);
                 if (dh == 0 && lane < 8) {
-                    float mi = 0.f, li = 0.f;
-#pragma unroll
-                    for (int i = 0; i < 8; ++i)
-                        if (i == lane) { mi = m[i]; li = l[i]; }
-                    ml[((unit * NMT * 8) + mt * 8 + lane) * 2] = mi;
-                    ml[((unit * NMT * 8) + mt * 8 + lane) * 2 + 1] = li;
+                    ml[((unit * NMT * 8) + mt * 8 + lane) * 2] = ml_m;
+                    ml[((unit * NMT * 8) + mt * 8 + lane) * 2 + 1] = ml_l;
                 }
             });
     });
@@ -217,17 +229,23 @@ torch::Tensor attn_dpas(torch::Tensor q, torch::Tensor key, torch::Tensor value,
             const int d = it.get_local_id(0), item = it.get_group(0);
             const int h = item / S, s = item % S, kh = h / groups, r = (h % groups) * S + s;
             const int64_t base = int64_t(kh) * chunks;
+            const int64_t raw = lens[0];
+            const int L = raw < 0 ? 0 : (raw > cap ? cap : int(raw));
+            int per, active;
+            chunking(L, chunks, per, active);
+            // every active chunk holds at least one cached token, so its m is finite: no branches, and the
+            // unrolled loops keep several chunks' loads in flight
             float M = -INFINITY;
-            for (int c = 0; c < chunks; ++c) M = sycl::fmax(M, pm[((base + c) * nmt * 8 + r) * 2]);
+#pragma unroll 8
+            for (int c = 0; c < active; ++c) M = sycl::fmax(M, pm[((base + c) * nmt * 8 + r) * 2]);
             float acc = 0.f, sum = 0.f;
-            if (M != -INFINITY)
-                for (int c = 0; c < chunks; ++c) {
-                    const float mc = pm[((base + c) * nmt * 8 + r) * 2];
-                    if (mc == -INFINITY) continue;
-                    const float w = sycl::exp(mc - M);
-                    sum += pm[((base + c) * nmt * 8 + r) * 2 + 1] * w;
-                    acc += pp[((base + c) * nmt * 8 + r) * HD + d] * w;
-                }
+#pragma unroll 8
+            for (int c = 0; c < active; ++c) {
+                const int64_t u = (base + c) * nmt * 8 + r;
+                const float w = sycl::exp(pm[u * 2] - M);
+                sum += pm[u * 2 + 1] * w;
+                acc += pp[u * HD + d] * w;
+            }
             if (masks != nullptr) {  // tree rows this row admits: scores in FP32 over the head dim
                 const float qd = Q.at(0, h, s, d);
                 for (int tr = 0; tr < S; ++tr) {

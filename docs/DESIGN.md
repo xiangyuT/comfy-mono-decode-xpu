@@ -23,7 +23,7 @@ keeping every output bit unchanged.
 | `csrc/mono_layer.sycl` | `layer_pre` (norm + quantize + input projections) and `layer_post` (sigmoid gate, out proj, residual, post norm, MLP, residual). |
 | `csrc/mono_mlp.sycl` | `mono_mlp`: one-launch MLP block, used outside the layer path. |
 | `csrc/attn_port.sycl` | `attn_core`: Kitchen `decode_gqa` + combine + `tree_merge` in one launch, for the tree verify rows and the single draft row. |
-| `csrc/attn_dpas.sycl` | `attn_dpas`: tree-verify attention with DPAS, split by the actual context length, then a merge with the tree rows. Not bit-identical to Kitchen. |
+| `csrc/attn_dpas.sycl` | `attn_dpas`: decode attention (tree verify rows and the draft row) with DPAS, split by the actual context length, then a merge with the tree rows. Not bit-identical to Kitchen. |
 | `csrc/rope_kv.sycl` | Q/K RMSNorm, partial split-half RoPE, pass-through lanes and K/V cache write; also the normalization-free RoPE entry. |
 | `csrc/fast_topk.sycl` | Single-row top-k (k ≤ 8) / argmax / both, in torch XPU tie order. |
 | `csrc/w4a8_decode.sycl`, `csrc/act_prep.sycl` | Fused small-M W4A8 linear (SLM codebook, DPAS at M=8) and ConvRot rotate + INT8 quantize. |
@@ -44,22 +44,27 @@ keeping every output bit unchanged.
 - A layer is a sequence of phases separated by device-wide barriers inside one launch.
 - The GDN layer's single fused kernel spilled 1–3 KB per thread at 128 GRF. It is split into a
   core-only kernel (0 spill) plus `layer_post`, which made it faster.
-- Tree-verify attention (`attn_dpas`, default; `MONO_DECODE_XPU_ATTN_DPAS=0` for `attn_core`):
-  - A work-group handles one (kv head, context chunk); the chunk length comes from the actual
-    length on the device (about 32–48 chunks), not from the capacity. A sub-group handles 8 query
-    rows and half of the head dim.
+- Decode attention (`attn_dpas`, default for the tree verify rows and the draft row;
+  `MONO_DECODE_XPU_ATTN_DPAS=0` for `attn_core`):
+  - A work-group handles one (kv head, context chunk). Chunks follow the actual length on the device
+    (at most 48, at least 32 tokens each; work-groups past the last chunk exit). A sub-group handles 8
+    query rows and half of the head dim.
   - Per 16-token tile: S = Q K^T as 16 DPAS (K^T a column-major load of the K rows), online softmax
     per row inside the sub-group, O += P V as 8 DPAS (V a row-major block load). On Xe2 an
     accumulator, an A and a B fragment all hold lane = column, element i = row i, so the scores are
     already laid out as the P operand; P goes through a 256 B SLM tile because elementwise writes
     into BF16 A/B fragments hang the device with this compiler.
-  - A second kernel merges the chunks' (m, l, O) in FP32 with the tree rows each row admits.
+  - Registers decide the speed: the running max and sum sit one row per lane and fragments are read
+    through unrolled `wi_data` loops, keeping the default 128 GRF. The 256 GRF mode removes the
+    remaining spills but halves occupancy and is slower.
+  - A second kernel merges the active chunks' (m, l, O) in FP32 with the tree rows each row admits.
   - Accuracy: P is rounded to BF16 for P V; against an fp64 reference its error matches or is below
     the Kitchen kernel's own error on the same inputs (max about 7.8e-3, one BF16 output rounding).
-  - Verify call at cap 11400: L1000 61 us, L6000 134 us, L9000 176 us (`attn_core` 91 / 315 /
-    466 us, Kitchen 273 / 651 / 889 us). About a third of the time is the column-major K^T load;
-    S^T = K Q^T with Q^T from SLM was 2.4x slower.
-- `attn_core` (draft row, and tree rows with `MONO_DECODE_XPU_ATTN_DPAS=0`) keeps Kitchen's split-K structure (up to 32 splits of the cache capacity, 64-key
+  - Device time at cap 11400, L 1000 / 4000 / 8000: verify (8 rows) 45 / 82 / 134 us, draft row
+    27 / 50 / 90 us (`attn_core` verify 91 / about 250 / about 420 us; Kitchen verify 273 / about
+    480 / about 800 us). Not helpful: cooperative K / V staging in SLM per tile (the staging stores
+    cost more than the shared loads saved), S^T = K Q^T with Q^T from SLM.
+- `attn_core` (with `MONO_DECODE_XPU_ATTN_DPAS=0`) keeps Kitchen's split-K structure (up to 32 splits of the cache capacity, 64-key
   tiles, per-split online softmax, then combine and tree merge), which fixes every row's rounding.
   Two scheduling choices change only which work-group runs what:
   - Tasks are numbered with the split slowest, so the live splits (those below the current length)
@@ -72,7 +77,7 @@ keeping every output bit unchanged.
 ### MTP draft
 
 - The draft block holds BF16 weights. Its GEMMs stay on oneDNN and run at about 96% of DRAM bandwidth.
-- Its attention goes through `rope_kv` + the bit-identical `attn_core` (faster than `attn_dpas` for one row).
+- Its attention goes through `rope_kv` + `attn_dpas`.
 - The logits pick uses `fast_pick`: one pass gives the argmax plus a top-8 list, and the
   following `topk(k ≤ 8)` reuses the list.
 - Under DynamicVRAM the head's BF16 linears keep, for the generate, the tensor comfy hands to

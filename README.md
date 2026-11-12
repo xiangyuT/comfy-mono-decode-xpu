@@ -5,10 +5,10 @@ Decode kernels for ComfyUI prompt enhance (`TextGenerate` / `TextGenerateV2` wit
 
 The hooks sit at the model's decode step, so official workflows and templates speed up without new
 nodes. Numerical checks compare each kernel with the operator chain it replaces, using identical
-inputs, weights, dtype and layout. The one exception is the tree-verify attention, which uses DPAS and
-a split by the actual context length instead of Kitchen's structure: it is checked against an fp64
-reference, with Kitchen's own error on the same inputs as the bound (`MONO_DECODE_XPU_ATTN_DPAS=0`
-restores the bit-identical port). The v0.43 fixed-tree results below preserved the generated token
+inputs, weights, dtype and layout. The one exception is the decode attention (tree-verify rows and the MTP
+draft row), which uses DPAS and a split by the actual context length instead of Kitchen's structure:
+it is checked against an fp64 reference, with Kitchen's own error on the same inputs as the bound
+(`MONO_DECODE_XPU_ATTN_DPAS=0` restores the bit-identical port). The v0.43 fixed-tree results below preserved the generated token
 IDs. Workflow qualification checks the generated prompt and final image; it does not require
 whole-generation token identity across different layouts or backend dispatch.
 
@@ -286,7 +286,7 @@ MTP head. Per verify layer:
   the out projection, residual, post norm, MLP and residual.
 - **Full-attention layers (8):** `layer_pre`, then fused Q/K norm + partial RoPE + KV write, then
   `attn_dpas` (DPAS tree attention split along the context, then a merge), then `layer_post`.
-- **MTP draft:** the BF16 draft block's attention uses `rope_kv` and the bit-identical `attn_core`. Top-k and
+- **MTP draft:** the BF16 draft block's attention uses `rope_kv` and `attn_dpas`. Top-k and
   argmax over the 248k-vocab logits run in one launch with torch's exact tie order.
 
 The persistent kernels stream W4 weights through a GEMV engine with device-wide grid barriers. The

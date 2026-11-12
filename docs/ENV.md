@@ -24,7 +24,7 @@ These all default to `1`. Set `0` to fall back to the stock code for that part o
 | `MONO_DECODE_XPU_GDN1` | Whole Gated-DeltaNet block in persistent launches. `0` runs `layer_pre` + Kitchen GDN calls + `layer_post`. |
 | `MONO_DECODE_XPU_GDN_SPLIT` | GDN core-only kernel plus `layer_post`. `0` runs one fused launch, which spills registers and is slower. |
 | `MONO_DECODE_XPU_ATTN` | One-launch tree / draft attention port for `FixedKVCache.attend`. |
-| `MONO_DECODE_XPU_ATTN_DPAS` | Tree-verify attention with DPAS and a context split (`attn_dpas`). Not bit-identical to Kitchen (fp64-checked; see DESIGN); `0` uses the bit-identical port for tree rows too. |
+| `MONO_DECODE_XPU_ATTN_DPAS` | Decode attention (tree verify rows and the draft row) with DPAS and a context split (`attn_dpas`). Not bit-identical to Kitchen (fp64-checked; see DESIGN); `0` uses the bit-identical port. |
 | `MONO_DECODE_XPU_ROPE` | `rope_kv` (fused partial RoPE + KV write), with the MTP draft attention through the same path. |
 | `MONO_DECODE_XPU_NORM_CACHE` | Cache `RMSNorm(add=True)` weight + 1 instead of computing it every call. |
 | `MONO_DECODE_XPU_LOGITS` | Exact single-launch top-k / argmax on draft and first-token logits. |
