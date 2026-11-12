@@ -40,7 +40,9 @@ def test_mono_mlp_matches_chain(C):
         out_t = C.mono_mlp(xn, H, lut, *[t for w in tiled for t in w], 0, 4, True)
         assert bits_equal(out_t, ref), ("tile-major", M)
 
-    cores = torch.xpu.get_device_properties(xn.device).gpu_subslice_count
-    for workers, message in ((-1, "Xe cores"), (cores + 1, "Xe cores"), (1, "SLM requirement")):
-        with pytest.raises(RuntimeError, match=message):
-            C.mono_mlp(xn, H, lut, *args, workers, 4, False)
+    props = torch.xpu.get_device_properties(xn.device)
+    for workers in (-1, props.gpu_subslice_count + 1):
+        assert bits_equal(C.mono_mlp(xn, H, lut, *args, workers, 4, False), ref)
+    capacity_error = "SLM requirement" if props.device_id == 0xE20B else "tiles per work-group"
+    with pytest.raises(RuntimeError, match=capacity_error):
+        C.mono_mlp(xn, H, lut, *args, 1, 4, False)

@@ -196,10 +196,10 @@ v0.43 environment and measurement identities.
 
 B580 functional checks use llm-scaler source
 [`99daa2f`](https://github.com/intel/llm-scaler/commit/99daa2fec7e7726168816c23c8210d0cc0c184e7)
-with ComfyUI v0.45, Kitchen/provider 0.2.41 and this node installed. Persistent stream kernels size
-their accumulators from the runtime Xe-core count and tile ranges; explicit worker requests that
-exceed the device's cores or local-memory capacity raise before launch.
-This launch-planning update was tested on B580; the B70 results retain their original source revisions.
+with ComfyUI v0.45, Kitchen/provider 0.2.41 and this node installed. All devices share the original
+worker selection, override clamping and stream partitioning. Only physical B580 (`0xE20B`) may grow
+the accumulator beyond its original 64-tile reservation when the tile range requires it; other
+devices keep that fixed reservation. The B70 results retain their original source revisions.
 
 The kernels reproduce the OmniXPU / Kitchen XPU kernels bit for bit; that is the stack the
 "identical tokens" claim refers to. Without OmniXPU (plain upstream ComfyUI + comfy-kitchen), the

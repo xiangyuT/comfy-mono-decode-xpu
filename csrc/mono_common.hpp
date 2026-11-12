@@ -76,6 +76,7 @@ inline float hw_rsqrt(float x) {
 using LPtrU16 = sycl::multi_ptr<uint16_t, sycl::access::address_space::local_space, sycl::access::decorated::no>;
 using LPtrF = sycl::multi_ptr<float, sycl::access::address_space::local_space, sycl::access::decorated::no>;
 constexpr int TAB = 128 * 256;
+constexpr int ACC = 64 * 128;
 static_assert(MWG == 1024, "pair table build assumes 1024 threads");
 
 // exact pair table for one codebook: entry (s << 8 | byte) holds the INT8-grid values of the low and
