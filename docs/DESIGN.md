@@ -61,8 +61,8 @@ keeping every output bit unchanged.
   - Accuracy: P is rounded to BF16 for P V; against an fp64 reference its error matches or is below
     the Kitchen kernel's own error on the same inputs (max about 7.8e-3, one BF16 output rounding).
   - Device time at cap 11400, L 1000 / 4000 / 8000: verify (8 rows) 45 / 82 / 134 us, draft row
-    27 / 50 / 90 us (`attn_core` verify 91 / about 250 / about 420 us; Kitchen verify 273 / about
-    480 / about 800 us). Not helpful: cooperative K / V staging in SLM per tile (the staging stores
+    27 / 50 / 90 us (`attn_core` verify 91 / 230 / 448 us, draft 35 / 59 / 113 us; Kitchen verify
+    273 / 484 / 843 us). Not helpful: cooperative K / V staging in SLM per tile (the staging stores
     cost more than the shared loads saved), S^T = K Q^T with Q^T from SLM.
 - `attn_core` (with `MONO_DECODE_XPU_ATTN_DPAS=0`) keeps Kitchen's split-K structure (up to 32 splits of the cache capacity, 64-key
   tiles, per-split online softmax, then combine and tree merge), which fixes every row's rounding.
