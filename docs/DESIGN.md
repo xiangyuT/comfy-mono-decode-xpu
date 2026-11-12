@@ -44,6 +44,26 @@ keeping every output bit unchanged.
 - A layer is a sequence of phases separated by device-wide barriers inside one launch.
 - The GDN layer's single fused kernel spilled 1–3 KB per thread at 128 GRF. It is split into a
   core-only kernel (0 spill) plus `layer_post`, which made it faster.
+- `layer_gdn` (the core kernel, P1–P5) keeps every operation of the replaced chain in order; what
+  changed is who runs it and when its inputs are requested. Its serial phases are latency-bound:
+  - P1: the a / b BF16 linear (64 DPAS units in oneDNN order) runs on idle work-groups as soon as the
+    R normed rows are published through an atomic counter, in the shadow of rot_quant. The Hadamard
+    matrix and the a / b weights are requested into L2 at launch: the previous launch's weight
+    stream evicts them, and each of rot_quant's 16 load-mad steps then waited on DRAM.
+  - P3: the causal conv runs one (channel, pair of tree slots) per thread over all work-groups, with
+    ctl in SLM; 8 slots per thread were ALU-bound (exp and IEEE division per slot).
+  - P5: every entry's k, q, v and gates are staged in SLM up front; the row-group partials are
+    double-buffered, so each entry needs one barrier; a non-committing entry recomputes its decayed /
+    updated rows into temporaries instead of snapshotting the state; the gated norm of all output
+    rows runs once after the recurrence. The recurrent state, conv state and the previous step's
+    buffers are requested into L2 when the work-group's qkv / z GEMV share is done.
+  - Measured during a real generate (per call, B70): 132 -> 119 us (P1 10.6 -> 8, P3 10.8 -> 5,
+    P5 30 -> 27); about 0.3 ms per step in the verify segment.
+  - A prefetch is not free: the issuing thread's next device-scope fence (every grid barrier) waits
+    for it. Issued halfway through the qkv / z GEMV (a callback in the weight loop), the cold-data
+    prefetch made the launch 20 us slower.
+  - Small changes to one phase move others by a few us (one register allocation and schedule for the
+    whole kernel); compare builds without instrumentation.
 - Decode attention (`attn_dpas`, default for the tree verify rows and the draft row;
   `MONO_DECODE_XPU_ATTN_DPAS=0` for `attn_core`):
   - A work-group handles one (kv head, context chunk). Chunks follow the actual length on the device
@@ -177,6 +197,9 @@ inputs (`tests/`). What it took:
   32-row attention packs (slower at short contexts); skipping `layer_post`'s pair-table rebuilds (no
   change); L2 prefetch of the next GEMV phase by idle work-groups in `layer_post` (64–512 KB; the
   extra code changed register allocation and slowed gate/up more than it saved).
+- Tried without gain in `layer_gdn` (2026-11-12): a callback in the qkv / z GEMV loop that requests P3 /
+  P5 inputs halfway through (P1, P2 and P3 all slower); issuing the recurrent state loads after the
+  prologue's loads (P5 faster, P2 slower by the same amount).
 
 - **2026-11-12: Q/K norm fusion implemented.** The D256 gated Q route preserves the installed
   Torch vec4/two-SIMD32 reduction; dense K preserves Omni's eight BS32-block reduction. The BF16
