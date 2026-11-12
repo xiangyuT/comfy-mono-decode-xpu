@@ -513,7 +513,10 @@ def install():
                 plan = _args(self, sp, x, es)
                 if plan is not None:
                     if plan["tiled"]:
-                        tiles.set_plan(self, _owned(plan))
+                        try:  # an optimization only: without it, later calls prepare their arguments again
+                            tiles.set_plan(self, _owned(plan))
+                        except (torch.OutOfMemoryError, RuntimeError):
+                            pass
                     return _run(self, plan, x, S, gdn, attention_mask, freqs_cis, optimized_attention,
                                 past_key_value, state)
         except SubpathError:

@@ -11,7 +11,6 @@ Resident weights (no cast), quantized weights and weight/bias functions keep com
 """
 from __future__ import annotations
 
-import logging
 import os
 import threading
 
@@ -54,11 +53,7 @@ def install():
         return False
 
     def make_forward(m, comfy_forward):
-        def forward(x):
-            if guard.off("draft") or not tiles.session_active() or getattr(m, "weight_function", None) \
-                    or getattr(m, "bias_function", None):
-                return comfy_forward(x)
-            owned = tiles.cached(("draft", id(m)), lambda: {})
+        def owned_linear(x, owned):
             w = owned.get("w")
             if w is not None and w.device == x.device and w.dtype == x.dtype:
                 if not owned.get("checked"):  # first reuse in this generate: same bits as comfy's forward
@@ -86,6 +81,18 @@ def install():
                     with _lock:
                         _stats["copied_bytes"] += weight.numel() * weight.element_size()
             return out
+
+        def forward(x, *args, **kwargs):
+            if (args or kwargs or guard.off("draft") or not tiles.session_active() or not isinstance(x, torch.Tensor)
+                    or getattr(m, "weight_function", None) or getattr(m, "bias_function", None)):
+                return comfy_forward(x, *args, **kwargs)
+            owned = tiles.cached(("draft", id(m)), lambda: {})
+            try:
+                return owned_linear(x, owned)
+            except Exception as e:  # a pure function of x and the weights: comfy's forward recomputes it
+                guard.failed("draft", e)
+                owned.clear()
+                return comfy_forward(x)
         return forward
 
     def _generate_mtp(self, embeds, *args, **kwargs):
@@ -121,5 +128,4 @@ def install():
     setattr(_generate_mtp, CLAIM, True)
     _generate_mtp.__wrapped__ = original_gen
     q35.Qwen35._generate_mtp = _generate_mtp
-    logging.debug("[mono_decode_xpu] draft head owned-weight path installed")
     return True

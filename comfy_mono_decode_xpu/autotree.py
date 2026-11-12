@@ -11,11 +11,11 @@ forward to the next step's first draft (verify, lm_head, sampling and accept). E
 when best_widths runs, right after the step's own host sync, so reading them never waits.
 Fixed MTP modes never call best_widths and are unaffected.
 
-With the tree timed on the device, the sampling filters no longer need to stop the host: under
-_MaskedAssign, processed_probs' `t[mask] = scalar` runs as `t.masked_fill_(mask, scalar)` (the same
-values without the nonzero() that waits for the device), so the verify step's sampling queues
-behind its lm_head. Installed together with the timing, never alone: upstream's host clocks rely
-on that wait.
+With the tree timed on the device (auto) or not timed at all (fixed modes), the sampling filters
+no longer need to stop the host: inside such an MTP generate, processed_probs' `t[mask] = scalar`
+runs as `t.masked_fill_(mask, scalar)` (the same values without the nonzero() that waits for the
+device), so the verify step's sampling queues behind its lm_head. Never applied elsewhere:
+upstream's host clocks rely on that wait.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from . import guard
 CLAIM = "__comfy_mono_decode_xpu_autotree__"
 _lock = threading.Lock()
 _stats = {"steps": 0, "updates": 0, "draft_ms": None, "verify_ms": None}
-_current = {"state": None}
+_current = {"state": None, "active": False}  # state: the timed auto generate's clock; active: inside an MTP generate we own
 
 
 def stats():
@@ -100,7 +100,9 @@ def _install_sampling(llama):
         return False
 
     def processed_probs(self, logits, *args, **kwargs):
-        if guard.off("autotree") or not isinstance(logits, torch.Tensor) or logits.device.type != "xpu":
+        # only inside an MTP generate whose tree is timed on the device (auto) or not timed at all (fixed)
+        if (not _current["active"] or guard.off("autotree") or not isinstance(logits, torch.Tensor)
+                or logits.device.type != "xpu"):
             return original(self, logits, *args, **kwargs)
         with _MaskedAssign():
             return original(self, logits, *args, **kwargs)
@@ -135,8 +137,16 @@ def install():
 
     def _generate_mtp(self, embeds, *args, **kwargs):
         if guard.off("autotree") or getattr(embeds, "device", None) is None or embeds.device.type != "xpu" \
-                or _current["state"] is not None:
+                or _current["active"]:
             return original_gen(self, embeds, *args, **kwargs)
+        # _generate_mtp(embeds, max_length, stop_tokens, mtp, ...): mtp is True for auto, a mode name otherwise
+        mtp = kwargs["mtp"] if "mtp" in kwargs else (args[2] if len(args) > 2 else None)
+        if mtp is not True:  # fixed tree: nothing is timed, so the sampling wait is not needed either
+            _current["active"] = True
+            try:
+                return original_gen(self, embeds, *args, **kwargs)
+            finally:
+                _current["active"] = False
         clock = _Clock()
         model_forward, mtp_forward = self.model.forward, self.mtp.forward
 
@@ -151,11 +161,11 @@ def install():
 
         saved = [(m, vars(m).get("forward")) for m in (self.model, self.mtp)]  # outer wrappers, if any
         self.model.forward, self.mtp.forward = timed_model_forward, timed_mtp_forward
-        _current["state"] = clock
+        _current.update(state=clock, active=True)
         try:
             return original_gen(self, embeds, *args, **kwargs)
         finally:
-            _current["state"] = None
+            _current.update(state=None, active=False)
             for module, previous in saved:
                 if previous is None:
                     vars(module).pop("forward", None)

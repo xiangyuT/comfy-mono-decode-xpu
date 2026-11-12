@@ -43,6 +43,15 @@ keeping every output bit unchanged.
 - A layer is a sequence of phases separated by device-wide barriers inside one launch.
 - The GDN layer's single fused kernel spilled 1–3 KB per thread at 128 GRF. It is split into a
   core-only kernel (0 spill) plus `layer_post`, which made it faster.
+- `attn_core` keeps Kitchen's split-K structure (up to 32 splits of the cache capacity, 64-key
+  tiles, per-split online softmax, then combine and tree merge), which fixes every row's rounding.
+  Two scheduling choices change only which work-group runs what:
+  - Tasks are numbered with the split slowest, so the live splits (those below the current length)
+    are dealt to all work-groups. Numbering the split fastest with 32 splits and 32 work-groups gave
+    work-group w split w only, so a short prefix ran on two or three work-groups.
+  - Verify rows of one kv head (four Kitchen packs of four rows) share each staged K/V tile: every
+    key is scored for all 16 rows and each value read serves the work-item's four rows. The draft's
+    single row keeps one row per work-item.
 
 ### MTP draft
 
@@ -50,6 +59,17 @@ keeping every output bit unchanged.
 - Its attention goes through `rope_kv` + `attn_core`.
 - The logits pick uses `fast_pick`: one pass gives the argmax plus a top-8 list, and the
   following `topk(k ≤ 8)` reuses the list.
+- Under DynamicVRAM the head's BF16 linears keep, for the generate, the tensor comfy hands to
+  `F.linear` (a copy of the cast, about 0.5 GB, when free memory allows), so later drafts skip the
+  per-call cast. The first reuse per generate is compared bit for bit with comfy's forward.
+- ComfyUI's `auto` tree (`qwen35.best_widths`) scores width chains by accepted tokens per
+  millisecond. Off CUDA it times with host clocks: a draft counts only its launch time, and the
+  verify clock includes the drafts' remaining device work only because the sampling filters wait
+  for the device (`t[mask] = v` runs `nonzero()`). `autotree.py` keeps upstream's shapes, scoring
+  and smoothing and feeds it XPU event timings instead (first draft → verify forward, per draft;
+  verify forward → next step's first draft). With that, inside MTP generates the filters run as
+  `masked_fill_` (same values, no wait). Removing the wait while keeping host clocks made `auto`
+  settle on one draft per step and lowered throughput, so the two are installed together.
 
 ### DynamicVRAM
 
@@ -61,6 +81,10 @@ keeping every output bit unchanged.
   members or keep a group view after the forward. The tile-copy key remains the canonical module
   weight, independent of temporary VBAR addresses. Q/K/V and MLP outputs remain contiguous.
 - Module-level contract checks (layout, scale range, codebook) run once, on host-side metadata.
+- With tile-major copies a block's kernel arguments are all owned by the generate (tile copies,
+  FP32 metadata copies, norm weights; GDN BF16 operands borrowed from a cast are copied), so the
+  first call records the block's plan and later calls reuse it without recasting seven linears.
+  This took a verify step's host launch time from 12.3 to 2.2 ms (H3 Image).
 - Resident and DynamicVRAM copies have the same per-generate owner. They are keyed by the canonical
   module weight, so a new temporary VBAR cast address reuses the copy. Layout is chosen after
   prefill from actual weight storage and the live allocator/inference budget, including VBAR
@@ -113,7 +137,25 @@ inputs (`tests/`). What it took:
 - Fusing RoPE + KV write gave +4% resident and +8% DynamicVRAM, larger than its kernel-time share:
   removing about 15 launches per attention call also removed host-side gaps.
 
+## Measurements (B70, official H3 Image prompt enhance, auto MTP, sampling on, DynamicVRAM)
+
+- Decode: 98–101 tok/s on the public v0.1.0 code, about 115–117 tok/s with the attention scheduling,
+  plan reuse, device-timed `auto` and the draft head's kept weights. `auto` now settles on about 2.4–2.6
+  drafts and 2.8–2.9 accepted tokens per step.
+- Per step (about 24 ms) the 32 verify layers run back to back on the device (0.13 ms of gaps in
+  total); lm_head (1.7 ms per call) and the BF16 head GEMMs are at the read roof. The remaining
+  distance to the bytes floor (598 GB/s for weights and KV, no idle) is about 10 ms per step:
+  W4 GEMV phases at 70–80% of the roof (about 4 ms), long-context attention (about 2 ms, growing
+  with the context), host/sync idle between a step's sync and its first draft (about 2.5 ms) and
+  small kernels (0.65 ms). The bytes floor for this tree is about 14.6 ms per step, or about 195
+  tok/s at 2.85 tokens per step.
+
 ## Not done / ideas
+
+- Tried without gain (2026-11-12): attention register prefetch of the next tile (exact, 12% slower);
+  32-row attention packs (slower at short contexts); skipping `layer_post`'s pair-table rebuilds (no
+  change); L2 prefetch of the next GEMV phase by idle work-groups in `layer_post` (64–512 KB; the
+  extra code changed register allocation and slowed gate/up more than it saved).
 
 - **2026-11-12: Q/K norm fusion implemented.** The D256 gated Q route preserves the installed
   Torch vec4/two-SIMD32 reduction; dense K preserves Omni's eight BS32-block reduction. The BF16
