@@ -178,6 +178,20 @@ inputs (`tests/`). What it took:
 - Fusing RoPE + KV write gave +4% resident and +8% DynamicVRAM, larger than its kernel-time share:
   removing about 15 launches per attention call also removed host-side gaps.
 
+### Host path after a step's sync
+
+- Each step has one host sync (the accepted tokens). The draft that follows starts on an idle device,
+  so its host time is device idle. Measured without a profiler (B70): sync -> first draft's embedding
+  0.36 ms, embedding 0.35 ms, MTP head 0.84 ms, draft lm_head call 0.32 ms; a launch itself costs
+  about 5 us, the rest is Python and module code. The blocking wait returns about 20 us after the copy.
+  Torch profiles with CPU activity inflate these host-bound gaps (1-1.5 ms) and misplace them.
+- `graph_draft.py` replays the MTP head (`MTPHead.forward`) as an XPU graph: everything it reads is
+  device-side at fixed addresses within a generate (upstream's static carriers, the MTP KV cache with
+  device position / seqlen written by `prepare` outside the graph, owned BF16 linears, resident norm
+  weights). Captured after 4 eager drafts, once per generate; 5935 replays matched the eager head bit
+  for bit (`MONO_DECODE_XPU_GRAPH_DRAFT_CHECK=1`). MTP head host time 0.82 -> 0.09 ms; about 0.5 ms per
+  step at the same tree.
+
 ## Measurements (B70, official H3 Image prompt enhance, auto MTP, sampling on, DynamicVRAM)
 
 - Decode: 98–101 tok/s on the public v0.1.0 code, about 115–117 tok/s with the attention scheduling,

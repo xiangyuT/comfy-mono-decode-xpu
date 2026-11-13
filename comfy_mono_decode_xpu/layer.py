@@ -488,6 +488,9 @@ def install():
     if os.environ.get("MONO_DECODE_XPU_DRAFT", "1") == "1":
         from . import draft
         draft.install()
+        if os.environ.get("MONO_DECODE_XPU_GRAPH_DRAFT", "1") == "1":  # needs the owned draft weights
+            from . import graph_draft
+            graph_draft.install()
     from comfy.text_encoders.llama import SPEC_ROWS
     from . import _C
 
