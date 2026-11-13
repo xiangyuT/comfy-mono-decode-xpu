@@ -191,6 +191,23 @@ inputs (`tests/`). What it took:
   weights). Captured after 4 eager drafts, once per generate; 5935 replays matched the eager head bit
   for bit (`MONO_DECODE_XPU_GRAPH_DRAFT_CHECK=1`). MTP head host time 0.82 -> 0.09 ms; about 0.5 ms per
   step at the same tree.
+- `mtp_loop.py` (user decision 2026-11-13: the MTP loop's control may move to the device) replaces the
+  body of `_generate_mtp` for the supported shape. Upstream's host state per step and its replacement
+  (csrc/mtp_loop.sycl): attention position / seqlen from the host index and the commit_path slot loop,
+  the deferred-delta ctl row built on the host (pending, parity, accepted slots, tree program), the MTP
+  KV counters, the accept walk, nt_buf / h_buf and pos -> `mtp_prep_draft`, `mtp_prep_verify`,
+  `mtp_accept` on a device state `st` = [committed length, MTP KV length]; the caches' prepare /
+  advance are no-ops for the generate. Drafts, the verify forward, lm_head and sampling are upstream's
+  calls (sampling has no sync with autotree's masked assign). The host queues step n + 1, then reads
+  step n's record (committed tokens, auto-tree ranks) from a pinned ring and does the ids, stop,
+  progress and auto-tree statistics (best_widths on device timings of finished steps); one step is
+  queued past a stop token or max_length and dropped, so the caches get one more step of capacity.
+  Validation: the shadow mode compared every step with upstream's host walk and ctl (1704 auto,
+  2198 fixed tree4s1m8, 1992 greedy steps, 0 mismatches); tests/test_mtp_accept.py checks the walk,
+  counters, ctl and KV slot moves on random trees. Measured (B70, H3 PE, 4 seeds): tail segment 3.45
+  -> 2.17 ms (lm_head + sampling only), 134-139 vs 129-135 tok/s; about 20.9 vs 22.5 ms per step at
+  2.4 drafts per step. The draft head graph gives nothing inside this loop (host time already hidden),
+  so it stays eager there. Torch profiles do not show kernels replayed from XPU graphs.
 
 ## Measurements (B70, official H3 Image prompt enhance, auto MTP, sampling on, DynamicVRAM)
 

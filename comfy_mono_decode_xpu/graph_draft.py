@@ -78,7 +78,8 @@ def install():
     def forward(self, embeds, hidden, freqs_cis, past_key_value):
         call = lambda: original(self, embeds, hidden, freqs_cis, past_key_value)
         kv = past_key_value
-        if (guard.off("graph_draft") or not tiles.session_active() or torch.is_grad_enabled()
+        from . import mtp_loop
+        if (guard.off("graph_draft") or not tiles.session_active() or torch.is_grad_enabled() or mtp_loop.in_async_loop()
                 or not all(isinstance(t, torch.Tensor) and t.device.type == "xpu" for t in (embeds, hidden, freqs_cis))
                 or embeds.dim() != 3 or embeds.shape[:2] != (1, 1) or hidden.shape != embeds.shape
                 or embeds.dtype != torch.bfloat16 or type(kv) is not llama.FixedKVCache
