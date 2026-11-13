@@ -5,8 +5,11 @@ Decode kernels for ComfyUI prompt enhance (`TextGenerate` / `TextGenerateV2` wit
 
 The hooks sit at the model's decode step, so official workflows and templates speed up without new
 nodes. Numerical checks compare each kernel with the operator chain it replaces, using identical
-inputs, weights, dtype and layout. The v0.43 fixed-tree results below preserved the generated token
-IDs. Workflow qualification checks the generated prompt and final image; it does not require
+inputs, weights, dtype and layout. The one exception is the decode attention (tree-verify rows and the MTP
+draft row), which uses DPAS and a split by the actual context length instead of Kitchen's structure:
+it is checked against an fp64 reference, with Kitchen's own error on the same inputs as the bound
+(`MONO_DECODE_XPU_ATTN_DPAS=0` restores the bit-identical port). The v0.43 fixed-tree results (Results, Legacy) preserved the
+generated token IDs. Workflow qualification checks the generated prompt and final image; it does not require
 whole-generation token identity across different layouts or backend dispatch.
 
 ComfyUI v0.45's `CombinedLinear` is supported: hooks borrow per-projection views of the current
@@ -24,14 +27,60 @@ Validated on Arc Pro B70:
 
 | official template | ComfyUI | validation |
 |---|---|---|
-| MOSS Image (`image_moss_image_t2i`) | v0.43 | performance and output, see Results |
-| MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | functional: the default workflow completes in DynamicVRAM, prefetch and ordinary-memory modes |
+| MOSS Image (`image_moss_image_t2i`) | v0.45 (and v0.43) | performance and output, see Results |
+| MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | functional: the default workflow completes in DynamicVRAM, prefetch and ordinary-memory modes; prompt-enhance decode about 133–142 tok/s (sampling, auto MTP; `MONO_DECODE_XPU=0`: 24–28 tok/s), see Results |
 
 ## Results
 
-All numbers are from one Arc Pro B70 in the llm-scaler-omni 0.2.0-b3 ComfyUI image (see Requirements).
+All numbers are from one Arc Pro B70. The current results (ComfyUI v0.45, 2026-11-13) use the
+environment in Requirements with ComfyUI-OmniXPU from intel/llm-scaler main `066f0db`. The Legacy
+results keep their original v0.43 environment (the llm-scaler-omni 0.2.0-b3 ComfyUI image).
 
-### Current MOSS-Image C/D comparison (2026-11-12)
+### MOSS-Image (ComfyUI v0.45, 2026-11-13)
+
+Workflow: the official `image_moss_image_t2i` template (identical in v0.43 and v0.45), replayed from the
+frontend's saved Run request with the KSampler seed fixed to 42: 1024x1024, 25 steps, CFG 2.5,
+er_sde/simple, DynamicVRAM, prompt enhance with the template defaults (`auto` MTP, sampling on).
+Each configuration runs on a fresh server: one cold run (text seed 0), three warmups (101/102/103) and
+three measured runs (text seeds 1/2/3). Every run executes prompt enhance, conditioning, sampling and
+VAE again. Means over the measured runs:
+
+| | C `MONO_DECODE_XPU=0` | D default | D + `MONO_DECODE_XPU_DRAFT_INT4=1` |
+|---|---:|---:|---:|
+| end to end | 35.06 s | 24.35 s (**-30.5%**) | 24.30 s (-30.7%) |
+| end to end, cold run | 45.67 s | 32.98 s | 32.67 s |
+| prompt enhance | 14.94 s | 4.23 s (-71.7%) | 4.12 s (-72.4%) |
+| prompt-enhance decode | 23.4 tok/s | 121.9 tok/s (**5.2x**) | 127.3 tok/s (5.4x) |
+| everything else (encode, sampling, VAE) | 20.1 s | 20.1 s | 20.2 s |
+| enhanced prompt tokens (seeds 1/2/3) | 314 / 355 / 279 | 297 / 365 / 355 | 297 / 365 / 355 |
+
+All 21 runs completed and saved an image (the measured ones checked by eye). With the experimental two-stage draft lm_head, the three
+measured prompts are the same token sequences as D's (same sha), only faster. C and D write
+different, equally valid prompts: under `auto` the tree follows each configuration's speed, and the
+decode attention is no longer bit-identical to Kitchen (see the top of this page).
+
+![MOSS-Image, text seed 1: C / D / D + DRAFT_INT4](docs/demo/moss-045-seed1.jpg)
+
+### MiniMax H3 Image prompt enhance (ComfyUI v0.45, 2026-11-13)
+
+The official H3 Image default workflow (`thinking` on, sampling on, `auto` MTP, up to 8192 tokens),
+prompt enhance alone, decode tok/s over text seeds 0-3 (0-1 for `MONO_DECODE_XPU=0`); the default and
+`DRAFT_INT4` ranges cover two and three such runs:
+
+| `MONO_DECODE_XPU=0` | previous release (`d42987e`) | default | + `MONO_DECODE_XPU_DRAFT_INT4=1` |
+|---:|---:|---:|---:|
+| 23.7-27.8 | 115.0-117.1 | 133.0-141.6 | 145.8-152.3 |
+
+H3 enhanced prompts run to several thousand tokens (thinking), so decode dominates prompt enhance.
+Between runs the per-step device time stays the same (verify about 11.6 ms, tail 2.2 ms, a draft
+about 2.8 ms, or 2.1 ms with `DRAFT_INT4`); tok/s follows the generated text through the tokens
+accepted and the drafts run per step.
+
+### Legacy
+
+<details><summary>ComfyUI v0.43 results (2026-11-11 / 2026-11-12): MOSS-Image C/D comparison, official showcase with images, upstream reference groups, TextGenerate decode alone</summary>
+
+### MOSS-Image C/D comparison (ComfyUI v0.43, 2026-11-12)
 
 Measured on the pre-release development source with the default-on stack (before the fused Q/K norm + RoPE kernel).
 C explicitly sets `MONO_DECODE_XPU=0`; D leaves it unset and exercises the default-on stack.
@@ -51,10 +100,10 @@ Auto timings include adaptive-tree and text-length differences and do not establ
 All 42 complete UI executions produced valid images; all 14 default-on generations ended with no live
 tile references or disabled paths. These are development source-overlay measurements.
 
-### Earlier official MOSS-Image showcase (2026-11-11)
+### Official MOSS-Image showcase (ComfyUI v0.43, 2026-11-11)
 
 The measurements below predate the failure-recovery and cache-lifetime fixes. They retain their
-original cold/warm sampling scheme and medians; the current comparison above uses paired means.
+original cold/warm sampling scheme and medians; the 2026-11-12 comparison above uses paired means.
 
 Workflow: the official `image_moss_image_t2i` template, unchanged except that the KSampler seed is
 fixed to **42** (the template randomizes it). Prompt enhance uses the template defaults: Qwen3.5-9B
@@ -142,7 +191,7 @@ like-for-like comparison.
 
 </details>
 
-### TextGenerate decode alone
+### TextGenerate decode alone (ComfyUI v0.43)
 
 Same image, `qwen3.5_9b_w4a8_gptq.safetensors`, three prompts (base / giant / adult), decode tok/s:
 
@@ -155,6 +204,8 @@ Same image, `qwen3.5_9b_w4a8_gptq.safetensors`, three prompts (base / giant / ad
 Note on `auto`: the adaptive tree reshapes itself from measured step times, so the accepted token
 paths depend on speed. Exactness is therefore verified on fixed trees: the token sha256 equals the
 stock image's for every prompt.
+
+</details>
 
 ## Requirements
 
@@ -190,7 +241,8 @@ The published image `intel/llm-scaler-omni:0.2.0-b2` is older and has not been t
 The v0.45 functional environment uses [llm-scaler PR #790](https://github.com/intel/llm-scaler/pull/790)
 at `3445059be0ba75424babe66620ea07c645673e52`, Kitchen provider
 `f27f58782c51b6ab314b4cc0f6e65c8a6bafa277` and AIMDO provider
-`3bc6afbcb92e10a2d4737e79d170190ed787bf89`. The performance tables above keep their original
+`3bc6afbcb92e10a2d4737e79d170190ed787bf89`; the 2026-11-13 results use ComfyUI-OmniXPU from
+intel/llm-scaler main `066f0db` (which includes intel/llm-scaler#790 and intel/llm-scaler#793). The Legacy tables keep their original
 v0.43 environment and measurement identities.
 
 The kernels reproduce the OmniXPU / Kitchen XPU kernels bit for bit; that is the stack the
@@ -282,9 +334,14 @@ MTP head. Per verify layer:
   projections, deferred conv, gates, delta rule and gated norm. A second launch, `layer_post`, covers
   the out projection, residual, post norm, MLP and residual.
 - **Full-attention layers (8):** `layer_pre`, then fused Q/K norm + partial RoPE + KV write, then
-  `attn_core` (one-launch tree attention), then `layer_post`.
-- **MTP draft:** the BF16 draft block's attention uses the same `rope_kv` / `attn_core`. Top-k and
+  `attn_dpas` (DPAS tree attention split along the context, then a merge), then `layer_post`.
+- **MTP draft:** the BF16 draft block's attention uses `rope_kv` and `attn_dpas`. Top-k and
   argmax over the 248k-vocab logits run in one launch with torch's exact tie order.
+- **MTP loop:** the per-step bookkeeping (accept walk, cache counters, KV slot moves, next token)
+  runs on the device and the host reads each step's tokens one step late, so steps follow each other
+  without a host sync. Experimental and off by default: `MONO_DECODE_XPU_DRAFT_INT4=1` scores a draft's
+  vocabulary with an int4 copy of the lm_head and recomputes the best candidates exactly in int8
+  (only drafts change; see [docs/ENV.md](docs/ENV.md)).
 
 The persistent kernels stream W4 weights through a GEMV engine with device-wide grid barriers. The
 engine uses an exact FP8 group-scale pair table and int32 split-K, and reproduces the reference
@@ -298,7 +355,10 @@ Details, exactness method and measurements: [docs/DESIGN.md](docs/DESIGN.md).
 ```
 __init__.py              ComfyUI entry point (env-gated install, adds no nodes)
 comfy_mono_decode_xpu/   routing: layer.py (layers, attention, RoPE, sessions), logits.py (picks),
-                         mono.py (MLP block), patch.py (W4 linear, rotate+quant), graph_step.py (experimental)
+                         mono.py (MLP block), patch.py (W4 linear, rotate+quant), mtp_loop.py (device
+                         MTP loop), draft.py / graph_draft.py (draft head weights, XPU graph),
+                         draft_lmhead.py (experimental two-stage draft lm_head), autotree.py, tiles.py,
+                         graph_step.py (experimental)
 csrc/                    SYCL kernels (see docs/DESIGN.md) and bindings
 install.py / install.sh  build the extension in place (ComfyUI-Manager runs install.py)
 build_icpx.sh            the single-invocation icpx build

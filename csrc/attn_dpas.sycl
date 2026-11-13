@@ -1,0 +1,266 @@
+// SPDX-License-Identifier: Apache-2.0
+// Decode attention for the tree-verify rows and the MTP draft row with DPAS, split along the context.
+//
+// Same contract as attn_core (FixedKVCache.attend): rows of one kv head attend the committed prefix
+// [0, L) of the BF16 cache and, for tree verify, the tree rows a row's mask admits (from xk / xv).
+// Not bit-identical to Kitchen's decode_gqa + tree_merge: the context is split by its actual length,
+// QK^T and P.V run on DPAS (BF16 inputs, FP32 accumulation; P is rounded to BF16 for the P.V step)
+// and partial results are merged in FP32. The softmax is the same function.
+//
+// Kernel 1: work-group = (kv head, context chunk); sub-group = (8-row M tile, half of the head dim).
+//   Chunks follow the actual length (at least 32 tokens each; work-groups past the last chunk exit).
+//   Per 16-token tile: S = Q K^T (16 DPAS over the head dim; K^T a column-major load of the K rows),
+//   online softmax per row inside the sub-group, O += P V (8 DPAS for the half; V a row-major block
+//   load). On Xe2 an accumulator, an A and a B fragment all hold lane = column, element i = row i, so
+//   the scores are already in the P operand's layout; P still goes through a 256 B SLM tile because
+//   elementwise writes into BF16 A/B fragments (joint_matrix_apply) hang the device with this compiler,
+//   and the cache's last partial tile is staged in SLM with zero rows. Registers: the running max and
+//   sum sit one row per lane and fragments are read through unrolled wi_data loops, which keeps the
+//   kernel at the default 128 GRF (the 256 GRF mode removes the spills but halves occupancy: slower).
+// Kernel 2: per (head, row), merge the active chunks' (m, l, O) and the admitted tree rows, write BF16.
+#include <cmath>
+#include <cstdint>
+#include <type_traits>
+#include <vector>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+namespace mono_decode_xpu {
+namespace {
+namespace jm = sycl::ext::oneapi::experimental::matrix;
+using bf16 = sycl::ext::oneapi::bfloat16;
+constexpr int HD = 256, TT = 16, HALF = HD / 2, NT = HALF / 16;
+constexpr float SCALE = 0.0625f;  // 1 / sqrt(256)
+
+template <typename T>
+inline auto gp(T* p) {
+    return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p);
+}
+template <typename T>
+inline auto lp(T* p) {
+    return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+}
+
+template <int NMT>
+class AttnDpasPartK;
+class AttnDpasMergeK;
+
+struct V4 {  // [B, H, S, D] strided bf16 view
+    const bf16* p;
+    int64_t s0, s1, s2, s3;
+    float at(int b, int h, int s, int d) const { return float(p[b * s0 + h * s1 + s * s2 + d * s3]); }
+};
+V4 v4(const torch::Tensor& t) {
+    return {reinterpret_cast<const bf16*>(t.data_ptr()), t.stride(0), t.stride(1), t.stride(2), t.stride(3)};
+}
+
+#ifndef ATTN_DPAS_MINCH
+#define ATTN_DPAS_MINCH 32
+#endif
+// Chunks actually used for a context of L cached tokens: at least MINCH tokens each (fewer partials
+// for the merge at short contexts), a multiple of the 16-token tile. Same arithmetic on both kernels.
+inline void chunking(int L, int chunks, int& per, int& active) {
+    per = (L + chunks - 1) / chunks;
+    per = per < ATTN_DPAS_MINCH ? ATTN_DPAS_MINCH : per;
+    per = (per + TT - 1) / TT * TT;
+    active = L > 0 ? (L + per - 1) / per : 0;
+}
+
+template <int NMT>
+void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16* Vc, const int* lens, int HK,
+                     int groups, int S, int rows, int cap, int chunks, float* part, float* ml) {
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<bf16, 1> qs(NMT * 8 * HD, cgh);
+        // per sub-group: P [8][16] and a staged 16 x 16 cache tile for the cache's last partial tile
+        sycl::local_accessor<bf16, 1> scratch(NMT * 2 * (8 * 16 + 16 * 16), cgh);
+        cgh.parallel_for<AttnDpasPartK<NMT>>(
+            sycl::nd_range<1>(int64_t(HK) * chunks * NMT * 32, NMT * 32),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                auto sg = it.get_sub_group();
+                const int t = it.get_local_id(0), lane = sg.get_local_id()[0], sgi = t / 16;
+                const int mt = sgi / 2, dh = sgi % 2;
+                const int wg = it.get_group(0), kh = wg / chunks, c = wg % chunks;
+                const int64_t raw = lens[0];
+                const int L = raw < 0 ? 0 : (raw > cap ? cap : int(raw));
+                int per, active;
+                chunking(L, chunks, per, active);
+                if (c >= active) return;  // uniform per work-group
+                const int beg = c * per, end = sycl::min(L, beg + per);
+                for (int i = t; i < NMT * 8 * HD; i += NMT * 32) {
+                    const int r = i / HD, d = i % HD;
+                    qs[i] = r < rows ? bf16(Q.at(0, kh * groups + r / S, r % S, d)) : bf16(0.f);
+                }
+                sycl::group_barrier(it.get_group());
+                bf16* pslm = &scratch[sgi * (8 * 16 + 16 * 16)];
+                bf16* stage = pslm + 8 * 16;
+                float ml_m = -INFINITY, ml_l = 0.f;  // running max / sum of row `lane` (lanes 0-7), one register each
+                jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> o[NT];
+#pragma unroll
+                for (int n = 0; n < NT; ++n) jm::joint_matrix_fill(sg, o[n], 0.f);
+                const bf16* kbase = Kc + int64_t(kh) * cap * HD;
+                const bf16* vbase = Vc + int64_t(kh) * cap * HD;
+                for (int tb = beg; tb < end; tb += TT) {
+                    const int tok = tb + lane;
+                    const bool live = tok < end;
+                    const bool full = tb + TT <= cap;  // a block load reads 16 cache rows
+                    // S = Q K^T over the head dim
+                    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> s;
+                    jm::joint_matrix_fill(sg, s, 0.f);
+#pragma unroll 2
+                    for (int dc = 0; dc < HD / 16; ++dc) {
+                        jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a;
+                        jm::joint_matrix_load(sg, a, lp(&qs[(mt * 8) * HD + dc * 16]), HD);
+                        jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::col_major> b;
+                        if (full) {
+                            jm::joint_matrix_load(sg, b, gp(kbase + int64_t(tb) * HD + dc * 16), HD);
+                        } else {  // B[k][n] = K[tb + n][dc*16 + k]: stage the 16 rows with zeros past the cache
+                            for (int e = 0; e < 16; ++e)
+                                stage[lane * 16 + e] = tb + lane < cap ? kbase[int64_t(tb + lane) * HD + dc * 16 + e] : bf16(0.f);
+                            sycl::group_barrier(sg);
+                            jm::joint_matrix_load(sg, b, lp(stage), 16);
+                            sycl::group_barrier(sg);
+                        }
+                        jm::joint_matrix_mad(sg, s, a, b, s);
+                    }
+                    // online softmax per row (element i = row i, lane = token)
+                    float sv[8];
+                    {
+                        auto w = sycl::ext::oneapi::detail::get_wi_data(sg, s);  // 8 elements: rows 0-7
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) sv[i] = w[i];
+                    }
+                    float alpha[8];
+                    float* p = sv;  // scores become probabilities in place
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const float v = live ? sv[i] * SCALE : -INFINITY;
+                        const float mx = sycl::reduce_over_group(sg, v, sycl::maximum<float>());
+                        const float mi = sycl::group_broadcast(sg, ml_m, i), li = sycl::group_broadcast(sg, ml_l, i);
+                        const float mn = sycl::fmax(mi, mx);
+                        alpha[i] = mi == -INFINITY ? 0.f : sycl::exp(mi - mn);
+                        p[i] = v == -INFINITY ? 0.f : sycl::exp(v - mn);
+                        const float rs = sycl::reduce_over_group(sg, p[i], sycl::plus<float>());
+                        if (lane == i) { ml_m = mn; ml_l = li * alpha[i] + rs; }
+                    }
+                    // P (lane = token, element i = row i) -> SLM [8][16] -> A fragment
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) pslm[i * 16 + lane] = bf16(p[i]);
+                    sycl::group_barrier(sg);
+                    jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> pa;
+                    jm::joint_matrix_load(sg, pa, lp(pslm), 16);
+#pragma unroll
+                    for (int n = 0; n < NT; ++n) {
+                        {
+                            auto w = sycl::ext::oneapi::detail::get_wi_data(sg, o[n]);
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) w[i] = float(w[i]) * alpha[i];
+                        }
+                        jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::row_major> vb;
+                        const bf16* vp = vbase + int64_t(tb) * HD + dh * HALF + n * 16;
+                        if (full) {
+                            jm::joint_matrix_load(sg, vb, gp(vp), HD);
+                        } else {  // cache tail: 16 token rows x 16 dims, zero rows past the cache
+                            for (int e = 0; e < 16; ++e)
+                                stage[e * 16 + lane] = tb + e < cap ? vp[int64_t(e) * HD + lane] : bf16(0.f);
+                            sycl::group_barrier(sg);
+                            jm::joint_matrix_load(sg, vb, lp(stage), 16);
+                            sycl::group_barrier(sg);
+                        }
+                        jm::joint_matrix_mad(sg, o[n], pa, vb, o[n]);
+                    }
+                    sycl::group_barrier(sg);  // pslm / stage are rewritten by the next tile
+                }
+                // partials: part [HK][chunks][NMT * 8][HD], ml [HK][chunks][NMT * 8][2]
+                const int64_t unit = int64_t(kh) * chunks + c;
+#pragma unroll
+                for (int n = 0; n < NT; ++n)
+                    jm::joint_matrix_store(sg, o[n], gp(part + (unit * NMT * 8 + mt * 8) * HD + dh * HALF + n * 16), HD,
+                                           jm::layout::row_major);
+                if (dh == 0 && lane < 8) {
+                    ml[((unit * NMT * 8) + mt * 8 + lane) * 2] = ml_m;
+                    ml[((unit * NMT * 8) + mt * 8 + lane) * 2 + 1] = ml_l;
+                }
+            });
+    });
+}
+}  // namespace
+
+torch::Tensor attn_dpas(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,
+                        torch::Tensor xk, torch::Tensor xv, torch::Tensor mask, int64_t chunks_hint) {
+    TORCH_CHECK(q.is_xpu() && q.scalar_type() == at::kBFloat16 && q.dim() == 4 && q.size(3) == HD, "q bf16 [1, H, S, 256]");
+    TORCH_CHECK(key.is_contiguous() && value.is_contiguous() && key.sizes() == value.sizes() && key.dim() == 4 &&
+                    key.size(3) == HD && key.scalar_type() == at::kBFloat16 && value.scalar_type() == at::kBFloat16,
+                "cache bf16 [1, Hk, cap, 256]");
+    TORCH_CHECK(seqlen.scalar_type() == at::kInt && mask.scalar_type() == at::kInt && mask.is_contiguous(), "int32 seqlen / mask");
+    const int H = q.size(1), S = q.size(2), HK = key.size(1), cap = key.size(2);
+    const bool merge = mask.numel() > 0;
+    TORCH_CHECK(q.size(0) == 1 && key.size(0) == 1 && S >= 1 && S <= 8 && H % HK == 0 && (merge ? mask.numel() == S : S == 1),
+                "batch 1, 1..8 rows");
+    TORCH_CHECK(xk.sizes() == xv.sizes() && xk.size(1) == HK && xk.size(2) == S && xk.size(3) == HD, "xk / xv [1, Hk, S, 256]");
+    const int groups = H / HK, rows = groups * S, nmt = (rows + 7) / 8;
+    TORCH_CHECK(nmt <= 4, "at most 32 query rows per kv head");
+    // about 32-48 chunks balance the partial kernel's parallelism against the merge's reads (B70)
+    const int chunks = chunks_hint > 0 ? int(chunks_hint) : std::max(1, std::min(48, (cap + 255) / 256));
+    auto opts = q.options();
+    auto part = torch::empty({HK, chunks, nmt * 8, HD}, opts.dtype(at::kFloat));
+    auto ml = torch::empty({HK, chunks, nmt * 8, 2}, opts.dtype(at::kFloat));
+    auto out = torch::empty({1, S, H * HD}, opts);
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    const V4 Q = v4(q), XK = v4(xk), XV = v4(xv);
+    const bf16* Kc = reinterpret_cast<const bf16*>(key.data_ptr());
+    const bf16* Vc = reinterpret_cast<const bf16*>(value.data_ptr());
+    const int* lens = seqlen.data_ptr<int>();
+    float* pp = part.data_ptr<float>();
+    float* pm = ml.data_ptr<float>();
+    switch (nmt) {
+        case 1: launch_partials<1>(queue, Q, Kc, Vc, lens, HK, groups, S, rows, cap, chunks, pp, pm); break;
+        case 2: launch_partials<2>(queue, Q, Kc, Vc, lens, HK, groups, S, rows, cap, chunks, pp, pm); break;
+        case 3: launch_partials<3>(queue, Q, Kc, Vc, lens, HK, groups, S, rows, cap, chunks, pp, pm); break;
+        default: launch_partials<4>(queue, Q, Kc, Vc, lens, HK, groups, S, rows, cap, chunks, pp, pm); break;
+    }
+    const int* masks = merge ? mask.data_ptr<int>() : nullptr;
+    bf16* dest = reinterpret_cast<bf16*>(out.data_ptr());
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red(16, cgh);
+        cgh.parallel_for<AttnDpasMergeK>(sycl::nd_range<1>(int64_t(H) * S * HD, HD), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int d = it.get_local_id(0), item = it.get_group(0);
+            const int h = item / S, s = item % S, kh = h / groups, r = (h % groups) * S + s;
+            const int64_t base = int64_t(kh) * chunks;
+            const int64_t raw = lens[0];
+            const int L = raw < 0 ? 0 : (raw > cap ? cap : int(raw));
+            int per, active;
+            chunking(L, chunks, per, active);
+            // every active chunk holds at least one cached token, so its m is finite: no branches, and the
+            // unrolled loops keep several chunks' loads in flight
+            float M = -INFINITY;
+#pragma unroll 8
+            for (int c = 0; c < active; ++c) M = sycl::fmax(M, pm[((base + c) * nmt * 8 + r) * 2]);
+            float acc = 0.f, sum = 0.f;
+#pragma unroll 8
+            for (int c = 0; c < active; ++c) {
+                const int64_t u = (base + c) * nmt * 8 + r;
+                const float w = sycl::exp(pm[u * 2] - M);
+                sum += pm[u * 2 + 1] * w;
+                acc += pp[u * HD + d] * w;
+            }
+            if (masks != nullptr) {  // tree rows this row admits: scores in FP32 over the head dim
+                const float qd = Q.at(0, h, s, d);
+                for (int tr = 0; tr < S; ++tr) {
+                    if (!((masks[s] >> tr) & 1)) continue;
+                    const float sc = sycl::reduce_over_group(it.get_group(), qd * XK.at(0, kh, tr, d), sycl::plus<float>()) * SCALE;
+                    const float M2 = sycl::fmax(M, sc);
+                    const float fp = M == -INFINITY ? 0.f : sycl::exp(M - M2), ft = sycl::exp(sc - M2);
+                    acc = acc * fp + ft * XV.at(0, kh, tr, d);
+                    sum = sum * fp + ft;
+                    M = M2;
+                }
+            }
+            dest[(int64_t(s) * H + h) * HD + d] = bf16(sum > 0.f ? acc / sum : 0.f);
+        });
+    });
+    return out;
+}
+}  // namespace mono_decode_xpu

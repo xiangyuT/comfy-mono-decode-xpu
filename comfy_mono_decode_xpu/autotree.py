@@ -36,6 +36,12 @@ def stats():
         return dict(_stats)
 
 
+def note_device_timing(steps, draft_ms, verify_ms):
+    """The device MTP loop times its own steps (it reads them one step late): record what auto used."""
+    with _lock:
+        _stats.update(updates=_stats["updates"] + 1, steps=steps, draft_ms=round(draft_ms, 3), verify_ms=round(verify_ms, 3))
+
+
 class _Clock:
     def __init__(self):
         self.marks = []      # (kind, event, drafts so far in the step) in issue order
@@ -150,13 +156,16 @@ def install():
         clock = _Clock()
         model_forward, mtp_forward = self.model.forward, self.mtp.forward
 
-        def timed_model_forward(*a, **k):
-            if k.get("decode_buffers") is not None:  # the verify forward of a step
+        from . import mtp_loop
+
+        def timed_model_forward(*a, **k):  # the device loop (mtp_loop) times its steps itself
+            if k.get("decode_buffers") is not None and not mtp_loop.in_device_loop():  # a step's verify forward
                 clock.on_verify()
             return model_forward(*a, **k)
 
         def timed_mtp_forward(*a, **k):
-            clock.on_draft()
+            if not mtp_loop.in_device_loop():
+                clock.on_draft()
             return mtp_forward(*a, **k)
 
         saved = [(m, vars(m).get("forward")) for m in (self.model, self.mtp)]  # outer wrappers, if any

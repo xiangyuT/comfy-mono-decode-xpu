@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: Apache-2.0
+// Device-side bookkeeping of the Qwen3.5 MTP decode loop (comfy_mono_decode_xpu/mtp_loop.py).
+//
+// Upstream decides each step's accepted path on the host after one sync, then prepares the next step's
+// caches from host counters (FixedKVState.prepare, LinearKV.prepare, commit_path, rollback). Here the
+// same decisions run on the device, so the host can queue the next step without waiting:
+//   mtp_prep_draft   MTP KV position / seqlen for draft k, and the draft's rope row
+//   mtp_prep_verify  attention position / seqlen, verify rope positions, ctl parity and tree program
+//   mtp_accept       the accept walk, committed tokens, auto-tree ranks, next token / hidden row, the
+//                    next step's position counters and deferred-delta ctl (pending, slots), and the
+//                    attention KV slot moves of an off-chain path
+// st (int64 [4]) is the loop's device state: st[0] committed length (attention index), st[1] MTP KV length.
+
+#include <sycl/sycl.hpp>
+#include <c10/xpu/XPUStream.h>
+#include <torch/extension.h>
+
+namespace mono_decode_xpu {
+namespace {
+constexpr int SLOTS = 8;  // gated_delta_slot_max / SPEC_ROWS
+constexpr int RANKS = 7;  // auto: candidates kept per draft
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+void check_i64(const torch::Tensor& t, const char* what) {
+    TORCH_CHECK(t.is_xpu() && t.scalar_type() == at::kLong && t.is_contiguous(), what, ": contiguous int64 XPU tensor");
+}
+}  // namespace
+
+void mtp_prep_draft(torch::Tensor st, int64_t k, torch::Tensor ftab, torch::Tensor freqs, torch::Tensor mpos,
+                    torch::Tensor mseq) {
+    check_i64(st, "st");
+    check_i64(mpos, "mtp position");
+    TORCH_CHECK(mseq.is_xpu() && mseq.scalar_type() == at::kInt && mseq.numel() >= 1, "mtp seqlen int32");
+    TORCH_CHECK(ftab.scalar_type() == at::kFloat && ftab.is_contiguous() && freqs.scalar_type() == at::kFloat
+                && freqs.is_contiguous() && ftab.dim() >= 3 && freqs.dim() == ftab.dim() && freqs.size(2) == 1,
+                "rope table [.., .., cap, ...] / row [.., .., 1, ...] float");
+    const int64_t n = freqs.numel(), cap = ftab.size(2), np = mpos.numel();
+    TORCH_CHECK(ftab.numel() == cap * n, "rope table row size");
+    const int64_t* sp = st.data_ptr<int64_t>();
+    const float* tp = ftab.data_ptr<float>();
+    float* fp = freqs.data_ptr<float>();
+    int64_t* pp = mpos.data_ptr<int64_t>();
+    int* qp = mseq.data_ptr<int>();
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    queue.parallel_for(sycl::nd_range<1>(256, 256), [=](sycl::nd_item<1> it) {
+        const int t = it.get_local_id(0);
+        const int64_t p = sp[0] + k, m = sp[1] + k;
+        const int64_t row = p < cap ? p : cap - 1;  // (capacity covers every position of the generate)
+        for (int64_t i = t; i < n; i += 256) fp[i] = tp[row * n + i];
+        if (t < np) pp[t] = m + t;  // FixedKVState.prepare: arange(index, index + SPEC_ROWS)
+        if (t == 0) qp[0] = int(m + 1);  // a chain row: seqlen = index + 1
+    });
+}
+
+void mtp_prep_verify(torch::Tensor st, torch::Tensor apos, torch::Tensor aseq, torch::Tensor vpos,
+                     torch::Tensor tree_pos, torch::Tensor ctl, torch::Tensor tree_ctl, int64_t parity,
+                     int64_t rope_offset) {
+    check_i64(st, "st");
+    check_i64(apos, "attention position");
+    check_i64(vpos, "verify positions");
+    check_i64(tree_pos, "tree positions");
+    TORCH_CHECK(aseq.is_xpu() && aseq.scalar_type() == at::kInt, "attention seqlen int32");
+    TORCH_CHECK(ctl.scalar_type() == at::kInt && ctl.numel() == 2 + 3 * SLOTS && tree_ctl.scalar_type() == at::kInt
+                && tree_ctl.numel() == 2 * SLOTS && tree_ctl.is_xpu(), "ctl / tree program");
+    const int rows = int(vpos.numel()), np = int(apos.numel());
+    TORCH_CHECK(tree_pos.numel() == rows && rows <= SLOTS && np <= 64, "rows");
+    const int64_t* sp = st.data_ptr<int64_t>();
+    int64_t* ap = apos.data_ptr<int64_t>();
+    int* aq = aseq.data_ptr<int>();
+    int64_t* vp = vpos.data_ptr<int64_t>();
+    const int64_t* tp = tree_pos.data_ptr<int64_t>();
+    int* cp = ctl.data_ptr<int>();
+    const int* tc = tree_ctl.data_ptr<int>();
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    queue.parallel_for(sycl::nd_range<1>(64, 64), [=](sycl::nd_item<1> it) {
+        const int t = it.get_local_id(0);
+        const int64_t pos = sp[0];
+        if (t < np) ap[t] = pos + t;  // FixedKVState.prepare (tree): arange(index, ...), seqlen = index
+        if (t == 0) aq[0] = int(pos);
+        if (t < rows) vp[t] = tp[t] + pos + rope_offset;  // tree.positions + pos + rope_offset
+        if (t == 0) cp[1] = int(parity);  // LinearKV.prepare: this step's side buffers
+        if (t < 2 * SLOTS) cp[2 + SLOTS + t] = tc[t];  // parent[], prog[] of this step's tree
+    });
+}
+
+void mtp_accept(torch::Tensor st, torch::Tensor toks, torch::Tensor vtok, torch::Tensor cand, torch::Tensor children,
+                int64_t rows, int64_t depth, torch::Tensor x, torch::Tensor nt_buf, torch::Tensor h_buf,
+                torch::Tensor ctl, torch::Tensor kv_ptrs, int64_t kv_heads, int64_t kv_cap, int64_t head_dim,
+                torch::Tensor result) {
+    check_i64(st, "st");
+    check_i64(result, "result");
+    check_i64(nt_buf, "next token");
+    TORCH_CHECK(toks.is_xpu() && toks.scalar_type() == at::kLong && toks.numel() >= rows && toks.stride(-1) == 1,
+                "sampled tokens int64 [1, rows]");
+    check_i64(vtok, "verify tokens");
+    TORCH_CHECK(rows >= 1 && rows <= SLOTS && depth >= 0 && depth < rows, "rows / depth");
+    TORCH_CHECK(children.is_xpu() && children.scalar_type() == at::kInt && children.numel() == SLOTS * SLOTS, "children [8][8]");
+    TORCH_CHECK(cand.numel() == 0 || (cand.scalar_type() == at::kLong && cand.is_contiguous() && cand.numel() >= RANKS * RANKS),
+                "auto candidates int64 [7, 7]");
+    TORCH_CHECK(x.is_contiguous() && h_buf.is_contiguous() && x.scalar_type() == at::kBFloat16
+                && h_buf.scalar_type() == at::kBFloat16 && x.numel() >= rows * h_buf.numel(), "hidden rows bf16");
+    TORCH_CHECK(ctl.scalar_type() == at::kInt && ctl.numel() == 2 + 3 * SLOTS, "ctl");
+    TORCH_CHECK(kv_ptrs.scalar_type() == at::kLong && kv_ptrs.is_contiguous(), "kv pointer table");
+    TORCH_CHECK(result.numel() >= 32, "result slot");
+    const int64_t H = h_buf.numel(), slot = kv_heads * head_dim, nkv = kv_ptrs.numel();
+    const int64_t* tk = toks.data_ptr<int64_t>();
+    const int64_t* dr = vtok.data_ptr<int64_t>();
+    const int64_t* cd = cand.numel() ? cand.data_ptr<int64_t>() : nullptr;
+    const int* ch = children.data_ptr<int>();
+    const bf16* xp = reinterpret_cast<const bf16*>(x.data_ptr());
+    bf16* hp = reinterpret_cast<bf16*>(h_buf.data_ptr());
+    int64_t* sp = st.data_ptr<int64_t>();
+    int64_t* np = nt_buf.data_ptr<int64_t>();
+    int* cp = ctl.data_ptr<int>();
+    const int64_t* kp = kv_ptrs.data_ptr<int64_t>();
+    int64_t* rp = result.data_ptr<int64_t>();
+    const int R = int(rows), D = int(depth);
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    queue.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> sh(SLOTS + 4, cgh);  // path, len, row, on_chain
+        sycl::local_accessor<int64_t, 1> base(1, cgh);
+        cgh.parallel_for(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) {
+            const int t = it.get_local_id(0);
+            if (t == 0) {
+                // the accept walk: continue along the child whose draft token is the token the verify chose
+                int path[SLOTS], len = 1;
+                path[0] = 0;
+                while (len < R) {
+                    const int cur = path[len - 1];
+                    int next = -1;
+                    for (int j = 0; j < SLOTS; ++j) {
+                        const int c = ch[cur * SLOTS + j];
+                        if (c < 0) break;
+                        if (dr[c] == tk[cur]) { next = c; break; }
+                    }
+                    if (next < 0) break;
+                    path[len++] = next;
+                }
+                const int row = path[len - 1];
+                const bool on_chain = row == len - 1;
+                const int kept = (on_chain ? len : len - 1) < D ? (on_chain ? len : len - 1) : D;
+                const int64_t pos = sp[0];
+                // result: [n, commit[8], row, on_chain, nranks, ranks[7], pos, kept]
+                rp[0] = len;
+                for (int i = 1; i < len; ++i) rp[i] = dr[path[i]];
+                rp[len] = tk[row];
+                for (int i = len + 1; i <= SLOTS; ++i) rp[i] = -1;
+                rp[9] = row;
+                rp[10] = on_chain;
+                int nr = 0;
+                if (cd != nullptr)
+                    for (int i = 0; i < len && path[i] < D; ++i) {
+                        const int node = path[i];
+                        int r = RANKS;
+                        for (int q = 0; q < RANKS; ++q)
+                            if (cd[node * RANKS + q] == tk[node]) { r = q; break; }
+                        rp[12 + nr++] = r;
+                    }
+                rp[11] = nr;
+                rp[19] = pos;
+                rp[20] = kept;
+                // the next step: counters, deferred-delta replay of the accepted rows, next token
+                sp[0] = pos + len;
+                sp[1] = sp[1] + kept;
+                cp[0] = len;
+                for (int i = 0; i < SLOTS; ++i) cp[2 + i] = i < len ? path[i] : i;
+                np[0] = tk[row];
+                for (int i = 0; i < SLOTS; ++i) sh[i] = i < len ? path[i] : i;
+                sh[SLOTS] = len;
+                sh[SLOTS + 1] = row;
+                sh[SLOTS + 2] = on_chain;
+                base[0] = pos;
+            }
+            sycl::group_barrier(it.get_group());
+            const int len = sh[SLOTS], row = sh[SLOTS + 1];
+            for (int64_t i = t; i < H; i += 1024) hp[i] = xp[int64_t(row) * H + i];
+            if (!sh[SLOTS + 2]) {
+                // FixedKVState.commit_path: accepted row path[k] becomes slot base + k, ascending (a row
+                // never sits above its depth, so no later source is overwritten first)
+                const int64_t b = base[0];
+                for (int k = 1; k < len; ++k) {
+                    const int r = sh[k];
+                    if (r != k) {
+                        const int64_t dst = (b + k) % kv_cap, src = (b + r) % kv_cap;
+                        for (int64_t e = t; e < nkv * slot; e += 1024) {
+                            const int64_t which = e / slot, w = e % slot, h = w / head_dim, d = w % head_dim;
+                            bf16* p = reinterpret_cast<bf16*>(kp[which]);
+                            p[(h * kv_cap + dst) * head_dim + d] = p[(h * kv_cap + src) * head_dim + d];
+                        }
+                    }
+                    sycl::group_barrier(it.get_group());
+                }
+            }
+        });
+    });
+}
+}  // namespace mono_decode_xpu

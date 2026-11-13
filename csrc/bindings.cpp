@@ -25,6 +25,8 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
 torch::Tensor layer_gdn_core(torch::Tensor like, int64_t rows);
 torch::Tensor attn_core(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,
                         torch::Tensor xk, torch::Tensor xv, torch::Tensor mask, int64_t nwg);
+torch::Tensor attn_dpas(torch::Tensor q, torch::Tensor key, torch::Tensor value, torch::Tensor seqlen,
+                        torch::Tensor xk, torch::Tensor xv, torch::Tensor mask, int64_t chunks);
 
 std::vector<torch::Tensor> fast_topk(torch::Tensor x, int64_t k, bool argmax_order);
 std::vector<torch::Tensor> fast_pick(torch::Tensor x, int64_t k);
@@ -42,6 +44,18 @@ torch::Tensor layer_post(torch::Tensor x, torch::Tensor y, std::optional<torch::
                          torch::Tensor gq, torch::Tensor gs, torch::Tensor gsc, torch::Tensor gcb,
                          torch::Tensor uq, torch::Tensor us, torch::Tensor usc, torch::Tensor ucb,
                          torch::Tensor dq, torch::Tensor ds, torch::Tensor dsc, torch::Tensor dcb, int64_t nwg, int64_t stop, bool tiled);
+void mtp_prep_draft(torch::Tensor st, int64_t k, torch::Tensor ftab, torch::Tensor freqs, torch::Tensor mpos,
+                    torch::Tensor mseq);
+void mtp_prep_verify(torch::Tensor st, torch::Tensor apos, torch::Tensor aseq, torch::Tensor vpos,
+                     torch::Tensor tree_pos, torch::Tensor ctl, torch::Tensor tree_ctl, int64_t parity,
+                     int64_t rope_offset);
+void mtp_accept(torch::Tensor st, torch::Tensor toks, torch::Tensor vtok, torch::Tensor cand, torch::Tensor children,
+                int64_t rows, int64_t depth, torch::Tensor x, torch::Tensor nt_buf, torch::Tensor h_buf,
+                torch::Tensor ctl, torch::Tensor kv_ptrs, int64_t kv_heads, int64_t kv_cap, int64_t head_dim,
+                torch::Tensor result);
+void draft_pick(torch::Tensor approx, torch::Tensor qx, torch::Tensor sx, torch::Tensor w, torch::Tensor sw,
+                int64_t nout, bool argmax_first, torch::Tensor top, torch::Tensor ranks_row, torch::Tensor token,
+                torch::Tensor vtok, std::vector<int64_t> children, torch::Tensor calls);
 }  // namespace mono_decode_xpu
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -55,6 +69,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("layer_gdn", &mono_decode_xpu::layer_gdn);
     m.def("layer_gdn_core", &mono_decode_xpu::layer_gdn_core);
     m.def("attn_core", &mono_decode_xpu::attn_core);
+    m.def("attn_dpas", &mono_decode_xpu::attn_dpas);
+    m.def("mtp_prep_draft", &mono_decode_xpu::mtp_prep_draft);
+    m.def("mtp_prep_verify", &mono_decode_xpu::mtp_prep_verify);
+    m.def("mtp_accept", &mono_decode_xpu::mtp_accept);
+    m.def("draft_pick", &mono_decode_xpu::draft_pick);
     m.def("fast_topk", &mono_decode_xpu::fast_topk);
     m.def("fast_pick", &mono_decode_xpu::fast_pick);
     m.def("rope_kv", &mono_decode_xpu::rope_kv);

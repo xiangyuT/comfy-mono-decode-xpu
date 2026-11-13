@@ -330,14 +330,19 @@ inline void rot_quant_row(sycl::nd_item<1>& it, const bf16* x, const bf16* h, in
     for (int64_t tile = sgi; tile < tiles; tile += MSG) {
         const int64_t gb = tile / (GS / 16);
         const int cb = tile % (GS / 16);
-        jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a;
-        jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::row_major> b;
+        constexpr int KB = 4;  // k-steps whose loads are in flight together (a load-mad chain of 16 round trips)
+        jm::joint_matrix<sycl::sub_group, bf16, jm::use::a, 8, 16, jm::layout::row_major> a[KB];
+        jm::joint_matrix<sycl::sub_group, bf16, jm::use::b, 16, 16, jm::layout::row_major> b[KB];
         jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> c;
         jm::joint_matrix_fill(sg, c, 0.f);
-        for (int k = 0; k < GS; k += 16) {
-            jm::joint_matrix_load(sg, a, gptr(x + gb * 8 * GS + k), GS);
-            jm::joint_matrix_load(sg, b, gptr(h + k * GS + cb * 16), GS);
-            jm::joint_matrix_mad(sg, c, a, b, c);
+        for (int k0 = 0; k0 < GS; k0 += 16 * KB) {
+#pragma unroll
+            for (int u = 0; u < KB; ++u) {
+                jm::joint_matrix_load(sg, a[u], gptr(x + gb * 8 * GS + k0 + 16 * u), GS);
+                jm::joint_matrix_load(sg, b[u], gptr(h + (k0 + 16 * u) * GS + cb * 16), GS);
+            }
+#pragma unroll
+            for (int u = 0; u < KB; ++u) jm::joint_matrix_mad(sg, c, a[u], b[u], c);
         }
         jm::joint_matrix_store(
             sg, c,
@@ -386,6 +391,9 @@ inline void rms_norm_row(sycl::nd_item<1>& it, const bf16* x, const bf16* w, bf1
     auto sg = it.get_sub_group();
     const int t = it.get_local_id(0), lane = sg.get_local_id()[0], sgi = sg.get_group_id()[0];
     const int et = t >> 5, j0 = t & 31;
+    float wv[4096 / MWG];  // the (cold) weight is requested before the reductions
+#pragma unroll
+    for (int k = 0; k < 4096 / MWG; ++k) wv[k] = static_cast<float>(w[t + k * MWG]);
     float v[2];
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
@@ -417,10 +425,12 @@ inline void rms_norm_row(sycl::nd_item<1>& it, const bf16* x, const bf16* w, bf1
     }
     sycl::group_barrier(it.get_group());
     const float scale = red[1056 - 1];
-    for (int i = t; i < 4096; i += MWG) {
+#pragma unroll
+    for (int k = 0; k < 4096 / MWG; ++k) {
+        const int i = t + k * MWG;
         const float xv = static_cast<float>(x[i]);
         const float s1 = xv * scale;
-        out[i] = static_cast<bf16>(s1 * static_cast<float>(w[i]));
+        out[i] = static_cast<bf16>(s1 * wv[k]);
     }
     sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group);
     sycl::group_barrier(it.get_group());

@@ -12,7 +12,8 @@ T=$($PY -c "import torch, os; print(os.path.dirname(torch.__file__))")
 PYINC=$($PY -c "import sysconfig; print(sysconfig.get_paths()['include'])")
 SUFFIX=$($PY -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 SRCS=(csrc/bindings.cpp csrc/w4a8_decode.sycl csrc/act_prep.sycl csrc/mono_mlp.sycl
-      csrc/mono_layer.sycl csrc/mono_gdn.sycl csrc/attn_port.sycl csrc/fast_topk.sycl csrc/rope_kv.sycl)
+      csrc/mono_layer.sycl csrc/mono_gdn.sycl csrc/attn_port.sycl csrc/attn_dpas.sycl csrc/fast_topk.sycl
+      csrc/rope_kv.sycl csrc/mtp_loop.sycl csrc/draft_lmhead.sycl)
 icpx -fsycl -std=c++20 -O3 -DNDEBUG -fPIC -shared -fsycl-targets=spir64_gen -Xsycl-target-backend "-device ${TARGET}" \
   -I"$T/include" -I"$T/include/torch/csrc/api/include" -I"$PYINC" -Icsrc \
   -DTORCH_EXTENSION_NAME=_C -DTORCH_API_INCLUDE_EXTENSION_H \

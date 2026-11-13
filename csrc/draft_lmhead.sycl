@@ -1,0 +1,284 @@
+// SPDX-License-Identifier: Apache-2.0
+// Second stage of the experimental two-stage draft lm_head (comfy_mono_decode_xpu/draft_lmhead.py).
+//
+// The first stage scores the whole vocabulary with an int4 copy of the int8 lm_head (oneDNN weight-only
+// GEMM, half the bytes). draft_pick then, in one launch:
+//   1. work-group w (32 of them) owns rows [w * 8192, (w + 1) * 8192) (grid-stride beyond 262144); its
+//      thread t keeps the 2 best approximate scores of rows t + 1024 j (j < 8), and the work-group the
+//      32 best of those 2048 (binary search on the 16-bit bf16 order key). Neighbouring token ids (digits,
+//      punctuation: often several of the top 7) fall to different threads.
+//   2. per work-group: the exact int8 logit of each of its 32 candidates, the way the decode path's
+//      int8 convrot linear computes it: int32 dot of the rotated, rowwise-quantized activation with the
+//      int8 row, (acc * x_scale) * w_scale in fp32, rounded to bf16
+//   3. per work-group its top-8 by exact rank (torch XPU topk's tie order, fast_topk.sycl's ranks) and its
+//      best by torch's argmax rules; the last work-group merges the 32 lists and writes the draft's
+//      outputs: the top-n row, the auto-tree rank row, the draft token and the children's verify tokens.
+// The candidates include the global int4 top-32 unless 3 of them share a thread (rows 1024 apart). On
+// 8636 real drafts the exact top-7 with ties always lies within the int4 top-32.
+#include <cstdint>
+#include <map>
+#include <vector>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+namespace mono_decode_xpu {
+namespace {
+constexpr int DP_WG = 1024, DP_NW = 32, DP_PER = 8, DP_SEL = 32, DP_MAXN = 8, DP_MAXCH = 8;
+constexpr int DP_CAND = DP_NW * DP_SEL;
+
+// bf16 bits -> unsigned key with the float order (approximate scores: no NaN handling needed)
+inline uint32_t order_key(uint16_t b) { return (b & 0x8000u) ? (~uint32_t(b) & 0xFFFFu) : (uint32_t(b) | 0x8000u); }
+
+// fast_topk.sycl's ranks (larger = better): torch topk's radix key and gather-order ties; torch argmax
+inline uint64_t dp_rank_topk(uint16_t bits, uint32_t i) {
+    const uint32_t mask = (bits & 0x8000u) ? 0xFFFFu : 0x8000u;
+    const bool nan = (bits & 0x7FFFu) > 0x7F80u;
+    const uint32_t conv = nan ? 0xFFFFu : ((bits ^ mask) & 0xFFFFu);
+    const uint32_t it = i >> 15, off = i & 32767u;
+    const uint32_t gkey = (it << 15) | (((off & 8191u) >> 3) << 5) | ((off >> 13) << 3) | (off & 7u);
+    return (uint64_t(conv) << 32) | uint64_t(0xFFFFFFFFu - gkey);
+}
+inline uint64_t dp_rank_argmax(uint16_t bits, uint32_t i) {
+    const bool nan = (bits & 0x7FFFu) > 0x7F80u;
+    uint32_t key;
+    if (nan) key = 0xFFFFFFFFu;
+    else {
+        const uint16_t b = (bits & 0x7FFFu) == 0 ? 0 : bits;
+        key = (b & 0x8000u) ? uint32_t(0x7FFFu - (b & 0x7FFFu)) : uint32_t(0x8000u + b);
+    }
+    return (uint64_t(key) << 32) | uint64_t(0xFFFFFFFFu - i);
+}
+
+inline void dp_insert(uint64_t (&top)[DP_MAXN], uint64_t r) {
+    if (r <= top[DP_MAXN - 1]) return;
+    int p = DP_MAXN - 1;
+    while (p > 0 && top[p - 1] < r) { top[p] = top[p - 1]; --p; }
+    top[p] = r;
+}
+template <typename L>
+inline void dp_merge(L& lst, int a, int b) {  // sorted (descending) lists of DP_MAXN: the best DP_MAXN into a
+    uint64_t out[DP_MAXN];
+    int i = 0, j = 0;
+    for (int o = 0; o < DP_MAXN; ++o) {
+        const uint64_t x = lst[a + i], y = lst[b + j];
+        if (x >= y) { out[o] = x; ++i; } else { out[o] = y; ++j; }
+    }
+    for (int o = 0; o < DP_MAXN; ++o) lst[a + o] = out[o];
+}
+inline int64_t dp_index_topk(uint64_t r) {  // the element index of a dp_rank_topk rank
+    const uint32_t g = 0xFFFFFFFFu - uint32_t(r);
+    const uint32_t itn = g >> 15, th = (g >> 5) & 1023u, ld = (g >> 3) & 3u, ln = g & 7u;
+    return int64_t((itn << 15) | (ld << 13) | (th << 3) | ln);
+}
+
+template <typename T>
+using global_ref = sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                    sycl::access::address_space::global_space>;
+template <typename T>
+using local_ref = sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                   sycl::access::address_space::local_space>;
+
+class DraftPickKernel;
+}  // namespace
+
+void draft_pick(torch::Tensor approx, torch::Tensor qx, torch::Tensor sx, torch::Tensor w, torch::Tensor sw,
+                int64_t nout, bool argmax_first, torch::Tensor top, torch::Tensor ranks_row, torch::Tensor token,
+                torch::Tensor vtok, std::vector<int64_t> children, torch::Tensor calls) {
+    TORCH_CHECK(approx.is_xpu() && approx.scalar_type() == at::kBFloat16 && approx.is_contiguous(), "approx: bf16 row");
+    const int64_t N = approx.numel();
+    TORCH_CHECK(w.scalar_type() == at::kChar && w.is_contiguous() && w.dim() == 2 && w.size(0) == N, "w: int8 [N, K]");
+    const int64_t K = w.size(1);
+    TORCH_CHECK(K % 64 == 0 && K <= 16384, "K");
+    TORCH_CHECK(qx.scalar_type() == at::kChar && qx.is_contiguous() && qx.numel() == K, "qx: int8 [K]");
+    TORCH_CHECK(sx.scalar_type() == at::kFloat && sx.numel() == 1, "sx: one float");
+    TORCH_CHECK(sw.scalar_type() == at::kFloat && sw.is_contiguous() && sw.numel() == N, "sw: float [N]");
+    TORCH_CHECK(N >= DP_CAND && N < (int64_t(1) << 31), "rows");
+    TORCH_CHECK(nout >= 1 && nout <= DP_MAXN, "1 <= nout <= 8");
+    TORCH_CHECK(top.numel() == 0 || (top.scalar_type() == at::kLong && top.is_contiguous() && top.numel() >= nout), "top");
+    TORCH_CHECK(ranks_row.numel() == 0 || (ranks_row.scalar_type() == at::kLong && ranks_row.is_contiguous()
+                && ranks_row.numel() >= nout), "ranks row");
+    TORCH_CHECK(token.scalar_type() == at::kLong && token.numel() == 1, "token");
+    TORCH_CHECK(vtok.scalar_type() == at::kLong && vtok.is_contiguous(), "verify tokens");
+    TORCH_CHECK(!children.empty() && int64_t(children.size()) <= DP_MAXCH && int64_t(children.size()) <= nout, "children");
+    for (auto c : children) TORCH_CHECK(c >= 0 && c < vtok.numel(), "child row");
+    TORCH_CHECK(calls.scalar_type() == at::kLong && calls.numel() >= 1, "calls counter");
+
+    // cross-work-group lists and the last-work-group counter, per device and stream (launches on one
+    // stream are ordered; the kernel resets the counter, which only an aborted launch, i.e. a failed
+    // device, would leave behind)
+    static std::map<std::pair<int, int64_t>, torch::Tensor> scratch;
+    auto& sc = scratch[{approx.get_device(), int64_t(c10::xpu::getCurrentXPUStream().id())}];
+    if (!sc.defined()) sc = torch::zeros({DP_NW * DP_MAXN + DP_NW + 1}, approx.options().dtype(at::kLong));
+    auto* prt = reinterpret_cast<uint64_t*>(sc.data_ptr());  // [DP_NW][DP_MAXN] each work-group's top-8 ranks
+    auto* pra = prt + DP_NW * DP_MAXN;                          // [DP_NW] each work-group's best argmax rank
+    auto* cnt = reinterpret_cast<uint32_t*>(pra + DP_NW);
+
+    const auto* ap = reinterpret_cast<const uint16_t*>(approx.data_ptr());
+    const auto* qp = reinterpret_cast<const int8_t*>(qx.data_ptr());
+    const float* sxp = sx.data_ptr<float>();
+    const auto* wp = reinterpret_cast<const int8_t*>(w.data_ptr());
+    const float* swp = sw.data_ptr<float>();
+    int64_t* tp = top.numel() ? top.data_ptr<int64_t>() : nullptr;
+    int64_t* rp = ranks_row.numel() ? ranks_row.data_ptr<int64_t>() : nullptr;
+    int64_t* kp = token.data_ptr<int64_t>();
+    int64_t* vp = vtok.data_ptr<int64_t>();
+    int64_t* cp = calls.data_ptr<int64_t>();
+    int ch[DP_MAXCH];
+    const int nch = int(children.size());
+    for (int j = 0; j < DP_MAXCH; ++j) ch[j] = j < nch ? int(children[j]) : 0;
+    const int n_out = int(nout), KK = int(K);
+    const bool amf = argmax_first;
+    constexpr int NSG = DP_WG / 16, NQ = 15;  // sub-groups; thresholds per 16-ary search step
+
+    c10::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> sel(DP_SEL, cgh);  // the work-group's candidates
+        sycl::local_accessor<int, 1> ctr(2, cgh);
+        sycl::local_accessor<int, 1> part(NSG * NQ, cgh);  // per sub-group counts of the search step
+        sycl::local_accessor<int, 1> tot(NQ, cgh);
+        sycl::local_accessor<uint64_t, 1> rk(2 * DP_SEL, cgh);  // the candidates' topk / argmax ranks
+        sycl::local_accessor<uint64_t, 1> lst(DP_NW * DP_MAXN, cgh);
+        sycl::local_accessor<uint64_t, 1> am(DP_NW, cgh);
+        sycl::local_accessor<int, 1> last(1, cgh);
+        cgh.parallel_for<DraftPickKernel>(sycl::nd_range<1>(DP_NW * DP_WG, DP_WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int t = it.get_local_id(0), wg = it.get_group(0);
+            auto grp = it.get_group();
+            auto sg = it.get_sub_group();
+            const int sid = int(sg.get_group_linear_id()), lane = int(sg.get_local_linear_id());
+            // 1a. the 2 best approximate scores of this thread's rows (stored keys: order key + 1, 0 = empty)
+            uint32_t k0 = 0, k1 = 0;
+            int i0 = -1, i1 = -1;
+            for (int64_t base = int64_t(wg) * DP_WG * DP_PER + t; base < N; base += int64_t(DP_NW) * DP_WG * DP_PER) {
+                uint16_t v[DP_PER];  // all loads first: in-order threads would wait on each one
+#pragma unroll
+                for (int j = 0; j < DP_PER; ++j) {
+                    const int64_t i = base + int64_t(j) * DP_WG;
+                    v[j] = i < N ? ap[i] : uint16_t(0);
+                }
+#pragma unroll
+                for (int j = 0; j < DP_PER; ++j) {
+                    const int64_t i = base + int64_t(j) * DP_WG;
+                    const uint32_t key = i < N ? order_key(v[j]) + 1 : 0u;
+                    if (key > k1) {
+                        if (key > k0) { k1 = k0; i1 = i0; k0 = key; i0 = int(i); }
+                        else { k1 = key; i1 = int(i); }
+                    }
+                }
+            }
+            // 1b. the DP_SEL best of the work-group's 2048 entries: a 16-ary search for the DP_SEL-th key
+            // (4 steps of 15 thresholds; entries stay in registers), then collect the entries above / at it
+            if (t < 2) ctr[t] = 0;
+            if (t < DP_SEL) sel[t] = -1;
+            uint32_t lo = 0, span = 65536;  // count(key >= lo) >= DP_SEL (unless fewer entries), count(key >= lo + span) < DP_SEL
+            int nab = 0;                    // count(key >= lo + span)
+            for (int step = 0; step < 4; ++step) {
+                const uint32_t q1 = span >> 4;
+#pragma unroll
+                for (int q = 0; q < NQ; ++q) {  // key >= m  <=>  stored key > m
+                    const uint32_t m = lo + uint32_t(q + 1) * q1;
+                    const int c = sycl::reduce_over_group(sg, int(k0 > m) + int(k1 > m), sycl::plus<int>());
+                    if (lane == 0) part[sid * NQ + q] = c;
+                }
+                sycl::group_barrier(grp);
+                if (t < NQ) {
+                    int c = 0;
+                    for (int g = 0; g < NSG; ++g) c += part[g * NQ + t];
+                    tot[t] = c;
+                }
+                sycl::group_barrier(grp);
+                int qs = 0;
+#pragma unroll
+                for (int q = 0; q < NQ; ++q) if (tot[q] >= DP_SEL) qs = q + 1;
+                if (qs < NQ) nab = tot[qs];
+                lo += uint32_t(qs) * q1;
+                span = q1;
+                sycl::group_barrier(grp);  // tot / part reused by the next step
+            }
+            {
+                const uint32_t thr = lo;  // entries with key > thr: nab of them (< DP_SEL)
+                const uint32_t ks[2] = {k0, k1};
+                const int is[2] = {i0, i1};
+                for (int e = 0; e < 2; ++e) {
+                    if (!ks[e]) continue;
+                    const uint32_t key = ks[e] - 1;
+                    if (key > thr) {
+                        const int s = local_ref<int>(ctr[0]).fetch_add(1);
+                        if (s < DP_SEL) sel[s] = is[e];
+                    } else if (key == thr) {
+                        const int s = nab + local_ref<int>(ctr[1]).fetch_add(1);
+                        if (s < DP_SEL) sel[s] = is[e];
+                    }
+                }
+            }
+            sycl::group_barrier(grp);
+            // 2. exact int8 logits of the candidates: one sub-group per candidate
+            if (sid < DP_SEL) {
+                const int c = sel[sid];
+                uint64_t rt = 0, ra = 0;
+                if (c >= 0) {
+                    const int8_t* row = wp + int64_t(c) * KK;
+                    int32_t acc = 0;
+                    for (int k0b = lane * 16; k0b < KK; k0b += 16 * 16) {
+                        const sycl::vec<int8_t, 16> wv = *reinterpret_cast<const sycl::vec<int8_t, 16>*>(row + k0b);
+                        const sycl::vec<int8_t, 16> xv = *reinterpret_cast<const sycl::vec<int8_t, 16>*>(qp + k0b);
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) acc += int32_t(wv[j]) * int32_t(xv[j]);
+                    }
+                    acc = sycl::reduce_over_group(sg, acc, sycl::plus<int32_t>());
+                    const float v = (float(acc) * sxp[0]) * swp[c];
+                    const uint16_t bits = sycl::bit_cast<uint16_t>(sycl::ext::oneapi::bfloat16(v));
+                    rt = dp_rank_topk(bits, uint32_t(c));
+                    ra = dp_rank_argmax(bits, uint32_t(c));
+                }
+                if (lane == 0) { rk[sid] = rt; rk[DP_SEL + sid] = ra; }
+            }
+            sycl::group_barrier(grp);
+            // 2b. the work-group's top-8 (sorted) and best argmax rank, published for the last work-group
+            if (t == 0) {
+                uint64_t top8[DP_MAXN];
+                for (int j = 0; j < DP_MAXN; ++j) top8[j] = 0;
+                uint64_t ba = 0;
+                for (int j = 0; j < DP_SEL; ++j) {
+                    dp_insert(top8, rk[j]);
+                    ba = sycl::max(ba, rk[DP_SEL + j]);
+                }
+                for (int j = 0; j < DP_MAXN; ++j) global_ref<uint64_t>(prt[wg * DP_MAXN + j]).store(top8[j]);
+                global_ref<uint64_t>(pra[wg]).store(ba);
+                sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+                sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                 sycl::access::address_space::global_space> c(cnt[0]);
+                last[0] = c.fetch_add(1u) == DP_NW - 1;
+            }
+            sycl::group_barrier(grp);
+            if (!last[0]) return;
+            // 3. the last work-group: merge the 32 sorted lists (tree of pairwise merges), the argmax, outputs
+            sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+            if (t < DP_NW * DP_MAXN) lst[t] = global_ref<uint64_t>(prt[t]).load();
+            if (t < DP_NW) am[t] = global_ref<uint64_t>(pra[t]).load();
+            sycl::group_barrier(grp);
+            for (int n = DP_NW / 2; n >= 1; n /= 2) {
+                if (t < n) dp_merge(lst, t * DP_MAXN, (t + n) * DP_MAXN);
+                sycl::group_barrier(grp);
+            }
+            if (t == 0) {
+                uint64_t ba = 0;
+                for (int j = 0; j < DP_NW; ++j) ba = sycl::max(ba, am[j]);
+                int64_t out[DP_MAXN];
+                for (int j = 0; j < DP_MAXN; ++j) out[j] = dp_index_topk(lst[j]);
+                for (int j = 0; j < n_out; ++j) {
+                    if (tp) tp[j] = out[j];
+                    if (rp) rp[j] = out[j];
+                }
+                const int64_t tok = amf ? int64_t(0xFFFFFFFFu - uint32_t(ba)) : out[0];
+                kp[0] = tok;
+                vp[ch[0]] = tok;
+                for (int j = 1; j < nch; ++j) vp[ch[j]] = out[j];
+                cp[0] += 1;
+                global_ref<uint32_t>(cnt[0]).store(0u);
+            }
+        });
+    });
+}
+}  // namespace mono_decode_xpu

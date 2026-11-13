@@ -41,6 +41,7 @@ _lock = threading.Lock()
 _consts = {}
 _single_gdn = os.environ.get("MONO_DECODE_XPU_GDN1", "1") == "1"
 _attn_port = os.environ.get("MONO_DECODE_XPU_ATTN", "1") == "1"
+_attn_dpas = os.environ.get("MONO_DECODE_XPU_ATTN_DPAS", "1") == "1"
 _gdn_split = os.environ.get("MONO_DECODE_XPU_GDN_SPLIT", "1") == "1"
 _rope_fused = os.environ.get("MONO_DECODE_XPU_ROPE", "1") == "1"
 _rope_state = {"ok": None}  # fused rope + KV write: None until the one-time check against the live path
@@ -49,6 +50,7 @@ _rope_state = {"ok": None}  # fused rope + KV write: None until the one-time che
 def stats():
     with _lock:
         out = {"layer": _stats["layer"], "gdn1": _stats.get("gdn1", 0), "attn": _stats.get("attn", 0),
+               "attn_dpas": _stats.get("attn_dpas", 0),
                "rope": _stats.get("rope", 0), "norm_rope": _stats.get("norm_rope", 0),
                "fallback": dict(_stats["fallback"])}
     t = tiles.stats()
@@ -394,13 +396,19 @@ def _install_attend():
             else:
                 mask = None
             if mask is not None:
+                # DPAS attention split along the context, for the tree verify rows and the draft row (not
+                # bit-identical to Kitchen; see attn_dpas.sycl)
+                dpas = _attn_dpas and not guard.off("attn_dpas")
                 try:
-                    out = _C.attn_core(xq, self.key, self.value, self.seqlen, xk, xv, mask, 0)
+                    if dpas:
+                        out = _C.attn_dpas(xq, self.key, self.value, self.seqlen, xk, xv, mask, 0)
+                    else:
+                        out = _C.attn_core(xq, self.key, self.value, self.seqlen, xk, xv, mask, 0)
                 except Exception as e:  # reads the cache only: the original recomputes it
-                    guard.failed("attn", e)
+                    guard.failed("attn_dpas" if dpas else "attn", e)
                     return original(self, xq, xk, xv)
                 with _lock:
-                    _stats["attn"] = _stats.get("attn", 0) + 1
+                    _stats["attn_dpas" if dpas else "attn"] = _stats.get("attn_dpas" if dpas else "attn", 0) + 1
                 return out
         return original(self, xq, xk, xv)
 
@@ -474,12 +482,19 @@ def install():
     if os.environ.get("MONO_DECODE_XPU_LOGITS", "1") == "1":
         from . import logits
         logits.install()
+    # the device-side MTP loop replaces upstream's _generate_mtp body: installed first, so the autotree /
+    # draft wrappers (sampling without the wait, owned draft weights) still wrap it
+    from . import mtp_loop
+    mtp_loop.install()
     if os.environ.get("MONO_DECODE_XPU_AUTOTREE", "1") == "1":
         from . import autotree
         autotree.install()
     if os.environ.get("MONO_DECODE_XPU_DRAFT", "1") == "1":
         from . import draft
         draft.install()
+        if os.environ.get("MONO_DECODE_XPU_GRAPH_DRAFT", "1") == "1":  # needs the owned draft weights
+            from . import graph_draft
+            graph_draft.install()
     from comfy.text_encoders.llama import SPEC_ROWS
     from . import _C
 

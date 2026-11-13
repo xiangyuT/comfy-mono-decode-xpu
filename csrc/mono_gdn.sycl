@@ -7,9 +7,10 @@
 // with GDN = Kitchen's deferred conv / gates / sums / replay-verify delta (llm-scaler fd4a584
 // kitchen_deferred.cpp) and in_proj_a/b in oneDNN's small-M BF16 order.
 //
-//   P1  rows    xn = RMSNorm(x); q1 = rot_quant(xn)
-//   P2  all     proj | z = W4(q1) (stream engine);  last WG first: a, b = BF16 linear(xn)
-//   P3  all     deferred conv (one channel per thread) | gates
+//   P1  rows    xn = RMSNorm(x); q1 = rot_quant(xn);  idle sub-groups of the last 16 WGs: a, b = BF16 linear(xn)
+//               (DPAS partials, once the rows have published xn)
+//   P2  all     proj | z = W4(q1) (stream engine)
+//   P3  all     deferred conv (one channel x pair of tree slots per thread) | gates
 //   P4  all     q/k sum of squares
 //   P5  heads   replay + verify delta, gated RMSNorm -> core
 //   P6  rows    q1 = rot_quant(core)
@@ -34,7 +35,9 @@
 namespace mono_decode_xpu {
 namespace {
 using namespace mono;
-constexpr int SLOT = 8, DH = 128, RG = 4, RPG = DH / RG;
+constexpr int SLOT = 8, DH = 128, RG = 4, RPG = DH / RG, CW = 3;  // CW: conv state width (kernel size - 1)
+constexpr int NCTL = 2 + 3 * SLOT;  // ctl: pending, parity, accepted slots, tree parents, verify instructions
+static_assert(SLOT == 8, "the conv output store packs 8 BF16 values");
 constexpr int64_t PF_P1 = 192 << 10, PF_O = 320 << 10, PF_G = 320 << 10, PF_D = 192 << 10;
 
 W4 w4g(const torch::Tensor& q, const torch::Tensor& s, const torch::Tensor& sc, const torch::Tensor& cb) {
@@ -46,7 +49,8 @@ W4 w4g(const torch::Tensor& q, const torch::Tensor& s, const torch::Tensor& sc, 
 }
 
 struct GScratch {
-    torch::Tensor q1, q2, s, xn, proj, z, ab, core, x1, h, cnt, dbg;
+    torch::Tensor q1, q2, s, xn, proj, z, core, x1, h, cnt, dbg;
+    torch::Tensor abpart;  // a / b linear partials: [4 tiles x 16 K-partials][8 rows x 16 cols], FP32
 };
 GScratch& gscratch(const torch::Tensor& like) {
     static std::map<int, GScratch> cache;
@@ -57,12 +61,21 @@ GScratch& gscratch(const torch::Tensor& like) {
         auto bf = o.dtype(at::kBFloat16);
         GScratch sc{torch::zeros({8, MAXK}, o.dtype(at::kChar)), torch::zeros({8, MAXK}, o.dtype(at::kChar)),
                     torch::zeros({32}, o.dtype(at::kFloat)), torch::zeros({8, 4096}, bf), torch::zeros({8, 8192}, bf),
-                    torch::zeros({8, 4096}, bf), torch::zeros({2, 8, 32}, bf), torch::zeros({8, 4096}, bf),
-                    torch::zeros({8, 4096}, bf), torch::zeros({8, MAXK}, bf), torch::zeros({2}, o.dtype(at::kInt)),
-                    torch::zeros({64 * 16}, o.dtype(at::kLong))};
+                    torch::zeros({8, 4096}, bf), torch::zeros({8, 4096}, bf),
+                    torch::zeros({8, 4096}, bf), torch::zeros({8, MAXK}, bf), torch::zeros({4}, o.dtype(at::kInt)),
+                    torch::zeros({64 * 16}, o.dtype(at::kLong)), torch::zeros({64 * 128}, o.dtype(at::kFloat))};
         found = cache.emplace(dev, sc).first;
     }
     return found->second;
+}
+
+// a[i] for a small register array and a dynamic index (a select chain, no indirect register access)
+template <typename V, int N>
+inline V pick(const V (&a)[N], int i) {
+    V v = a[0];
+#pragma unroll
+    for (int k = 1; k < N; ++k) v = i == k ? a[k] : v;
+    return v;
 }
 
 template <bool POST> class LayerGdnKernel;
@@ -83,6 +96,7 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
     const W4 G = w4g(w4[12], w4[13], w4[14], w4[15]), U = w4g(w4[16], w4[17], w4[18], w4[19]), Dn = w4g(w4[20], w4[21], w4[22], w4[23]);
     const int HV = static_cast<int>(rec_state.size(1)), HK = static_cast<int>(hk), KD = HK * DH, C = static_cast<int>(QKV.n);
     const int W = static_cast<int>(conv_state.size(2));
+    TORCH_CHECK(W == CW, "conv kernel size 4");
     TORCH_CHECK(QKV.k == 4096 && Z.k == 4096 && Z.n == HV * DH && O.k == HV * DH && O.n == 4096 && C == 2 * KD + HV * DH, "GDN shapes");
     TORCH_CHECK(G.k == 4096 && U.n == G.n && Dn.k == G.n && Dn.n == 4096 && G.n <= MAXK && HV * DH == 4096, "MLP shapes");
     TORCH_CHECK(rec_state.scalar_type() == at::kFloat && rec_state.is_contiguous() && rec_state.size(2) == DH && rec_state.size(3) == DH, "state");
@@ -122,6 +136,7 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
     const float* dp = dt_bias.data_ptr<float>();
     const float* gdp = g_decay.data_ptr<float>();
     float* rs = rec_state.data_ptr<float>();
+    const int64_t RS_BYTES = rec_state.numel() * 4;
     float* gatesp = gates_buf.data_ptr<float>();
     float* sumsp = sums_buf.data_ptr<float>();
     const auto* gnw = reinterpret_cast<const T*>(gnorm_w.data_ptr());
@@ -131,7 +146,7 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
     auto* xnp = reinterpret_cast<T*>(S.xn.data_ptr());
     auto* projp = reinterpret_cast<T*>(S.proj.data_ptr());
     auto* zp = reinterpret_cast<T*>(S.z.data_ptr());
-    auto* abp = reinterpret_cast<T*>(S.ab.data_ptr());
+    auto* abg = S.abpart.data_ptr<float>();
     auto* corep = reinterpret_cast<T*>(S.core.data_ptr());
     auto* x1p = reinterpret_cast<T*>(S.x1.data_ptr());
     auto* hb = reinterpret_cast<T*>(S.h.data_ptr());
@@ -153,8 +168,11 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
         sycl::local_accessor<float, 1> nred(1056, cgh);
         sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
         sycl::local_accessor<float, 1> cbl(16, cgh);
-        sycl::local_accessor<float, 2> qk(sycl::range<2>(2, DH), cgh), dred(sycl::range<2>(RG, DH), cgh);
-        sycl::local_accessor<float, 1> square(DH, cgh);
+        // P5: double-buffered row-group partials of the delta rule's memory (k . S) and output (q . S)
+        sycl::local_accessor<float, 1> mbuf(2 * RG * DH, cgh), rbuf(2 * RG * DH, cgh);
+        sycl::local_accessor<float, 1> misc(128, cgh);  // P5: entry gates [0, 32), parity-p gates [32, 48),
+                                                        // parity-p sums [48, 64), output row sums [64, 72)
+        sycl::local_accessor<int, 1> cts(NCTL, cgh);  // ctl in SLM (read after the first grid_sync)
         cgh.parallel_for<LayerGdnKernel<POST>>(
             sycl::nd_range<1>(NW * MWG, MWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 auto sg = it.get_sub_group();
@@ -168,6 +186,21 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                 auto lacc = lptr(acc.template get_multi_ptr<sycl::access::decorated::no>().get());
                 auto lred = lptr(nred.template get_multi_ptr<sycl::access::decorated::no>().get());
                 if (t < 16) cbl[t] = QKV.cb[t];  // one codebook for every projection (host-checked)
+                if (t < NCTL) cts[t] = control[t];
+                // P1's cold operands do not survive the previous launch's weight stream in L2: the Hadamard
+                // matrix (128 KB, rot_quant's B, first read after the norm, ~3 us in) and the a / b weights
+                // (512 KB, read once xn is published): request them now
+                {
+                    namespace syclex = sycl::ext::oneapi::experimental;
+                    auto pf = [&](const void* base, int64_t bytes) {
+                        for (int64_t off = int64_t(gid) * 64; off < bytes; off += int64_t(NW) * MWG * 64)
+                            syclex::prefetch(const_cast<char*>(static_cast<const char*>(base)) + off,
+                                             syclex::properties{syclex::prefetch_hint_L2});
+                    };
+                    pf(hp, int64_t(GS) * GS * 2);
+                    pf(wap, int64_t(HV) * 4096 * 2);
+                    pf(wbp, int64_t(HV) * 4096 * 2);
+                }
                 const SlmCb cb{cbl, 0};
                 bool tab_ok = false;
                 auto table = [&]() {
@@ -185,12 +218,55 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                 if (t == 0) dbg[wg * 16] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
                 const int p = control[1], pending = control[0];
                 const bool ctl_ok = p >= 0 && p <= 1 && pending >= 0 && pending <= SLOT;
-                // ---- P1: xn = RMSNorm(x); q1 = rot_quant(xn) ----
+                // ---- P1: xn = RMSNorm(x); q1 = rot_quant(xn) | a, b = xn W_a^T, xn W_b^T ----
                 if (PF_ON && int(wg) >= R) prefetch_stream(it, SP, wg, NW, PF_P1);
                 for (int r = wg; r < R; r += NW) {
                     rms_norm_row(it, xp + r * 4096, nin, xnp + r * 4096, e_in, lred);
+                    // publish row r of xn to the a / b sub-groups (they run while the rows are rotated)
+                    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+                    sycl::group_barrier(it.get_group());
+                    if (t == 0)
+                        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                         sycl::access::address_space::global_space>(cnt[2]).fetch_add(1u);
                     rot_quant_row(it, xnp + r * 4096, hp, q1p + r * 4096, sp + r, 4096, xr, red);
                     tab_ok = false;
+                }
+                // a, b BF16 linear in oneDNN order: 4 tiles (a: 2, b: 2) x 16 partial accumulators; partial j sums
+                // the K32 chunks j, j + 16, ... in order (the final, sequential sum of the 16 partials is done per
+                // head at the start of P5). The 64 (tile, partial) units run on the last sub-groups of the last
+                // 16 work-groups (no rows there for R <= NW - 16) as soon as all R rows of xn are published,
+                // in the shadow of rot_quant (one work-group reading all 512 KB in P3 took ~10 us)
+                {
+                    const int nab = int(NW) < 16 ? int(NW) : 16, upw = (64 + nab - 1) / nab;  // work-groups, units each
+                    const int usg = sgi - (MWG / 16 - upw), unit = (int(NW) - 1 - int(wg)) * upw + usg;
+                    if (int(wg) >= int(NW) - nab && usg >= 0 && unit < 64) {
+                        if (lane == 0) {
+                            sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                             sycl::access::address_space::global_space> rows(cnt[2]);
+                            while (rows.fetch_add(0u) < uint32_t(R)) {  // RMW poll (see grid_sync)
+                            }
+                        }
+                        sycl::group_barrier(sg);
+                        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+                        const int tile = unit / 16, j = unit % 16;
+                        const T* w = (tile < 2 ? wap : wbp) + int64_t(tile & 1) * 16 * 4096;
+                        // 8 K32 chunks x 2 K16 steps, accumulated in order; the loads of 4 steps are in flight together
+                        jm::joint_matrix<sycl::sub_group, T, jm::use::a, 8, 16, jm::layout::row_major> a[4];
+                        jm::joint_matrix<sycl::sub_group, T, jm::use::b, 16, 16, jm::layout::col_major> b[4];
+                        jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> c;
+                        jm::joint_matrix_fill(sg, c, 0.f);
+                        for (int q = 0; q < 16; q += 4) {
+#pragma unroll
+                            for (int u = 0; u < 4; ++u) {
+                                const int k = (j + 16 * ((q + u) / 2)) * 32 + 16 * ((q + u) % 2);
+                                jm::joint_matrix_load(sg, a[u], gptr(xnp + k), 4096);
+                                jm::joint_matrix_load(sg, b[u], gptr(w + k), 4096);
+                            }
+#pragma unroll
+                            for (int u = 0; u < 4; ++u) jm::joint_matrix_mad(sg, c, a[u], b[u], c);
+                        }
+                        jm::joint_matrix_store(sg, c, gptr(abg + (tile * 16 + j) * 128), 16, jm::layout::row_major);
+                    }
                 }
                 grid_sync(it, cnt, NW, epoch);
                 if (t == 0) dbg[wg * 16 + 1] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
@@ -198,6 +274,32 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                 {
                     int64_t t0, t1;
                     gemv(SP, q1p, t0, t1);
+                    // P3 and P5 read cold per-layer data on latency-bound paths (the 2 MB recurrent state, conv
+                    // state and weights, the previous step's accepted projection rows and q / k / v, the gate
+                    // and norm parameters): requested into L2 once this work-group's GEMV share is done (one or two
+                    // lines per thread). Prefetches are not free: the issuing thread's next device-scope fence
+                    // waits for them, and halfway through the GEMV they cost the stream more than they saved.
+                    {
+                        namespace syclex = sycl::ext::oneapi::experimental;
+                        const int64_t g = int64_t(wg) * MWG + t, all = int64_t(NW) * MWG;
+                        auto pf = [&](const void* base, int64_t bytes) {
+                            for (int64_t off = g * 64; off < bytes; off += all * 64)
+                                syclex::prefetch(const_cast<char*>(static_cast<const char*>(base)) + off,
+                                                 syclex::properties{syclex::prefetch_hint_L2});
+                        };
+                        pf(rs, RS_BYTES);
+                        pf(cst, int64_t(C) * CW * 2);
+                        pf(cw, int64_t(C) * (CW + 1) * 2);
+                        pf(qb + int64_t(1 - p) * C * SLOT, int64_t(C) * SLOT * 2);
+                        if (ctl_ok)
+                            for (int r = pending > CW ? pending - CW : 0; r < pending; ++r)
+                                pf(pb + (int64_t(1 - p) * SLOT + cts[2 + r]) * C, int64_t(C) * 2);
+                        pf(gatesp + int64_t(1 - p) * SLOT * HV * 2, SLOT * HV * 2 * 4);
+                        pf(sumsp + int64_t(1 - p) * SLOT * HK * 2, SLOT * HK * 2 * 4);
+                        pf(dp, HV * 4);
+                        pf(gdp, HV * 4);
+                        pf(gnw, DH * 2);
+                    }
                     for (int64_t i = t; i < (t1 - t0) * 128; i += MWG) {
                         const int e2 = i % 128, r = e2 / 16;
                         if (r >= R) continue;
@@ -210,61 +312,68 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                 }
                 grid_sync(it, cnt, NW, epoch);
                 if (t == 0) dbg[wg * 16 + 2] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
-                // ---- P3: deferred conv (channel = gid) | a, b BF16 linear (last work-group) ----
-                if (ctl_ok && gid < C) {
-                    const int c = gid, n = pending;
-                    const int64_t current = int64_t(p) * SLOT * C, previous = int64_t(1 - p) * SLOT * C;
-                    T* history = cst + int64_t(c) * W;
-                    for (int r = 0; r < W; ++r) {
-                        const int accepted = n + r - W;
-                        const int slot = accepted >= 0 ? control[2 + accepted] : 0;
-                        history[r] = n + r < W ? history[n + r] : pb[previous + int64_t(slot) * C + c];
-                    }
-                    for (int ts = 0; ts < R; ++ts) {
-                        float sum = 0.f;
-                        int ancestor = ts, missing = 0;
-                        for (int distance = 0; distance <= W; ++distance) {
-                            if (distance) {
-                                ancestor = ancestor >= 0 ? control[2 + SLOT + ancestor] : -1;
-                                if (ancestor < 0) ++missing;
-                            }
-                            const float value = ancestor >= 0 ? float(projp[int64_t(ancestor) * C + c]) : float(history[W - missing]);
-                            sum = sycl::fma(value, float(cw[int64_t(c) * (W + 1) + W - distance]), sum);
+                // ---- P3: deferred conv ----
+                // conv, one (channel, pair of tree slots) per thread: the per-slot arithmetic (exp, IEEE division)
+                // of 8 slots on one thread was ~2.5 us of ALU; inputs are cold or just written, so they are all
+                // requested before use (ctl is in SLM); the arithmetic is the original's, in its order
+                if (ctl_ok) {
+                    const int64_t all = int64_t(NW) * MWG, current = int64_t(p) * SLOT * C, previous = int64_t(1 - p) * SLOT * C;
+                    for (int64_t i = gid; i < int64_t(C) * SLOT; i += all)  // this step's rows, zero beyond R
+                        pb[current + i] = i < int64_t(R) * C ? projp[i] : T(0.f);
+                    // a sub-group iterates as one (16 items = 4 channels x 4 slot pairs): the tp == 0 item of a
+                    // channel alone reads its conv state, hands it to the other three and writes it back
+                    static_assert(sizeof(T) == 2 && 16 % (SLOT / 2) == 0 && MWG % 16 == 0, "P3 sub-group layout");
+                    for (int64_t i0 = int64_t(gid) - lane; i0 < int64_t(C) * (SLOT / 2); i0 += all) {
+                        const int64_t i = i0 + lane;
+                        const bool valid = i < int64_t(C) * (SLOT / 2);
+                        const int c = valid ? int(i / (SLOT / 2)) : 0, tp = int(i % (SLOT / 2)), n = pending;
+                        T* history = cst + int64_t(c) * CW;
+                        T old[CW], hist[CW];
+                        float w[CW + 1];
+#pragma unroll
+                        for (int r = 0; r < CW; ++r) {
+                            const uint16_t mine = valid && tp == 0 ? sycl::bit_cast<uint16_t>(history[r]) : uint16_t(0);
+                            old[r] = sycl::bit_cast<T>(sycl::select_from_group(sg, mine, sycl::id<1>(size_t(lane - tp))));
                         }
-                        const float y = float(T(sum));
-                        qb[(int64_t(p) * C + c) * SLOT + ts] = T(y / (1.f + sycl::exp(-y)));
-                    }
-                    for (int ts = 0; ts < SLOT; ++ts) {
-                        pb[current + int64_t(ts) * C + c] = ts < R ? projp[int64_t(ts) * C + c] : T(0.f);
-                        if (ts >= R) qb[(int64_t(p) * C + c) * SLOT + ts] = T(0.f);
-                    }
-                }
-                if (wg == NW - 1) {  // a, b in oneDNN order (conv only occupies the first C / 1024 work-groups)
-                    // 4 tiles (a: 2, b: 2) x 16 partial accumulators = 64 sub-groups; partial j sums K32
-                    // chunks j, j + 16, ... in order; the 16 partials are then added sequentially
-                    auto part = lptr(reinterpret_cast<float*>(acc.template get_multi_ptr<sycl::access::decorated::no>().get()));
-                    const int tile = sgi / 16, j = sgi % 16;
-                    const T* w = (tile < 2 ? wap : wbp) + int64_t(tile & 1) * 16 * 4096;
-                    jm::joint_matrix<sycl::sub_group, T, jm::use::a, 8, 16, jm::layout::row_major> a;
-                    jm::joint_matrix<sycl::sub_group, T, jm::use::b, 16, 16, jm::layout::col_major> b;
-                    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> c;
-                    jm::joint_matrix_fill(sg, c, 0.f);
-                    for (int k = j * 32; k < 4096; k += 16 * 32)
+#pragma unroll
+                        for (int d = 0; d <= CW; ++d) w[d] = float(cw[int64_t(c) * (CW + 1) + d]);
+                        // the conv state shifted by the previous step's accepted tokens
+#pragma unroll
+                        for (int r = 0; r < CW; ++r) {
+                            const int accepted = n + r - CW;
+                            const int slot = accepted >= 0 ? cts[2 + accepted] : 0;
+                            hist[r] = n + r < CW ? pick(old, n + r) : pb[previous + int64_t(slot) * C + c];
+                        }
+                        uint32_t packed = 0;
+#pragma unroll
                         for (int h = 0; h < 2; ++h) {
-                            jm::joint_matrix_load(sg, a, gptr(xnp + k + 16 * h), 4096);
-                            jm::joint_matrix_load(sg, b, gptr(w + k + 16 * h), 4096);
-                            jm::joint_matrix_mad(sg, c, a, b, c);
+                            const int ts = 2 * tp + h;
+                            T out = T(0.f);
+                            if (ts < R) {
+                                int anc[CW + 1], missing[CW + 1];
+                                anc[0] = ts; missing[0] = 0;
+#pragma unroll
+                                for (int d = 1; d <= CW; ++d) {
+                                    anc[d] = anc[d - 1] >= 0 ? cts[2 + SLOT + anc[d - 1]] : -1;
+                                    missing[d] = missing[d - 1] + (anc[d] < 0);
+                                }
+                                T v[CW + 1];
+#pragma unroll
+                                for (int d = 0; d <= CW; ++d)
+                                    v[d] = anc[d] >= 0 ? projp[int64_t(anc[d]) * C + c] : pick(hist, CW - missing[d]);
+                                float sum = 0.f;
+#pragma unroll
+                                for (int d = 0; d <= CW; ++d) sum = sycl::fma(float(v[d]), w[CW - d], sum);
+                                const float y = float(T(sum));
+                                out = T(y / (1.f + sycl::exp(-y)));
+                            }
+                            packed |= uint32_t(sycl::bit_cast<uint16_t>(out)) << (16 * h);
                         }
-                    int e = 0;
-                    jm::joint_matrix_apply(sg, c, [&](float& v) { part[(tile * 16 + j) * 128 + e * 16 + lane] = v; ++e; });
-                    sycl::group_barrier(it.get_group());
-                    if (t < 4 * 128) {
-                        const int tl = t / 128, el = t % 128, r = el / 16, col = el % 16;
-                        float s = part[(tl * 16) * 128 + el];
-                        for (int q = 1; q < 16; ++q) s = s + part[(tl * 16 + q) * 128 + el];
-                        if (r < R) abp[(tl / 2) * 8 * 32 + r * 32 + (tl & 1) * 16 + col] = static_cast<T>(s);
+                        if (valid) *reinterpret_cast<uint32_t*>(qb + (int64_t(p) * C + c) * SLOT + 2 * tp) = packed;
+                        if (valid && tp == 0)
+#pragma unroll
+                            for (int r = 0; r < CW; ++r) history[r] = hist[r];
                     }
-                    sycl::group_barrier(it.get_group());
                 }
                 grid_sync(it, cnt, NW, epoch);
                 if (t == 0) dbg[wg * 16 + 3] = sycl::ext::oneapi::experimental::clock<sycl::ext::oneapi::experimental::clock_scope::sub_group>();
@@ -273,24 +382,82 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
 #ifndef GDN_NO_DELTA
                 for (int head = wg; head < HV && ctl_ok; head += NW) {
                     const int kh = head / (HV / HK);
+                    const bool act = t < RG * DH;
+                    const int col = t % DH, rg = (t / DH) % RG;
+                    const int64_t base = (int64_t(head) * DH + rg * RPG) * DH + col;
+                    float st[RPG];  // the recurrent state (64 KB per work-group)
+                    for (int r = 0; r < RPG; ++r) st[r] = act ? rs[base + r * DH] : 0.f;
+                    // the gated norm's inputs of output row (t / DH, col)
+                    const int ots = t / DH;
+                    const int64_t odst = (int64_t(ots) * HV + head) * DH + col;
+                    const float ozz = ots < R ? float(zp[odst]) : 0.f, ogw = float(gnw[col]);
+                    auto slm = lptr(reinterpret_cast<float*>(acc.template get_multi_ptr<sycl::access::decorated::no>().get()));
+                    auto vals = slm;                 // [q|k][ts][d], parity p (2 * SLOT * DH)
+                    auto kvec = slm + 2 * SLOT * DH;  // [entry][d]: k * ki (2 * SLOT * DH)
+                    auto qvec = slm + 4 * SLOT * DH;  // [verify entry][d]: (q * scale) * qi (SLOT * DH)
+                    auto vvec = slm + 5 * SLOT * DH;  // [entry][d]: v (2 * SLOT * DH)
+                    auto rawb = slm + 7 * SLOT * DH;  // [ts][d]: the delta rule's output rows (SLOT * DH)
+                    // the entry list: phase 0 replays the previous step's accepted slots (parity 1 - p, always
+                    // committed), phase 1 runs this step's verify instructions (parity p); an invalid slot ends
+                    // the list there (in phase 0 nothing is written then)
+                    int E0 = 0, E1 = 0;
+                    while (E0 < pending && cts[2 + E0] >= 0 && cts[2 + E0] < SLOT) ++E0;
+                    const bool replayed = E0 == pending;
+                    if (replayed)
+                        while (E1 < R && (cts[2 + 2 * SLOT + E1] & 15) < R && cts[2 + 2 * SLOT + E1] >= 0) ++E1;
+                    const int E = E0 + E1;
+                    auto slot_of = [&](int e) { return e < E0 ? cts[2 + e] : (cts[2 + 2 * SLOT + e - E0] & 15); };
+                    {
+#pragma clang fp reassociate(off) contract(off)
+                    // the replayed entries' inputs (previous step's buffers) do not depend on the prologue
+                    if (t < E0) {
+                        const int64_t gate = (int64_t(1 - p) * SLOT + slot_of(t)) * HV + head;
+                        misc[t * 2] = gatesp[gate * 2];
+                        misc[t * 2 + 1] = gatesp[gate * 2 + 1];
+                    }
+                    for (int i = t; i < E0 * DH; i += MWG) {
+                        const int e = i / DH, d = i % DH, ts = slot_of(e);
+                        const int64_t qbbase = int64_t(1 - p) * C * SLOT, ss = (int64_t(1 - p) * SLOT + ts) * HK + kh;
+                        const float ki = 1.f / sycl::fmax(sycl::sqrt(sumsp[ss * 2 + 1]), 1e-12f);
+                        kvec[i] = float(qb[qbbase + (KD + kh * DH + d) * SLOT + ts]) * ki;
+                        vvec[i] = float(qb[qbbase + (2 * KD + head * DH + d) * SLOT + ts]);
+                    }
+                    }
                     // prologue: this head's gates and its key head's q/k sums of squares for parity p
                     // (Kitchen gates / sums kernels; the two heads of a key head write identical sums)
-                    if (t < SLOT) {
-                        const int ts = t;
+                    // (gates on sub-group 32, sums on sub-group 0: the two chains run side by side)
+                    if (t >= MWG / 2 && t < MWG / 2 + SLOT) {
+                        const int ts = t - MWG / 2;
                         const int64_t dst = (int64_t(p) * SLOT + ts) * HV + head;
                         float decay = 0, beta = 0;
                         if (ts < R) {
-                            const float av = float(abp[ts * 32 + head]) + dp[head], bv = float(abp[8 * 32 + ts * 32 + head]);
+                            // a / b for this head: the 16 K-partials summed in order, rounded to T (all 32
+                            // partials are requested first: a load-add loop issued them one at a time, ~7 us)
+                            const int el = ts * 16 + head % 16;
+                            float part[2][16];
+#pragma unroll
+                            for (int which = 0; which < 2; ++which)
+#pragma unroll
+                                for (int q = 0; q < 16; ++q) part[which][q] = abg[((which * 2 + head / 16) * 16 + q) * 128 + el];
+                            const float dph = dp[head], gdh = gdp[head];
+                            auto ab = [&](int which) {
+                                float acc_ab = part[which][0];
+#pragma unroll
+                                for (int q = 1; q < 16; ++q) acc_ab = acc_ab + part[which][q];
+                                return float(static_cast<T>(acc_ab));
+                            };
+                            const float av = ab(0) + dph, bv = ab(1);
                             const float softplus = av > 20.f ? av : sycl::log(1.f + sycl::exp(av));
-                            decay = sycl::exp(gdp[head] * softplus);
+                            decay = sycl::exp(gdh * softplus);
                             beta = float(T(1.f / (1.f + sycl::exp(-bv))));
                         }
                         gatesp[dst * 2] = decay;
                         gatesp[dst * 2 + 1] = beta;
+                        misc[32 + ts * 2] = decay;
+                        misc[32 + ts * 2 + 1] = beta;
                     }
                     {
-                        auto vals = lptr(reinterpret_cast<float*>(acc.template get_multi_ptr<sycl::access::decorated::no>().get()));
-                        for (int i = t; i < 2 * SLOT * DH; i += MWG) {  // [q|k][ts][d]
+                        for (int i = t; i < 2 * SLOT * DH; i += MWG) {
                             const int which = i / (SLOT * DH), ts = (i / DH) % SLOT, d = i % DH;
                             const int64_t src = int64_t(p) * C * SLOT + (int64_t(which) * KD + kh * DH + d) * SLOT + ts;
                             vals[i] = ts < R ? float(qb[src]) : 0.f;
@@ -300,100 +467,147 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                             const int which = t / SLOT, ts = t % SLOT;
                             float acc2 = 0;
                             if (ts < R)
-                                for (int d = 0; d < DH; ++d) {
-                                    const float v = vals[(which * SLOT + ts) * DH + d];
-                                    acc2 = sycl::fma(v, v, acc2);
+#pragma unroll 8
+                                for (int d4 = 0; d4 < DH / 4; ++d4) {  // in order, four values per SLM load
+                                    sycl::vec<float, 4> v;
+                                    v.load(d4, vals + (which * SLOT + ts) * DH);
+                                    acc2 = sycl::fma(v[0], v[0], acc2);
+                                    acc2 = sycl::fma(v[1], v[1], acc2);
+                                    acc2 = sycl::fma(v[2], v[2], acc2);
+                                    acc2 = sycl::fma(v[3], v[3], acc2);
                                 }
                             sumsp[((int64_t(p) * SLOT + ts) * HK + kh) * 2 + which] = acc2;
+                            misc[48 + ts * 2 + which] = acc2;
                         }
                         sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group);
                         sycl::group_barrier(it.get_group());
                     }
                     {
 #pragma clang fp reassociate(off) contract(off)
-                    const bool act = t < RG * DH;
-                    const int col = t % DH, rg = (t / DH) % RG;
-                    const int64_t base = (int64_t(head) * DH + rg * RPG) * DH + col;
-                    float st[RPG];
-                    for (int r = 0; r < RPG; ++r) st[r] = act ? rs[base + r * DH] : 0.f;
-                    bool abort = false;
-                    for (int phase = 0; phase < 2 && !abort; ++phase) {
-                        const int parity = phase ? p : 1 - p, count = phase ? R : pending;
-                        for (int entry = 0; entry < count; ++entry) {
-                            const int instruction = phase ? control[2 + 2 * SLOT + entry] : 0;
-                            const int ts = phase ? (instruction & 15) : control[2 + entry];
-                            const bool commit = !phase || (instruction & 32);
-                            if (ts < 0 || ts >= SLOT || (phase && ts >= R)) { abort = true; break; }
-                            // the pre-entry state of a non-committing entry lives in SLM (the table region),
-                            // not in registers: 32 more live registers slowed every GEMV phase by ~10%
-                            if (act && !commit)
-                                for (int r = 0; r < RPG; ++r) xr[r * (RG * DH) + t] = st[r];
-                            const int64_t qbbase = int64_t(parity) * C * SLOT;
-                            const int64_t ss = (int64_t(parity) * SLOT + ts) * HK + kh;
-                            if (act && rg == 0) {
-                                const float qi = 1.f / sycl::fmax(sycl::sqrt(sumsp[ss * 2]), 1e-12f);
-                                const float ki = 1.f / sycl::fmax(sycl::sqrt(sumsp[ss * 2 + 1]), 1e-12f);
-                                qk[0][col] = phase ? (float(qb[qbbase + (kh * DH + col) * SLOT + ts]) * sc) * qi : 0.f;
-                                qk[1][col] = float(qb[qbbase + (KD + kh * DH + col) * SLOT + ts]) * ki;
-                            }
-                            sycl::group_barrier(it.get_group());
-                            const int64_t gate = (int64_t(parity) * SLOT + ts) * HV + head;
-                            const float decay = gatesp[gate * 2], beta = gatesp[gate * 2 + 1];
-                            float memory = 0;
-                            if (act)
-                                for (int r = 0; r < RPG; ++r) { st[r] = st[r] * decay; memory = sycl::fma(st[r], qk[1][rg * RPG + r], memory); }
-                            if (act) dred[rg][col] = memory;
-                            sycl::group_barrier(it.get_group());
-                            float result = 0;
-                            if (act) {
-                                const float kv = dred[0][col] + dred[1][col] + dred[2][col] + dred[3][col];
-                                const float value = float(qb[qbbase + (2 * KD + head * DH + col) * SLOT + ts]);
-                                const float delta = (value - kv) * beta;
-                                for (int r = 0; r < RPG; ++r) {
-                                    st[r] = sycl::fma(qk[1][rg * RPG + r], delta, st[r]);
-                                    if (phase) result = sycl::fma(st[r], qk[0][rg * RPG + r], result);
-                                }
-                            }
-                            sycl::group_barrier(it.get_group());
-                            if (phase) {
-                                if (act) dred[rg][col] = result;
-                                sycl::group_barrier(it.get_group());
-                                const float raw = act ? float(T(dred[0][col] + dred[1][col] + dred[2][col] + dred[3][col])) : 0.f;
-                                if (act && rg == 0) square[col] = raw * raw;
-                                sycl::group_barrier(it.get_group());
-                                // Kitchen's halving tree over 128 squares (strides 64 .. 1), done by sub-group 0:
-                                // lane j holds columns j + 16k, so strides 64/32/16 are lane-local and 8..1 shuffles
-                                if (sgi == 0) {
-                                    float v[8];
-#pragma unroll
-                                    for (int k = 0; k < 8; ++k) v[k] = square[lane + 16 * k];
-#pragma unroll
-                                    for (int k = 0; k < 4; ++k) v[k] = v[k] + v[k + 4];
-#pragma unroll
-                                    for (int k = 0; k < 2; ++k) v[k] = v[k] + v[k + 2];
-                                    float a = v[0] + v[1];
-                                    a = a + sycl::shift_group_left(sg, a, 8);
-                                    a = a + sycl::shift_group_left(sg, a, 4);
-                                    a = a + sycl::shift_group_left(sg, a, 2);
-                                    a = a + sycl::shift_group_left(sg, a, 1);
-                                    if (lane == 0) square[0] = a;
-                                }
-                                sycl::group_barrier(it.get_group());
-                                if (act && rg == 0) {
-                                    const int64_t dst = (int64_t(ts) * HV + head) * DH + col;
-                                    const float rsq = hw_rsqrt(square[0] / DH + epsilon);
-                                    const float rw = raw * float(gnw[col]);
-                                    const float normed = float(T(rw * rsq));
-                                    const float zz = float(zp[dst]), gate_z = float(T(zz / (1.f + sycl::exp(-zz))));
-                                    corep[dst] = T(normed * gate_z);
-                                }
-                            }
-                            if (act && !commit) for (int r = 0; r < RPG; ++r) st[r] = xr[r * (RG * DH) + t];
-                            sycl::group_barrier(it.get_group());
-                        }
-                        if (!abort && !phase && pending > 0 && act)
-                            for (int r = 0; r < RPG; ++r) rs[base + r * DH] = st[r];
+                    // the verify entries' inputs (one round trip instead of ~4 per entry)
+                    if (t >= E0 && t < E) {
+                        const int ts = slot_of(t);
+                        misc[t * 2] = misc[32 + ts * 2];
+                        misc[t * 2 + 1] = misc[32 + ts * 2 + 1];
                     }
+                    for (int i = E0 * DH + t; i < E * DH; i += MWG) {
+                        const int e = i / DH, d = i % DH, ts = slot_of(e);
+                        const float qi = 1.f / sycl::fmax(sycl::sqrt(misc[48 + ts * 2]), 1e-12f);
+                        const float ki = 1.f / sycl::fmax(sycl::sqrt(misc[48 + ts * 2 + 1]), 1e-12f);
+                        kvec[i] = vals[(SLOT + ts) * DH + d] * ki;
+                        qvec[(e - E0) * DH + d] = (vals[ts * DH + d] * sc) * qi;
+                        vvec[i] = float(qb[int64_t(p) * C * SLOT + (2 * KD + head * DH + d) * SLOT + ts]);
+                    }
+                    sycl::group_barrier(it.get_group());
+                    // the output row of verify entry e from its four row-group partials
+                    auto finish = [&](int e) {
+                        const int rb = (e & 1) * RG * DH + col;  // (accessor indexing keeps the loads in SLM)
+                        rawb[slot_of(e) * DH + col] = float(T(rbuf[rb] + rbuf[rb + DH] + rbuf[rb + 2 * DH] + rbuf[rb + 3 * DH]));
+                    };
+                    // entry e's inputs; entry e + 1's are requested before entry e's barrier
+                    static_assert(RPG == 32, "two 16-lane loads per row group");
+                    struct In { float k_lo, k_hi, q_lo, q_hi, decay, beta, value; bool commit; };
+                    auto inputs = [&](int e) {
+                        In in{};
+                        const bool verify = e >= E0;
+                        in.commit = !verify || (cts[2 + 2 * SLOT + e - E0] & 32);
+                        in.decay = misc[e * 2];
+                        in.beta = misc[e * 2 + 1];
+                        if (act) {
+                            // k[rg * RPG + r] / q[...] are uniform in a sub-group: lane-parallel loads, then broadcasts
+                            in.k_lo = kvec[e * DH + rg * RPG + lane];
+                            in.k_hi = kvec[e * DH + rg * RPG + 16 + lane];
+                            const int qrow = (verify ? e - E0 : 0) * DH + rg * RPG;
+                            in.q_lo = qvec[qrow + lane];
+                            in.q_hi = qvec[qrow + 16 + lane];
+                            in.value = vvec[e * DH + col];
+                        }
+                        return in;
+                    };
+                    In cur = E > 0 ? inputs(0) : In{};
+                    for (int e = 0; e < E; ++e) {
+                        const bool verify = e >= E0, commit = cur.commit;
+                        const float decay = cur.decay, beta = cur.beta;
+                        // a non-committing entry leaves the state as it is: its decayed / updated rows are
+                        // recomputed into temporaries (same operations; no SLM snapshot of 32 rows)
+                        float memory = 0;
+                        if (act && commit)
+#pragma unroll
+                            for (int r = 0; r < RPG; ++r) {
+                                st[r] = st[r] * decay;
+                                memory = sycl::fma(st[r], sycl::group_broadcast(sg, r < 16 ? cur.k_lo : cur.k_hi, r % 16), memory);
+                            }
+                        if (act && !commit)
+#pragma unroll
+                            for (int r = 0; r < RPG; ++r) {
+                                const float sd = st[r] * decay;
+                                memory = sycl::fma(sd, sycl::group_broadcast(sg, r < 16 ? cur.k_lo : cur.k_hi, r % 16), memory);
+                            }
+                        const int mb = (e & 1) * RG * DH + col;
+                        if (act) mbuf[mb + rg * DH] = memory;
+                        const In next = e + 1 < E ? inputs(e + 1) : In{};
+                        sycl::group_barrier(it.get_group());  // the only barrier per entry (buffers alternate)
+                        if (e > E0 && act && rg == 0) finish(e - 1);
+                        if (act) {
+                            const float kv = mbuf[mb] + mbuf[mb + DH] + mbuf[mb + 2 * DH] + mbuf[mb + 3 * DH];
+                            const float delta = (cur.value - kv) * beta;
+                            float result = 0;
+                            if (commit)
+#pragma unroll
+                                for (int r = 0; r < RPG; ++r) {
+                                    st[r] = sycl::fma(sycl::group_broadcast(sg, r < 16 ? cur.k_lo : cur.k_hi, r % 16), delta, st[r]);
+                                    if (verify) result = sycl::fma(st[r], sycl::group_broadcast(sg, r < 16 ? cur.q_lo : cur.q_hi, r % 16), result);
+                                }
+                            else  // (a verify entry)
+#pragma unroll
+                                for (int r = 0; r < RPG; ++r) {
+                                    const float sd = st[r] * decay;
+                                    const float u = sycl::fma(sycl::group_broadcast(sg, r < 16 ? cur.k_lo : cur.k_hi, r % 16), delta, sd);
+                                    result = sycl::fma(u, sycl::group_broadcast(sg, r < 16 ? cur.q_lo : cur.q_hi, r % 16), result);
+                                }
+                            if (verify) rbuf[(e & 1) * RG * DH + rg * DH + col] = result;
+                        }
+                        if (e == E0 - 1 && replayed && act)  // the committed state after the replay
+                            for (int r = 0; r < RPG; ++r) rs[base + r * DH] = st[r];
+                        cur = next;
+                    }
+                    sycl::group_barrier(it.get_group());
+                    if (E1 > 0 && act && rg == 0) finish(E - 1);
+                    // gated RMSNorm of every output row at once: thread (ts, col) = (t / DH, t % DH)
+                    uint32_t written = 0;
+                    for (int e = E0; e < E; ++e) written |= 1u << slot_of(e);
+                    sycl::group_barrier(it.get_group());
+                    const bool out = (written >> ots) & 1;
+                    const float raw = out ? rawb[ots * DH + col] : 0.f;
+                    auto square = vals;  // [ts][d]
+                    square[ots * DH + col] = raw * raw;
+                    sycl::group_barrier(it.get_group());
+                    // Kitchen's halving tree over 128 squares (strides 64 .. 1), sub-group ts for row ts:
+                    // lane j holds columns j + 16k, so strides 64/32/16 are lane-local and 8..1 shuffles
+                    if (sgi < SLOT && ((written >> sgi) & 1)) {
+                        float v[8];
+#pragma unroll
+                        for (int k = 0; k < 8; ++k) v[k] = square[sgi * DH + lane + 16 * k];
+#pragma unroll
+                        for (int k = 0; k < 4; ++k) v[k] = v[k] + v[k + 4];
+#pragma unroll
+                        for (int k = 0; k < 2; ++k) v[k] = v[k] + v[k + 2];
+                        float a = v[0] + v[1];
+                        a = a + sycl::shift_group_left(sg, a, 8);
+                        a = a + sycl::shift_group_left(sg, a, 4);
+                        a = a + sycl::shift_group_left(sg, a, 2);
+                        a = a + sycl::shift_group_left(sg, a, 1);
+                        if (lane == 0) misc[64 + sgi] = a;
+                    }
+                    sycl::group_barrier(it.get_group());
+                    if (out) {
+                        const float rsq = hw_rsqrt(misc[64 + ots] / DH + epsilon);
+                        const float rw = raw * ogw;
+                        const float normed = float(T(rw * rsq));
+                        const float gate_z = float(T(ozz / (1.f + sycl::exp(-ozz))));
+                        corep[odst] = T(normed * gate_z);
+                    }
+                    sycl::group_barrier(it.get_group());
                     }
                     tab_ok = false;
                 }
@@ -474,7 +688,9 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                 if (t == 0) {
                     sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
                                      sycl::access::address_space::global_space> done(cnt[1]), c0(cnt[0]);
-                    if (done.fetch_add(1u) == NW - 1) { c0.store(0u); done.store(0u); }
+                    sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                                     sycl::access::address_space::global_space> rows(cnt[2]);
+                    if (done.fetch_add(1u) == NW - 1) { c0.store(0u); rows.store(0u); done.store(0u); }
                 }
             });
     });
