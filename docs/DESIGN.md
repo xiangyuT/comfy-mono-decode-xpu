@@ -19,6 +19,7 @@ keeping every output bit unchanged.
 | file | what |
 |---|---|
 | `csrc/mono_common.hpp` | Shared device code for the persistent kernels: grid barrier (atomic RMW polling, ≤ 32 work-groups), stream GEMV engine, RMSNorm and ConvRot rotate/quantize ports. |
+| `csrc/mono_launch.hpp` | Shared host launch planning: resident work-group count, stream accumulator capacity and decode-attention chunk selection. |
 | `csrc/mono_gdn.sycl` | `layer_gdn`: input norm, quantize, in-projections, deferred causal conv, gates, gated delta rule, gated RMSNorm. `layer_gdn_core` returns the core rows. |
 | `csrc/mono_layer.sycl` | `layer_pre` (norm + quantize + input projections) and `layer_post` (sigmoid gate, out proj, residual, post norm, MLP, residual). |
 | `csrc/mono_mlp.sycl` | `mono_mlp`: one-launch MLP block, used outside the layer path. |
@@ -42,6 +43,11 @@ keeping every output bit unchanged.
 ### Persistent layer kernels
 
 - A layer is a sequence of phases separated by device-wide barriers inside one launch.
+- Launches use at most one work-group per Xe core. On physical B580 (`0xE20B`), fewer cores give
+  each work-group more projection tiles, so accumulator storage grows to the actual stream share.
+  Admission checks the complete fixed and accumulator SLM footprint against the device capacity.
+  Other devices keep the existing accumulator limit and scheduling. B580's largest attention pack
+  uses at most one chunk per Xe core; explicit chunk hints and smaller packs keep their existing routes.
 - The GDN layer's single fused kernel spilled 1–3 KB per thread at 128 GRF. It is split into a
   core-only kernel (0 spill) plus `layer_post`, which made it faster.
 - `layer_gdn` (the core kernel, P1–P5) keeps every operation of the replaced chain in order; what

@@ -29,6 +29,8 @@
 #include <sycl/sycl.hpp>
 #include <torch/extension.h>
 
+#include "mono_launch.hpp"
+
 namespace mono_decode_xpu {
 namespace {
 namespace jm = sycl::ext::oneapi::experimental::matrix;
@@ -207,13 +209,12 @@ torch::Tensor attn_dpas(torch::Tensor q, torch::Tensor key, torch::Tensor value,
     TORCH_CHECK(xk.sizes() == xv.sizes() && xk.size(1) == HK && xk.size(2) == S && xk.size(3) == HD, "xk / xv [1, Hk, S, 256]");
     const int groups = H / HK, rows = groups * S, nmt = (rows + 7) / 8;
     TORCH_CHECK(nmt <= 4, "at most 32 query rows per kv head");
-    // about 32-48 chunks balance the partial kernel's parallelism against the merge's reads (B70)
-    const int chunks = chunks_hint > 0 ? int(chunks_hint) : std::max(1, std::min(48, (cap + 255) / 256));
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    const int chunks = mono::attention_chunks(queue, q, HK, nmt, cap, chunks_hint);
     auto opts = q.options();
     auto part = torch::empty({HK, chunks, nmt * 8, HD}, opts.dtype(at::kFloat));
     auto ml = torch::empty({HK, chunks, nmt * 8, 2}, opts.dtype(at::kFloat));
     auto out = torch::empty({1, S, H * HD}, opts);
-    auto& queue = c10::xpu::getCurrentXPUStream().queue();
     const V4 Q = v4(q), XK = v4(xk), XV = v4(xv);
     const bf16* Kc = reinterpret_cast<const bf16*>(key.data_ptr());
     const bf16* Vc = reinterpret_cast<const bf16*>(value.data_ptr());
