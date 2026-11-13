@@ -24,7 +24,7 @@ import time
 
 import torch
 
-from . import guard, tiles
+from . import draft_lmhead, guard, tiles
 
 CLAIM = "__comfy_mono_decode_xpu_mtp_loop__"
 MODE = os.environ.get("MONO_DECODE_XPU_DEVICE_MTP", "1")
@@ -38,7 +38,8 @@ def in_async_loop():
     return getattr(_tls, "async_loop", False) and not GRAPH_IN_LOOP
 RING = 8
 _lock = threading.Lock()
-_stats = {"generates": 0, "steps": 0, "fallback": {}, "shadow_mismatch": 0, "shadow_checked": 0, "host_rows": 0}
+_stats = {"generates": 0, "steps": 0, "fallback": {}, "shadow_mismatch": 0, "shadow_checked": 0, "host_rows": 0,
+          "draft_int4": 0, "draft_int4_checked": 0, "draft_int4_mismatch": 0, "draft_int4_generates": 0}
 
 
 def stats():
@@ -215,6 +216,9 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
         progress.update(n)
         console.update(n)
 
+    # experimental two-stage draft lm_head (MONO_DECODE_XPU_DRAFT_INT4): None unless enabled and eligible
+    lm2 = draft_lmhead.DraftLMHead.create(_C, head, device) if draft_lmhead.enabled() else None
+    lm2_on = lm2 is not None and draft_lmhead.MODE == "1"
     adaptive = mtp is True
     widths = (4, 3)
     hits = [[0.0] * 8 for _ in range(7)]
@@ -291,6 +295,13 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
             draft_emb.copy_(embed_rows(draft_token))
             n1, r1 = self.mtp(draft_emb, draft_hidden, draft_freqs, mtp_kv)
             draft_hidden.copy_(r1)
+            children = tree.children[k]
+            nout = 7 if adaptive else max(tree.fanout, 1)
+            top = draft_top if adaptive or tree.fanout > 1 else None
+            if lm2_on:  # the draft's top-n, rank row, token and children's verify tokens in one pick
+                lm2.pick(n1, nout, not adaptive, top, draft_ranks[k] if adaptive else None, draft_token,
+                         verify_tokens, children)
+                continue
             logits = self.logits(n1)[:, -1]
             if adaptive:
                 draft_top.copy_(logits.topk(7, dim=-1).indices)
@@ -300,10 +311,11 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
                 draft_token.copy_(logits.argmax(dim=-1, keepdim=True))
                 if tree.fanout > 1:
                     draft_top.copy_(logits.topk(tree.fanout, dim=-1).indices)
-            children = tree.children[k]
             verify_tokens[:, children[0]:children[0] + 1].copy_(draft_token)
             for j, c in enumerate(children[1:], 1):
                 verify_tokens[:, c:c + 1].copy_(draft_top[:, j:j + 1])
+            if lm2 is not None:  # check mode: the two-stage result against the int8 one
+                lm2.check(n1, nout, not adaptive, top, draft_token, verify_tokens, children)
         if ev:
             ev[1].record()
         parity ^= 1
@@ -411,4 +423,11 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
         torch.xpu.synchronize(device)  # queued steps still read the caches and graphs freed after this
         for kv in pkv + [mtp_kv]:
             kv._mono_device = False
+        if lm2 is not None:
+            calls, bad, checked = lm2.counters()
+            with _lock:
+                _stats["draft_int4_generates"] += 1
+                _stats["draft_int4"] += calls - checked
+                _stats["draft_int4_checked"] += checked
+                _stats["draft_int4_mismatch"] += bad
     return ids

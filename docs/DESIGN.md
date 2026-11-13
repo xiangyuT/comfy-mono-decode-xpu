@@ -112,6 +112,31 @@ keeping every output bit unchanged.
   `masked_fill_` (same values, no wait). Removing the wait while keeping host clocks made `auto`
   settle on one draft per step and lowered throughput, so the two are installed together.
 
+#### Two-stage draft lm_head (experimental, `MONO_DECODE_XPU_DRAFT_INT4=1`)
+
+A draft's lm_head reads the whole int8 head (248320 x 4096, 1.02 GB, 1.70 ms at 599 GB/s) to pick 7
+tokens: with about 2.5 drafts per step it was a fifth of the step. `draft_lmhead.py` splits it:
+
+1. **Score.** An int4 copy (groups of 128 along K, symmetric, the int8 row scale folded into the
+   bf16 group scales; built per generate from the int8 weights) through torch XPU's oneDNN
+   weight-only int4 GEMM on the same rotated activation: 0.89 ms, 598 GB/s.
+2. **Pick** (`draft_pick`, one launch). Work-group w owns rows [8192 w, 8192 (w + 1)); thread t keeps
+   the 2 best scores of rows t + 1024 j, so neighbouring ids (digits and punctuation are often
+   several of the top 7) land on different threads; the work-group keeps its 32 best by a 16-ary
+   search on the bf16 order key (4 steps of 15 thresholds, sub-group counts). The 1024 candidates get
+   their exact int8 logit the way the decode path computes it (int32 dot of the rowwise-quantized
+   activation and the int8 row, `(acc * x_scale) * w_scale` in fp32, bf16); `fast_topk`'s ranks give
+   each work-group's top-8 in torch topk's tie order and its argmax, and the last work-group merges
+   the 32 lists. The kernel also writes the draft token, the auto-tree rank row and the tree
+   children's verify tokens, which replaces the copies after `topk`. About 22 us (a binary search
+   with 16 work-group sums plus 8 work-group max reductions in the last work-group took 39 us).
+
+The result equals the int8 draft whenever the exact top-7 (with ties) lies among the candidates,
+which include the global int4 top-32 unless three of those share a thread. Measured: on 8636 real
+draft hiddens the exact top-7 with ties always lay within the int4 top-32 (groups of 32, 64 or 128);
+`check` mode found 0 mismatches over 8432 drafts. A first version gave each thread 8 consecutive rows
+and missed 6% of drafts, because the top-7 often holds adjacent token ids.
+
 ### DynamicVRAM
 
 - Each call takes the linear's GPU weight from `comfy.ops.CastBiasWeightContext`, the same VBAR

@@ -47,6 +47,7 @@ These all default to `1`. Set `0` to fall back to the stock code for that part o
 | `MONO_DECODE_XPU_DEVICE_MTP_GRAPH` | `1` replays the draft head graph inside the asynchronous device loop too (default off: the loop already hides the host time, no gain measured). |
 | `MONO_DECODE_XPU_GRAPH_DRAFT_WARMUP` | Eager drafts per generate before the draft head is captured (default `4`). |
 | `MONO_DECODE_XPU_GRAPH_DRAFT_CHECK` | Validation: rerun every replayed draft eagerly and count bitwise mismatches in `.graph_draft.stats()`. Slow. |
+| `MONO_DECODE_XPU_DRAFT_INT4` | Experimental, default `0`. `1`: inside the device MTP loop, a draft's lm_head scores the vocabulary with an int4 copy of the int8 head (oneDNN weight-only GEMM, about 0.55 GB extra per generate when free memory allows) and recomputes the exact int8 logits of about 1000 candidates (`draft_pick`), so its top-7 / argmax equal the int8 draft's whenever the exact top-7 lies among the candidates. Only drafts change; the verify, its sampling and so the output distribution do not. `check`: both paths run, the int8 one drives the loop and mismatches are counted in `.mtp_loop.stats()` (`draft_int4_mismatch`). |
 
 ## Checking what ran
 

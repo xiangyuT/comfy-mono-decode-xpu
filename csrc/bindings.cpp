@@ -53,6 +53,9 @@ void mtp_accept(torch::Tensor st, torch::Tensor toks, torch::Tensor vtok, torch:
                 int64_t rows, int64_t depth, torch::Tensor x, torch::Tensor nt_buf, torch::Tensor h_buf,
                 torch::Tensor ctl, torch::Tensor kv_ptrs, int64_t kv_heads, int64_t kv_cap, int64_t head_dim,
                 torch::Tensor result);
+void draft_pick(torch::Tensor approx, torch::Tensor qx, torch::Tensor sx, torch::Tensor w, torch::Tensor sw,
+                int64_t nout, bool argmax_first, torch::Tensor top, torch::Tensor ranks_row, torch::Tensor token,
+                torch::Tensor vtok, std::vector<int64_t> children, torch::Tensor calls);
 }  // namespace mono_decode_xpu
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -70,6 +73,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mtp_prep_draft", &mono_decode_xpu::mtp_prep_draft);
     m.def("mtp_prep_verify", &mono_decode_xpu::mtp_prep_verify);
     m.def("mtp_accept", &mono_decode_xpu::mtp_accept);
+    m.def("draft_pick", &mono_decode_xpu::draft_pick);
     m.def("fast_topk", &mono_decode_xpu::fast_topk);
     m.def("fast_pick", &mono_decode_xpu::fast_pick);
     m.def("rope_kv", &mono_decode_xpu::rope_kv);
