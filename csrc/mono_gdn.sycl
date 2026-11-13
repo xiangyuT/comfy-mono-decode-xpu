@@ -30,13 +30,14 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/extension.h>
 
-#include "mono_common.hpp"
+#include "mono_launch.hpp"
 
 namespace mono_decode_xpu {
 namespace {
 using namespace mono;
 constexpr int SLOT = 8, DH = 128, RG = 4, RPG = DH / RG, CW = 3;  // CW: conv state width (kernel size - 1)
 constexpr int NCTL = 2 + 3 * SLOT;  // ctl: pending, parity, accepted slots, tree parents, verify instructions
+constexpr int MISC_SLM = 128;
 static_assert(SLOT == 8, "the conv output store packs 8 BF16 values");
 constexpr int64_t PF_P1 = 192 << 10, PF_O = 320 << 10, PF_G = 320 << 10, PF_D = 192 << 10;
 
@@ -107,20 +108,14 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
     TORCH_CHECK(ctl.scalar_type() == at::kInt && ctl.numel() == 2 + 3 * SLOT, "ctl");
     auto& S = gscratch(x);
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
-    int64_t cores = queue.get_device().get_info<sycl::info::device::max_compute_units>() / 8;
-    if (nwg <= 0 || nwg > cores) nwg = cores;
-    const uint32_t NW = static_cast<uint32_t>(nwg);
+    const uint32_t NW = resident_wgs(queue, nwg);
     TORCH_CHECK(NW * MWG >= uint32_t(C + SLOT * HV), "conv threads");
     const W4 pre[2] = {QKV, Z}, gu[2] = {G, U};
     Stream SP = make_stream(pre, 2, false), SO = make_stream(&O, 1, false), SG = make_stream(gu, 2, true), SD = make_stream(&Dn, 1, false);
-    stream_finalize(SG, NW);
-    for (Stream* st : {&SP, &SO, &SG, &SD}) {
-        st->tiled = tiled;
-        int64_t a0, a1;
-        stream_range(*st, 0, NW, a0, a1);
-        TORCH_CHECK((a1 - a0) * 128 <= ACC, "SLM accumulators");
-        st->ksplit = choose_ksplit(a1 - a0, st->m[0].k);
-    }
+    for (Stream* st : {&SP, &SO, &SG, &SD}) st->tiled = tiled;
+    const size_t fixed_slm = STREAM_SLM + NORM_SLM
+        + (4 * RG * DH + MISC_SLM) * sizeof(float) + NCTL * sizeof(int);
+    const int64_t accumulator_elements = plan_streams(queue, x, NW, {&SP, &SO, &SG, &SD}, fixed_slm);
     auto* xp = reinterpret_cast<T*>(x.data_ptr());
     const auto* nin = reinterpret_cast<const T*>(norm_in.data_ptr());
     const auto* npost = reinterpret_cast<const T*>(norm_post.data_ptr());
@@ -166,11 +161,11 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
         sycl::local_accessor<uint32_t, 1> region(TAB / 2, cgh);
         sycl::local_accessor<float, 1> red(MSG, cgh);
         sycl::local_accessor<float, 1> nred(1056, cgh);
-        sycl::local_accessor<int32_t, 1> acc(ACC, cgh);
+        sycl::local_accessor<int32_t, 1> acc(accumulator_elements, cgh);
         sycl::local_accessor<float, 1> cbl(16, cgh);
         // P5: double-buffered row-group partials of the delta rule's memory (k . S) and output (q . S)
         sycl::local_accessor<float, 1> mbuf(2 * RG * DH, cgh), rbuf(2 * RG * DH, cgh);
-        sycl::local_accessor<float, 1> misc(128, cgh);  // P5: entry gates [0, 32), parity-p gates [32, 48),
+        sycl::local_accessor<float, 1> misc(MISC_SLM, cgh);  // P5: entry gates [0, 32), parity-p gates [32, 48),
                                                         // parity-p sums [48, 64), output row sums [64, 72)
         sycl::local_accessor<int, 1> cts(NCTL, cgh);  // ctl in SLM (read after the first grid_sync)
         cgh.parallel_for<LayerGdnKernel<POST>>(
