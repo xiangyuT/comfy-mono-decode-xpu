@@ -315,10 +315,11 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
 
     def verify_sample(lg):
         s = sampling
-        rows = lg[0] if s is None else lg[0].float()
         if s is None:
-            return rows.argmax(dim=-1).unsqueeze(0)
-        with _sampling.topk_mode(_C):  # upstream's sampling; its top-k filter served exactly by topk_rows
+            return lg[0].argmax(dim=-1).unsqueeze(0)
+        # upstream's sampling on lg[0].float(); its top-k filter served exactly by topk_rows
+        ctx, rows = _sampling.verify_rows(_C, lg[0])
+        with ctx:
             out = self.sample_token(rows, s["temperature"], s["top_k"], s["top_p"], s["min_p"], 1.0, [], generator)
         return out.transpose(0, 1)
 

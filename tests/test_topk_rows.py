@@ -35,3 +35,28 @@ def test_topk_rows_matches_torch(C, kind, R, k):
     v, i = C.topk_rows(x, k)
     assert torch.equal(i, want_i)
     assert torch.equal(v.view(torch.int32), want_v.view(torch.int32))
+    if kind not in ("few", "nan"):  # BF16-valued rows: the BF16 input gives torch.topk of its FP32 values
+        xb = x.bfloat16()           # (NaN rows are not reproduced: torch's own top-k there depends on its gather)
+        want_v, want_i = torch.topk(xb.float(), k)
+        v, i = C.topk_rows(xb, k)
+        assert torch.equal(i, want_i) and torch.equal(v.view(torch.int32), want_v.view(torch.int32))
+
+
+@pytest.mark.parametrize("T,top_k,top_p,min_p", [(1.0, 20, 0.95, 0.0), (0.7, 64, 0.95, 0.05), (1.0, 0, 0.9, 0.0),
+                                                 (1.0, 64, 1.0, 0.1), (0.5, 7, 0.8, 0.0)])
+def test_verify_rows_sampling_matches_upstream(C, T, top_k, top_p, min_p):
+    """ComfyUI's sample_token on the lazily served BF16 rows (sampling.verify_rows) against the FP32 rows
+    without the mode: the same tokens from the same generator."""
+    llama = pytest.importorskip("comfy.text_encoders.llama")
+    from comfy_mono_decode_xpu import sampling
+    g0 = torch.Generator().manual_seed(7)
+    lg = (torch.randn(8, N, generator=g0) * 4).bfloat16().to("xpu")
+    gen = object.__new__(llama.BaseGenerate)
+    for seed in range(3):
+        ref = llama.BaseGenerate.sample_token(gen, lg.float(), T, top_k, top_p, min_p, 1.0, [],
+                                              torch.Generator(device="xpu").manual_seed(seed))
+        ctx, rows = sampling.verify_rows(C, lg)
+        with ctx:
+            out = llama.BaseGenerate.sample_token(gen, rows, T, top_k, top_p, min_p, 1.0, [],
+                                                  torch.Generator(device="xpu").manual_seed(seed))
+        assert torch.equal(out, ref)

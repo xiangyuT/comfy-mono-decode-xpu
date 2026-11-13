@@ -164,16 +164,30 @@ tools) are marked `_mono_observer`; a head that bypasses forward calls their `_m
 `processed_probs` starts with `torch.topk(logits.float(), top_k)` over the verify rows (8 x 248320):
 270 us of torch XPU's sbtopk gather plus a segmented sort per step. Inside the device loop's verify
 sampling a `TorchFunctionMode` serves that call with `topk_rows`, which returns the same values and
-indices in torch's order: radix key descending (NaN on top, -0 below +0), ties in gather order
-(iteration i / 32768, then thread (i % 4096) / 4, then load (i % 32768) / 4096, then lane i % 4),
-established on 40 random tie-heavy, +-0 and NaN trials and checked bit for bit in the unit tests and
-on 3171 real calls (`check` mode). One work-group per row: each thread's largest key, a 16-ary search
-over their top 16 bits gives a threshold with at least k elements above it, a second pass collects
-those (usually k plus a few) and ranks them by the 64-bit (key, gather) rank; heavy ties at the
-threshold fall back to an exact 64-bit search (slow, correct). 48 us. A first version with 16
-work-groups per row and a 64-bit search in each took 603 us (48 barriers, 4 waves of work-groups).
-Everything else in the sampling is upstream's (temperature, min-p, top-p, softmax, multinomial).
-The tail of a step goes from 2.16 to 1.95 ms.
+indices in torch's order: the radix key (the sign-flipped bits: -0 below +0) descending, ties in
+gather order (iteration i / 32768, then thread (i % 4096) / 4, then load (i % 32768) / 4096, then lane
+i % 4), established on 40 random tie-heavy and +-0 trials and checked bit for bit in the unit tests and
+on 3171 real calls (`check` mode). Rows with NaN are not reproduced: torch's radix key has no NaN case
+(+NaN sorts on top, -NaN at the bottom), yet its gather lets a -NaN join a small top-k at the end.
+
+`topk_rows`: four work-groups per row, each owning a quarter. Each thread reads 16-byte chunks and keeps
+its largest key; a 16-ary search over the top 16 bits of the 1024 maxima gives a threshold with at least
+k elements of the quarter above it; a second pass collects those (usually k plus a few) and ranks them
+by the 64-bit (key, gather) rank (heavy ties at the threshold fall back to an exact 64-bit search). The
+row's last work-group merges the four sorted lists: an entry's rank is its own position plus a binary
+search in each other list. 14 us (from the BF16 logits), 20 us in place. On the way: one work-group per
+row took 48 us; a 64-bit search in each of 16 work-groups per row 603 us (48 barriers, 4 waves); a
+merge that compared every entry with all 256 others 14 us of 27 (a sequential local-memory loop).
+
+The sampling is handed the BF16 logits standing for their FP32 copy (`sampling.verify_rows`): topk_rows
+reads them directly, shape queries pass through, the dtype reads FP32, and any other op runs on the
+FP32 copy made then. With temperature 1 and top_k > 0 upstream only takes the shape and the top-k, so
+the 24 us `.float()` copy is gone. top-p then sorts the top-k values: they are sorted already and torch
+XPU's sort is stable (300 of 300 checks, tie-heavy rows included, give the values and an arange), so for
+the values `topk_rows` returned in this mode (a min-p mask only lowers their tail) the sort returns a
+copy and a cached arange instead of a 10 us radix sort. Everything else in the sampling is upstream's;
+the sampled tokens equal upstream's from the same generator in the unit tests (temperature 1 / 0.7 / 0.5,
+top_k 0 / 7 / 20 / 64, top-p, min-p). The tail of a step goes from 2.16 to about 1.85 ms.
 
 ### DynamicVRAM
 
@@ -293,12 +307,17 @@ inputs (`tests/`). What it took:
 
 ## Not done / ideas
 
-- Draft head after the fused head (B70, device loop, per draft): the oneDNN BF16 GEMMs run at about
-  490-585 GB/s (fc 130 us for 64 MB is the slowest); the 12 small launches take about 0.15 ms with
-  their gaps. A persistent draft kernel with its own GEMV could take most of both.
-- Verify sampling after topk_rows: about 20 small torch ops (min-p / top-p / softmax / multinomial on
-  8 x k) and the 24 us `.float()` copy of the logits remain; `topk_rows` itself (48 us, one
-  work-group per row) could split each row over several work-groups.
+- Closed after measuring (2026-11-13):
+  - A BF16 GEMV of our own for the draft head's projections: oneDNN already streams them at 580-597
+    GB/s on cold weights (fc 116 us, q|k|v 143, o 59, gate|up 337, down 173); five tilings of a
+    sub-group-per-rows GEMV were 1-15% slower, also with SwiGLU folded into gate|up. In the head, fc
+    takes 130 us: the ramp after the one-work-group embedding kernel.
+  - A persistent draft kernel: it would need a GEMV at oneDNN's speed; what it could save beyond that is
+    the 12 small launches' gaps (about 40 us per draft) and their one-work-group latency.
+  - The rest of the verify sampling (softmax, cumsum, the top-p masks, multinomial: about 70 us per step
+    with gaps): fusing it while keeping the sampled tokens means reproducing torch XPU's softmax and scan
+    reduction orders and the Philox stream behind multinomial's exponential sampling bit for bit; the
+    gain is about 0.3% of a step.
 
 - Tried without gain (2026-11-12): attention register prefetch of the next tile (exact, 12% slower);
   32-row attention packs (slower at short contexts); skipping `layer_post`'s pair-table rebuilds (no
