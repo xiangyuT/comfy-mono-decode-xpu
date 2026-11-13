@@ -80,6 +80,8 @@ keeping every output bit unchanged.
   - Max-subtracted exponentials use `sycl::native::exp`; FP32 accumulation and partials, BF16
     probability rounding and the FP64/Kitchen error bound remain the attention contract.
     Full and padded query packs compile separately; unused padded rows skip online-softmax work.
+    Full query packs run regular cache tiles in a loop without the cache-tail staging branch;
+    a final partial capacity tile is staged separately. Padded packs keep their original loop.
   - A second kernel merges the active chunks' (m, l, O) in FP32 with the tree rows each row admits.
   - Accuracy: P is rounded to BF16 for P V; the tests bound both maximum and mean error against
     an FP64 oracle relative to Kitchen on the same inputs, rather than assuming a fixed absolute error.

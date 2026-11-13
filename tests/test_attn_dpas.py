@@ -52,6 +52,11 @@ def _kitchen(q, k, v, sl, xk, xv, mask_t):
     (4001, 8193, [-1, 0, 0, 1]),
     (8001, 8193, [-1, 0, 0, 1, 1, 2]),
     (8191, 8193, [-1, 0, 0, 1, 1, 2, 2]),
+    # Full query packs: staged cache-capacity tail, including tail-only contexts.
+    (17, 17, [-1, 0]),
+    (15, 15, [-1, 0, 0, 1]),
+    (31, 31, [-1, 0, 0, 1, 1, 2]),
+    (8193, 8193, [-1, 0, 1, 2, 3, 4, 5, 6]),
 ])
 def test_attn_dpas_error_within_kitchen(C, L, cap, parents):
     pytest.importorskip("omni_xpu_kernel")
