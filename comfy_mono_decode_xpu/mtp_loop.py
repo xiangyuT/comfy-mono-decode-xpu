@@ -8,7 +8,8 @@ starts on an idle device after the host has done all of that. Here the walk, the
 the KV slot moves and the next token / hidden row are computed by small device kernels
 (csrc/mtp_loop.sycl), and the host reads each step's committed tokens one step late from a pinned ring,
 after it has already queued the next step. Drafts, the verify forward, lm_head and sampling are
-upstream's calls, so the tokens are the ones upstream's loop would produce from the same values.
+upstream's calls, so the tokens are the ones upstream's loop would produce from the same values
+(the experimental MONO_DECODE_XPU_DRAFT_INT4 replaces only the drafts' lm_head pick: draft_lmhead.py).
 
 Modes (MONO_DECODE_XPU_DEVICE_MTP): "1" asynchronous (default), "sync" one sync per step, "shadow" one
 sync per step plus upstream's host walk on the same values, compared field by field. Anything outside

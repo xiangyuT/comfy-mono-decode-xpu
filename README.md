@@ -28,7 +28,7 @@ Validated on Arc Pro B70:
 | official template | ComfyUI | validation |
 |---|---|---|
 | MOSS Image (`image_moss_image_t2i`) | v0.43 | performance and output, see Results |
-| MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | functional: the default workflow completes in DynamicVRAM, prefetch and ordinary-memory modes |
+| MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | functional: the default workflow completes in DynamicVRAM, prefetch and ordinary-memory modes; prompt-enhance decode about 136–140 tok/s (sampling, auto MTP, 4 seeds; `MONO_DECODE_XPU=0`: 24–28 tok/s) |
 
 ## Results
 
@@ -288,6 +288,11 @@ MTP head. Per verify layer:
   `attn_dpas` (DPAS tree attention split along the context, then a merge), then `layer_post`.
 - **MTP draft:** the BF16 draft block's attention uses `rope_kv` and `attn_dpas`. Top-k and
   argmax over the 248k-vocab logits run in one launch with torch's exact tie order.
+- **MTP loop:** the per-step bookkeeping (accept walk, cache counters, KV slot moves, next token)
+  runs on the device and the host reads each step's tokens one step late, so steps follow each other
+  without a host sync. Experimental and off by default: `MONO_DECODE_XPU_DRAFT_INT4=1` scores a draft's
+  vocabulary with an int4 copy of the lm_head and recomputes the best candidates exactly in int8
+  (only drafts change; see [docs/ENV.md](docs/ENV.md)).
 
 The persistent kernels stream W4 weights through a GEMV engine with device-wide grid barriers. The
 engine uses an exact FP8 group-scale pair table and int32 split-K, and reproduces the reference
@@ -301,7 +306,10 @@ Details, exactness method and measurements: [docs/DESIGN.md](docs/DESIGN.md).
 ```
 __init__.py              ComfyUI entry point (env-gated install, adds no nodes)
 comfy_mono_decode_xpu/   routing: layer.py (layers, attention, RoPE, sessions), logits.py (picks),
-                         mono.py (MLP block), patch.py (W4 linear, rotate+quant), graph_step.py (experimental)
+                         mono.py (MLP block), patch.py (W4 linear, rotate+quant), mtp_loop.py (device
+                         MTP loop), draft.py / graph_draft.py (draft head weights, XPU graph),
+                         draft_lmhead.py (experimental two-stage draft lm_head), autotree.py, tiles.py,
+                         graph_step.py (experimental)
 csrc/                    SYCL kernels (see docs/DESIGN.md) and bindings
 install.py / install.sh  build the extension in place (ComfyUI-Manager runs install.py)
 build_icpx.sh            the single-invocation icpx build

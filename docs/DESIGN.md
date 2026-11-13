@@ -249,6 +249,15 @@ inputs (`tests/`). What it took:
 
 ## Not done / ideas
 
+- Draft path after the two-stage lm_head (B70, device loop, per draft): about 30 small ops plus their
+  gaps take about 0.17 ms (the int8 embedding gather chain, two norms and the cat, gate / residual
+  element-wise ops, the lm_head's rotate and quantize); the 8 oneDNN BF16 GEMMs run at about 531 GB/s
+  (0.87 ms; about 0.1 ms above the roof). A fused or persistent draft head could take about 0.5 ms
+  per step.
+- Verify sampling: torch `topk(20)` over 8 x 248k logits (`SbtopkGather`) takes about 250 us of the
+  0.4 ms sampling per step; an exact top-20 in `fast_topk`'s style (values, indices, tie order) would
+  cover most of it.
+
 - Tried without gain (2026-11-12): attention register prefetch of the next tile (exact, 12% slower);
   32-row attention packs (slower at short contexts); skipping `layer_post`'s pair-table rebuilds (no
   change); L2 prefetch of the next GEMV phase by idle work-groups in `layer_post` (64–512 KB; the
