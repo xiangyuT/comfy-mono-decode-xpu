@@ -105,7 +105,8 @@ def install():
                             _stats["check_mismatch"] += 1
                 return n1, x
             if state["steps"] < WARMUP or not _weights_fixed(self):
-                state["steps"] += 1
+                # after the warm-up the weight check runs once: a head that is not fixed stays eager
+                state["steps"] = state["steps"] + 1 if state["steps"] < WARMUP else -(1 << 30)
                 with _lock:
                     _stats["eager"] += 1
                 return call()

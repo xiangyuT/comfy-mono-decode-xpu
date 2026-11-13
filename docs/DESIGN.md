@@ -233,6 +233,12 @@ inputs (`tests/`). What it took:
   -> 2.17 ms (lm_head + sampling only), 134-139 vs 129-135 tok/s; about 20.9 vs 22.5 ms per step at
   2.4 drafts per step. The draft head graph gives nothing inside this loop (host time already hidden),
   so it stays eager there. Torch profiles do not show kernels replayed from XPU graphs.
+  In the asynchronous mode an `auto` tree change (best_widths every 32 steps) reaches the device one
+  step later than in upstream's loop, since step n is read after step n + 1 is queued; `sync` and
+  `shadow` apply it at upstream's step, so the shadow comparison covers the same trees. The loop runs
+  only if the source of upstream's `_generate_mtp` and of the KV / tree classes it replaces matches
+  v0.45 (a fingerprint, else upstream's loop), and a failure inside it switches it off and reruns the
+  generate with upstream's loop (the caches are created per call, so nothing is reused).
 
 ## Measurements (B70, official H3 Image prompt enhance, auto MTP, sampling on, DynamicVRAM)
 

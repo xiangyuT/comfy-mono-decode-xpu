@@ -28,7 +28,7 @@ Validated on Arc Pro B70:
 | official template | ComfyUI | validation |
 |---|---|---|
 | MOSS Image (`image_moss_image_t2i`) | v0.45 (and v0.43) | performance and output, see Results |
-| MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | functional: the default workflow completes in DynamicVRAM, prefetch and ordinary-memory modes; prompt-enhance decode about 136–140 tok/s (sampling, auto MTP, 4 seeds; `MONO_DECODE_XPU=0`: 24–28 tok/s) |
+| MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | functional: the default workflow completes in DynamicVRAM, prefetch and ordinary-memory modes; prompt-enhance decode about 133–142 tok/s (sampling, auto MTP; `MONO_DECODE_XPU=0`: 24–28 tok/s), see Results |
 
 ## Results
 
@@ -64,13 +64,17 @@ decode attention is no longer bit-identical to Kitchen (see the top of this page
 ### MiniMax H3 Image prompt enhance (ComfyUI v0.45, 2026-11-13)
 
 The official H3 Image default workflow (`thinking` on, sampling on, `auto` MTP, up to 8192 tokens),
-prompt enhance alone, decode tok/s over text seeds 0-3 (0-1 for `MONO_DECODE_XPU=0`):
+prompt enhance alone, decode tok/s over text seeds 0-3 (0-1 for `MONO_DECODE_XPU=0`); the default and
+`DRAFT_INT4` ranges cover two and three such runs:
 
 | `MONO_DECODE_XPU=0` | previous release (`d42987e`) | default | + `MONO_DECODE_XPU_DRAFT_INT4=1` |
 |---:|---:|---:|---:|
-| 23.7-27.8 | 115.0-117.1 | 136.3-139.9 | 145.8-152.3 |
+| 23.7-27.8 | 115.0-117.1 | 133.0-141.6 | 145.8-152.3 |
 
 H3 enhanced prompts run to several thousand tokens (thinking), so decode dominates prompt enhance.
+Between runs the per-step device time stays the same (verify about 11.6 ms, tail 2.2 ms, a draft
+about 2.8 ms, or 2.1 ms with `DRAFT_INT4`); tok/s follows the generated text through the tokens
+accepted and the drafts run per step.
 
 ### Legacy
 

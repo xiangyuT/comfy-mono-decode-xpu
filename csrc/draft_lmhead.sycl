@@ -106,8 +106,11 @@ void draft_pick(torch::Tensor approx, torch::Tensor qx, torch::Tensor sx, torch:
     for (auto c : children) TORCH_CHECK(c >= 0 && c < vtok.numel(), "child row");
     TORCH_CHECK(calls.scalar_type() == at::kLong && calls.numel() >= 1, "calls counter");
 
-    static std::map<int, torch::Tensor> scratch;
-    auto& sc = scratch[approx.get_device()];
+    // cross-work-group lists and the last-work-group counter, per device and stream (launches on one
+    // stream are ordered; the kernel resets the counter, which only an aborted launch, i.e. a failed
+    // device, would leave behind)
+    static std::map<std::pair<int, int64_t>, torch::Tensor> scratch;
+    auto& sc = scratch[{approx.get_device(), int64_t(c10::xpu::getCurrentXPUStream().id())}];
     if (!sc.defined()) sc = torch::zeros({DP_NW * DP_MAXN + DP_NW + 1}, approx.options().dtype(at::kLong));
     auto* prt = reinterpret_cast<uint64_t*>(sc.data_ptr());  // [DP_NW][DP_MAXN] each work-group's top-8 ranks
     auto* pra = prt + DP_NW * DP_MAXN;                          // [DP_NW] each work-group's best argmax rank

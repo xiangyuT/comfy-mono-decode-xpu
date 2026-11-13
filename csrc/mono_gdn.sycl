@@ -7,9 +7,10 @@
 // with GDN = Kitchen's deferred conv / gates / sums / replay-verify delta (llm-scaler fd4a584
 // kitchen_deferred.cpp) and in_proj_a/b in oneDNN's small-M BF16 order.
 //
-//   P1  rows    xn = RMSNorm(x); q1 = rot_quant(xn)
-//   P2  all     proj | z = W4(q1) (stream engine);  last WG first: a, b = BF16 linear(xn)
-//   P3  all     deferred conv (one channel per thread) | gates
+//   P1  rows    xn = RMSNorm(x); q1 = rot_quant(xn);  idle sub-groups of the last 16 WGs: a, b = BF16 linear(xn)
+//               (DPAS partials, once the rows have published xn)
+//   P2  all     proj | z = W4(q1) (stream engine)
+//   P3  all     deferred conv (one channel x pair of tree slots per thread) | gates
 //   P4  all     q/k sum of squares
 //   P5  heads   replay + verify delta, gated RMSNorm -> core
 //   P6  rows    q1 = rot_quant(core)
@@ -48,7 +49,7 @@ W4 w4g(const torch::Tensor& q, const torch::Tensor& s, const torch::Tensor& sc, 
 }
 
 struct GScratch {
-    torch::Tensor q1, q2, s, xn, proj, z, ab, core, x1, h, cnt, dbg;
+    torch::Tensor q1, q2, s, xn, proj, z, core, x1, h, cnt, dbg;
     torch::Tensor abpart;  // a / b linear partials: [4 tiles x 16 K-partials][8 rows x 16 cols], FP32
 };
 GScratch& gscratch(const torch::Tensor& like) {
@@ -60,7 +61,7 @@ GScratch& gscratch(const torch::Tensor& like) {
         auto bf = o.dtype(at::kBFloat16);
         GScratch sc{torch::zeros({8, MAXK}, o.dtype(at::kChar)), torch::zeros({8, MAXK}, o.dtype(at::kChar)),
                     torch::zeros({32}, o.dtype(at::kFloat)), torch::zeros({8, 4096}, bf), torch::zeros({8, 8192}, bf),
-                    torch::zeros({8, 4096}, bf), torch::zeros({2, 8, 32}, bf), torch::zeros({8, 4096}, bf),
+                    torch::zeros({8, 4096}, bf), torch::zeros({8, 4096}, bf),
                     torch::zeros({8, 4096}, bf), torch::zeros({8, MAXK}, bf), torch::zeros({4}, o.dtype(at::kInt)),
                     torch::zeros({64 * 16}, o.dtype(at::kLong)), torch::zeros({64 * 128}, o.dtype(at::kFloat))};
         found = cache.emplace(dev, sc).first;
@@ -319,13 +320,21 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                     const int64_t all = int64_t(NW) * MWG, current = int64_t(p) * SLOT * C, previous = int64_t(1 - p) * SLOT * C;
                     for (int64_t i = gid; i < int64_t(C) * SLOT; i += all)  // this step's rows, zero beyond R
                         pb[current + i] = i < int64_t(R) * C ? projp[i] : T(0.f);
-                    for (int64_t i = gid; i < int64_t(C) * (SLOT / 2); i += all) {
-                        const int c = int(i / (SLOT / 2)), tp = int(i % (SLOT / 2)), n = pending;
+                    // a sub-group iterates as one (16 items = 4 channels x 4 slot pairs): the tp == 0 item of a
+                    // channel alone reads its conv state, hands it to the other three and writes it back
+                    static_assert(sizeof(T) == 2 && 16 % (SLOT / 2) == 0 && MWG % 16 == 0, "P3 sub-group layout");
+                    for (int64_t i0 = int64_t(gid) - lane; i0 < int64_t(C) * (SLOT / 2); i0 += all) {
+                        const int64_t i = i0 + lane;
+                        const bool valid = i < int64_t(C) * (SLOT / 2);
+                        const int c = valid ? int(i / (SLOT / 2)) : 0, tp = int(i % (SLOT / 2)), n = pending;
                         T* history = cst + int64_t(c) * CW;
                         T old[CW], hist[CW];
                         float w[CW + 1];
 #pragma unroll
-                        for (int r = 0; r < CW; ++r) old[r] = history[r];
+                        for (int r = 0; r < CW; ++r) {
+                            const uint16_t mine = valid && tp == 0 ? sycl::bit_cast<uint16_t>(history[r]) : uint16_t(0);
+                            old[r] = sycl::bit_cast<T>(sycl::select_from_group(sg, mine, sycl::id<1>(size_t(lane - tp))));
+                        }
 #pragma unroll
                         for (int d = 0; d <= CW; ++d) w[d] = float(cw[int64_t(c) * (CW + 1) + d]);
                         // the conv state shifted by the previous step's accepted tokens
@@ -360,8 +369,8 @@ torch::Tensor layer_gdn(torch::Tensor x, torch::Tensor norm_in, double eps_in, t
                             }
                             packed |= uint32_t(sycl::bit_cast<uint16_t>(out)) << (16 * h);
                         }
-                        *reinterpret_cast<uint32_t*>(qb + (int64_t(p) * C + c) * SLOT + 2 * tp) = packed;
-                        if (tp == 0)
+                        if (valid) *reinterpret_cast<uint32_t*>(qb + (int64_t(p) * C + c) * SLOT + 2 * tp) = packed;
+                        if (valid && tp == 0)
 #pragma unroll
                             for (int r = 0; r < CW; ++r) history[r] = hist[r];
                     }

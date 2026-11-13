@@ -8,8 +8,10 @@ starts on an idle device after the host has done all of that. Here the walk, the
 the KV slot moves and the next token / hidden row are computed by small device kernels
 (csrc/mtp_loop.sycl), and the host reads each step's committed tokens one step late from a pinned ring,
 after it has already queued the next step. Drafts, the verify forward, lm_head and sampling are
-upstream's calls, so the tokens are the ones upstream's loop would produce from the same values
-(the experimental MONO_DECODE_XPU_DRAFT_INT4 replaces only the drafts' lm_head pick: draft_lmhead.py).
+upstream's calls (the experimental MONO_DECODE_XPU_DRAFT_INT4 replaces only the drafts' lm_head pick:
+draft_lmhead.py), so with a fixed tree the tokens are the ones upstream's loop would produce from the
+same values. With `auto`, the asynchronous loop applies a tree change one step later than upstream
+(it reads each step one step late); "sync" and "shadow" apply it at upstream's step.
 
 Modes (MONO_DECODE_XPU_DEVICE_MTP): "1" asynchronous (default), "sync" one sync per step, "shadow" one
 sync per step plus upstream's host walk on the same values, compared field by field. Anything outside
@@ -25,7 +27,7 @@ import time
 
 import torch
 
-from . import draft_lmhead, guard, tiles
+from . import autotree, draft_lmhead, guard, tiles
 
 CLAIM = "__comfy_mono_decode_xpu_mtp_loop__"
 MODE = os.environ.get("MONO_DECODE_XPU_DEVICE_MTP", "1")
@@ -37,6 +39,28 @@ _tls = threading.local()
 def in_async_loop():
     """True while this thread runs the asynchronous device loop (graph_draft stays eager there)."""
     return getattr(_tls, "async_loop", False) and not GRAPH_IN_LOOP
+
+
+def in_device_loop():
+    """True while this thread runs the device loop in any mode (it times the auto tree itself)."""
+    return getattr(_tls, "device_loop", False)
+
+
+# Upstream code the device loop reimplements (ComfyUI 0.45): _generate_mtp, the KV classes whose host
+# state it keeps on the device, the verify tree and MTP_MODES. Different source (another ComfyUI
+# version, or another node's wrapper of _generate_mtp) runs upstream's loop.
+_UPSTREAM = "c980db6478a362ec"
+
+
+def _fingerprint(llama, q35, original):
+    import hashlib
+    import inspect
+    h = hashlib.sha256()
+    for obj in (original, llama.FixedKV, llama.FixedKVState, llama.FixedKVCache, q35.LinearKV, q35.VerifyTree,
+                q35.tree_spec):
+        h.update(inspect.getsource(obj).encode())
+    h.update(repr(q35.MTP_MODES).encode())
+    return h.hexdigest()[:16]
 RING = 8
 _lock = threading.Lock()
 _stats = {"generates": 0, "steps": 0, "fallback": {}, "shadow_mismatch": 0, "shadow_checked": 0, "host_rows": 0,
@@ -67,9 +91,10 @@ def _tree_tensors(tree, device):
 
 
 def _install_device_kv(llama, q35):
-    """FixedKVState / LinearKV prepare and advance become no-ops for caches a device loop owns."""
+    """prepare (FixedKVState, LinearKV) and advance (FixedKV, their base) become no-ops for caches a device
+    loop owns: their position / seqlen / ctl and the committed length live on the device."""
     done = 0
-    for cls, names in ((llama.FixedKVState, ("prepare", "advance")), (q35.LinearKV, ("prepare", "advance"))):
+    for cls, names in ((llama.FixedKV, ("advance",)), (llama.FixedKVState, ("prepare",)), (q35.LinearKV, ("prepare",))):
         for name in names:
             original = cls.__dict__.get(name)
             if original is None or getattr(original, CLAIM, False):
@@ -120,6 +145,13 @@ def install():
     for name in ("VerifyTree", "MTP_MODES", "tree_spec", "best_widths", "LinearKV"):
         if not hasattr(q35, name):
             return False
+    try:
+        fingerprint = _fingerprint(llama, q35, original)
+    except (OSError, TypeError):
+        fingerprint = None
+    if fingerprint != _UPSTREAM:
+        _fallback("upstream_changed")
+        return False
     _install_device_kv(llama, q35)
 
     def _generate_mtp(self, embeds, max_length, stop_tokens, mtp, sampling=None, position_ids=None,
@@ -138,7 +170,11 @@ def install():
                     return call()
         except Exception:
             return call()
-        out = _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp, sampling, position_ids)
+        try:
+            out = _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp, sampling, position_ids)
+        except Exception as e:  # re-raises a user interrupt; otherwise switched off, upstream reruns the generate
+            guard.failed("device_mtp", e)  # (its caches are created per call: nothing of this one is reused)
+            return call()
         return call() if out is None else out
 
     setattr(_generate_mtp, CLAIM, True)
@@ -299,10 +335,9 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
             children = tree.children[k]
             nout = 7 if adaptive else max(tree.fanout, 1)
             top = draft_top if adaptive or tree.fanout > 1 else None
-            if lm2_on:  # the draft's top-n, rank row, token and children's verify tokens in one pick
-                lm2.pick(n1, nout, not adaptive, top, draft_ranks[k] if adaptive else None, draft_token,
-                         verify_tokens, children)
-                continue
+            if lm2_on and lm2.pick(n1, nout, not adaptive, top, draft_ranks[k] if adaptive else None, draft_token,
+                                   verify_tokens, children):
+                continue  # the draft's top-n, rank row, token and children's verify tokens in one pick
             logits = self.logits(n1)[:, -1]
             if adaptive:
                 draft_top.copy_(logits.topk(7, dim=-1).indices)
@@ -382,6 +417,8 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
                 draft_ms += mix * (d - draft_ms)
                 verify_ms += mix * (v - verify_ms)
             if steps % 32 == 0:
+                if steps > 8:
+                    autotree.note_device_timing(steps, draft_ms, verify_ms)
                 best = best_widths(widths, hits, draft_ms, verify_ms)
                 if best != widths:
                     widths = best
@@ -401,6 +438,7 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
     with _lock:
         _stats["generates"] += 1
     _tls.async_loop = mode == "async"
+    _tls.device_loop = True
     try:
         s = 0
         pending = None
@@ -419,9 +457,9 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
             pending = rec
     finally:
         console.close()
+        _tls.async_loop = _tls.device_loop = False
+        torch.xpu.synchronize(device)  # queued steps still read the weights, caches and graphs released below
         comfy.model_prefetch.cleanup_prefetch_queues()
-        _tls.async_loop = False
-        torch.xpu.synchronize(device)  # queued steps still read the caches and graphs freed after this
         for kv in pkv + [mtp_kv]:
             kv._mono_device = False
         if lm2 is not None:

@@ -5,7 +5,7 @@ A draft's lm_head reads the whole int8 head (248320 x 4096, about 1 GB, 1.7 ms a
 to pick 7 tokens. Two stages read about half of that:
   1. score every row with an int4 copy of the int8 weights (grouped symmetric, the int8 row scale
      folded into the group scales) through oneDNN's weight-only int4 GEMM (torch XPU)
-  2. draft_pick (csrc/draft_lmhead.sycl): keep about 512 candidates by that score, recompute their exact
+  2. draft_pick (csrc/draft_lmhead.sycl): keep 1024 candidates by that score (32 per work-group), recompute their exact
      int8 logits the way the decode path does (same rotated, quantized activation), take the top-n with
      torch topk's tie order (and the argmax), and write the draft's outputs
 The whole vocabulary is scored; the result equals the int8 draft whenever the exact top-n lies within
@@ -23,11 +23,10 @@ import os
 
 import torch
 
-from . import guard
+from . import guard, tiles
 
 MODE = os.environ.get("MONO_DECODE_XPU_DRAFT_INT4", "0")
 GROUP = 128
-_margin = int(float(os.environ.get("MONO_DECODE_XPU_TILE_MARGIN_GB", "3")) * (1 << 30))
 
 
 def enabled():
@@ -88,7 +87,8 @@ class DraftLMHead:
         """The two-stage head for this generate, or None (not eligible, not enough memory, or a failure)."""
         if not enabled() or not hasattr(C, "draft_pick") or device.type != "xpu":
             return None
-        if (getattr(head, "weight_function", None) or getattr(head, "bias_function", None)
+        if (not isinstance(getattr(head, "in_features", None), int)  # a linear head (not a tied embedding)
+                or getattr(head, "weight_function", None) or getattr(head, "bias_function", None)
                 or getattr(head, "bias", None) is not None
                 or not hasattr(torch.ops.aten, "_weight_int4pack_mm_with_scales_and_zeros")):
             return None
@@ -104,7 +104,7 @@ class DraftLMHead:
                     return None
                 q, s = plain
                 need = q.numel() + q.numel() // GROUP * 3  # int4 copy (and its packing source) + scales/zeros
-                if torch.xpu.mem_get_info(device)[0] < need + _margin:
+                if torch.xpu.mem_get_info(device)[0] < need + tiles._margin:
                     return None
                 return cls(C, head, (oi, native), q, s)
         except Exception as e:
@@ -121,21 +121,35 @@ class DraftLMHead:
 
     def pick(self, n1, nout, argmax_first, top, ranks_row, token, vtok, children):
         """The draft's outputs from its normed hidden n1: top[:nout], ranks_row[:nout], token (the argmax
-        if argmax_first, else top[0]) and vtok[children] (token, then top[1..])."""
-        with _weight(self.head, n1) as (w, _b):
-            q, s = _plain(w)
-            approx, qx, sx = self._approx(n1)
-            empty = torch.empty(0, dtype=torch.long, device=n1.device)
-            self.C.draft_pick(approx.view(-1), qx.view(-1), sx.view(-1), q, s, nout, argmax_first,
-                              empty if top is None else top.view(-1), empty if ranks_row is None else ranks_row.view(-1),
-                              token.view(-1), vtok.view(-1), list(children), self.calls)
+        if argmax_first, else top[0]) and vtok[children] (token, then top[1..]). False: nothing was
+        written (the head's weight is not the int8 layout this call, or the path is off); the caller
+        runs the int8 pick."""
+        if guard.off("draft_int4"):
+            return False
+        try:
+            with _weight(self.head, n1) as (w, _b):
+                plain = _plain(w)
+                if plain is None or plain[0].shape != (self.N, self.K):
+                    return False
+                q, s = plain
+                approx, qx, sx = self._approx(n1)
+                empty = torch.empty(0, dtype=torch.long, device=n1.device)
+                self.C.draft_pick(approx.view(-1), qx.view(-1), sx.view(-1), q, s, nout, argmax_first,
+                                  empty if top is None else top.view(-1),
+                                  empty if ranks_row is None else ranks_row.view(-1),
+                                  token.view(-1), vtok.view(-1), list(children), self.calls)
+            return True
+        except Exception as e:  # argument checks fail before anything is written: the int8 pick runs
+            guard.failed("draft_int4", e)
+            return False
 
     def check(self, n1, nout, argmax_first, top, token, vtok, children):
         """check mode: the two-stage result for the draft just computed by the int8 path, compared on the device."""
         t2 = torch.empty(nout, dtype=torch.long, device=n1.device)
         k2 = torch.empty(1, dtype=torch.long, device=n1.device)
         v2 = vtok.clone()
-        self.pick(n1, nout, argmax_first, t2, None, k2, v2, children)
+        if not self.pick(n1, nout, argmax_first, t2, None, k2, v2, children):
+            return
         bad = (k2 != token.view(-1)).any() | (v2.view(-1) != vtok.view(-1)).any()
         if top is not None and nout > 1:
             bad = bad | (t2 != top.view(-1)[:nout]).any()
