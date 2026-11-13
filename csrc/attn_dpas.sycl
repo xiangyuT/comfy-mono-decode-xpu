@@ -105,10 +105,9 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
                 for (int n = 0; n < NT; ++n) jm::joint_matrix_fill(sg, o[n], 0.f);
                 const bf16* kbase = Kc + int64_t(kh) * cap * HD;
                 const bf16* vbase = Vc + int64_t(kh) * cap * HD;
-                for (int tb = beg; tb < end; tb += TT) {
+                auto tile = [&](int tb, bool full) {
                     const int tok = tb + lane;
                     const bool live = tok < end;
-                    const bool full = tb + TT <= cap;  // a block load reads 16 cache rows
                     // S = Q K^T over the head dim
                     jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 16> s;
                     jm::joint_matrix_fill(sg, s, 0.f);
@@ -179,6 +178,16 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
                         jm::joint_matrix_mad(sg, o[n], pa, vb, o[n]);
                     }
                     sycl::group_barrier(sg);  // pslm / stage are rewritten by the next tile
+                };
+                if constexpr (PADDED) {
+                    for (int tb = beg; tb < end; tb += TT) tile(tb, tb + TT <= cap);
+                } else {
+                    // Regular full-query tiles avoid the cache-tail staging branch
+                    // inside QK/PV. A final partial cache tile remains cap-safe.
+                    const int full_end = sycl::min(end, cap / TT * TT);
+                    int tb = beg;
+                    for (; tb < full_end; tb += TT) tile(tb, true);
+                    if (tb < end) tile(tb, false);
                 }
                 // partials: part [HK][chunks][NMT * 8][HD], ml [HK][chunks][NMT * 8][2]
                 const int64_t unit = int64_t(kh) * chunks + c;
