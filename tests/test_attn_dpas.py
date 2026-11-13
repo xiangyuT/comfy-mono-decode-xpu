@@ -47,6 +47,11 @@ def _kitchen(q, k, v, sl, xk, xv, mask_t):
     (11392, 11400, [-1, 0, 0, 1, 1]),  # the cache's last partial tile
     (1000, 4096, None),  # the MTP draft's single row, no tree
     (8000, 11400, None),
+    # Full 8-row tiles for NMT=1/2/3 and a padded NMT=4 tile: all compiled branches.
+    (1001, 4096, [-1, 0]),
+    (4001, 8193, [-1, 0, 0, 1]),
+    (8001, 8193, [-1, 0, 0, 1, 1, 2]),
+    (8191, 8193, [-1, 0, 0, 1, 1, 2, 2]),
 ])
 def test_attn_dpas_error_within_kitchen(C, L, cap, parents):
     pytest.importorskip("omni_xpu_kernel")

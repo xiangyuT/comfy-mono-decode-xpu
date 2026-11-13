@@ -5,7 +5,8 @@
 // [0, L) of the BF16 cache and, for tree verify, the tree rows a row's mask admits (from xk / xv).
 // Not bit-identical to Kitchen's decode_gqa + tree_merge: the context is split by its actual length,
 // QK^T and P.V run on DPAS (BF16 inputs, FP32 accumulation; P is rounded to BF16 for the P.V step)
-// and partial results are merged in FP32. The softmax is the same function.
+// and partial results are merged in FP32. Max-subtracted exponential arguments are nonpositive;
+// native exp is checked against the same FP64/Kitchen attention error contract.
 //
 // Kernel 1: work-group = (kv head, context chunk); sub-group = (8-row M tile, half of the head dim).
 //   Chunks follow the actual length (at least 32 tokens each; work-groups past the last chunk exit).
@@ -44,7 +45,7 @@ inline auto lp(T* p) {
     return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
 }
 
-template <int NMT>
+template <int NMT, bool PADDED>
 class AttnDpasPartK;
 class AttnDpasMergeK;
 
@@ -69,14 +70,14 @@ inline void chunking(int L, int chunks, int& per, int& active) {
     active = L > 0 ? (L + per - 1) / per : 0;
 }
 
-template <int NMT>
+template <int NMT, bool PADDED>
 void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16* Vc, const int* lens, int HK,
                      int groups, int S, int rows, int cap, int chunks, float* part, float* ml) {
     queue.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<bf16, 1> qs(NMT * 8 * HD, cgh);
         // per sub-group: P [8][16] and a staged 16 x 16 cache tile for the cache's last partial tile
         sycl::local_accessor<bf16, 1> scratch(NMT * 2 * (8 * 16 + 16 * 16), cgh);
-        cgh.parallel_for<AttnDpasPartK<NMT>>(
+        cgh.parallel_for<AttnDpasPartK<NMT, PADDED>>(
             sycl::nd_range<1>(int64_t(HK) * chunks * NMT * 32, NMT * 32),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
                 auto sg = it.get_sub_group();
@@ -136,12 +137,16 @@ void launch_partials(sycl::queue& queue, const V4 Q, const bf16* Kc, const bf16*
                     float* p = sv;  // scores become probabilities in place
 #pragma unroll
                     for (int i = 0; i < 8; ++i) {
+                        // DPAS fills eight rows; padded query rows are never read by the merge.
+                        if constexpr (PADDED) {
+                            if (mt * 8 + i >= rows) { alpha[i] = 0.f; p[i] = 0.f; continue; }
+                        }
                         const float v = live ? sv[i] * SCALE : -INFINITY;
                         const float mx = sycl::reduce_over_group(sg, v, sycl::maximum<float>());
                         const float mi = sycl::group_broadcast(sg, ml_m, i), li = sycl::group_broadcast(sg, ml_l, i);
                         const float mn = sycl::fmax(mi, mx);
-                        alpha[i] = mi == -INFINITY ? 0.f : sycl::exp(mi - mn);
-                        p[i] = v == -INFINITY ? 0.f : sycl::exp(v - mn);
+                        alpha[i] = mi == -INFINITY ? 0.f : sycl::native::exp(mi - mn);
+                        p[i] = v == -INFINITY ? 0.f : sycl::native::exp(v - mn);
                         const float rs = sycl::reduce_over_group(sg, p[i], sycl::plus<float>());
                         if (lane == i) { ml_m = mn; ml_l = li * alpha[i] + rs; }
                     }
@@ -215,11 +220,18 @@ torch::Tensor attn_dpas(torch::Tensor q, torch::Tensor key, torch::Tensor value,
     const int* lens = seqlen.data_ptr<int>();
     float* pp = part.data_ptr<float>();
     float* pm = ml.data_ptr<float>();
+    // Full query tiles avoid a padded-row predicate in each unrolled softmax row.
+    auto launch = [&]<int MT>() {
+        if (rows % 8)
+            launch_partials<MT, true>(queue, Q, Kc, Vc, lens, HK, groups, S, rows, cap, chunks, pp, pm);
+        else
+            launch_partials<MT, false>(queue, Q, Kc, Vc, lens, HK, groups, S, rows, cap, chunks, pp, pm);
+    };
     switch (nmt) {
-        case 1: launch_partials<1>(queue, Q, Kc, Vc, lens, HK, groups, S, rows, cap, chunks, pp, pm); break;
-        case 2: launch_partials<2>(queue, Q, Kc, Vc, lens, HK, groups, S, rows, cap, chunks, pp, pm); break;
-        case 3: launch_partials<3>(queue, Q, Kc, Vc, lens, HK, groups, S, rows, cap, chunks, pp, pm); break;
-        default: launch_partials<4>(queue, Q, Kc, Vc, lens, HK, groups, S, rows, cap, chunks, pp, pm); break;
+        case 1: launch.template operator()<1>(); break;
+        case 2: launch.template operator()<2>(); break;
+        case 3: launch.template operator()<3>(); break;
+        default: launch.template operator()<4>(); break;
     }
     const int* masks = merge ? mask.data_ptr<int>() : nullptr;
     bf16* dest = reinterpret_cast<bf16*>(out.data_ptr());
@@ -242,7 +254,7 @@ torch::Tensor attn_dpas(torch::Tensor q, torch::Tensor key, torch::Tensor value,
 #pragma unroll 8
             for (int c = 0; c < active; ++c) {
                 const int64_t u = (base + c) * nmt * 8 + r;
-                const float w = sycl::exp(pm[u * 2] - M);
+                const float w = sycl::native::exp(pm[u * 2] - M);
                 sum += pm[u * 2 + 1] * w;
                 acc += pp[u * HD + d] * w;
             }
@@ -252,7 +264,7 @@ torch::Tensor attn_dpas(torch::Tensor q, torch::Tensor key, torch::Tensor value,
                     if (!((masks[s] >> tr) & 1)) continue;
                     const float sc = sycl::reduce_over_group(it.get_group(), qd * XK.at(0, kh, tr, d), sycl::plus<float>()) * SCALE;
                     const float M2 = sycl::fmax(M, sc);
-                    const float fp = M == -INFINITY ? 0.f : sycl::exp(M - M2), ft = sycl::exp(sc - M2);
+                    const float fp = M == -INFINITY ? 0.f : sycl::native::exp(M - M2), ft = sycl::native::exp(sc - M2);
                     acc = acc * fp + ft * XV.at(0, kh, tr, d);
                     sum = sum * fp + ft;
                     M = M2;

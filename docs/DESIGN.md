@@ -77,9 +77,12 @@ keeping every output bit unchanged.
   - Registers decide the speed: the running max and sum sit one row per lane and fragments are read
     through unrolled `wi_data` loops, keeping the default 128 GRF. The 256 GRF mode removes the
     remaining spills but halves occupancy and is slower.
+  - Max-subtracted exponentials use `sycl::native::exp`; FP32 accumulation and partials, BF16
+    probability rounding and the FP64/Kitchen error bound remain the attention contract.
+    Full and padded query packs compile separately; unused padded rows skip online-softmax work.
   - A second kernel merges the active chunks' (m, l, O) in FP32 with the tree rows each row admits.
-  - Accuracy: P is rounded to BF16 for P V; against an fp64 reference its error matches or is below
-    the Kitchen kernel's own error on the same inputs (max about 7.8e-3, one BF16 output rounding).
+  - Accuracy: P is rounded to BF16 for P V; the tests bound both maximum and mean error against
+    an FP64 oracle relative to Kitchen on the same inputs, rather than assuming a fixed absolute error.
   - Device time at cap 11400, L 1000 / 4000 / 8000: verify (8 rows) 45 / 82 / 134 us, draft row
     27 / 50 / 90 us (`attn_core` verify 91 / 230 / 448 us, draft 35 / 59 / 113 us; Kitchen verify
     273 / 484 / 843 us). Not helpful: cooperative K / V staging in SLM per tile (the staging stores
