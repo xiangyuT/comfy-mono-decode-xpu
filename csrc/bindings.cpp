@@ -30,6 +30,15 @@ torch::Tensor attn_dpas(torch::Tensor q, torch::Tensor key, torch::Tensor value,
 
 std::vector<torch::Tensor> fast_topk(torch::Tensor x, int64_t k, bool argmax_order);
 std::vector<torch::Tensor> fast_pick(torch::Tensor x, int64_t k);
+std::vector<torch::Tensor> topk_rows(torch::Tensor x, int64_t k);
+void draft_embed_norm_cat(torch::Tensor token, torch::Tensor q, torch::Tensor s, torch::Tensor hmat, torch::Tensor emb,
+                          torch::Tensor hidden, torch::Tensor we, torch::Tensor wh, double eps_e, double eps_h,
+                          torch::Tensor out);
+void draft_add_rmsnorm(torch::Tensor x, torch::Tensor h, torch::Tensor w, double eps, torch::Tensor out);
+void draft_sigmoid_mul(torch::Tensor a, torch::Tensor qg, int64_t head_dim, torch::Tensor out);
+void draft_silu_mul(torch::Tensor gu, torch::Tensor out);
+void draft_norm_rot_quant(torch::Tensor x, torch::Tensor h, torch::Tensor w, double eps, torch::Tensor hmat,
+                          torch::Tensor xr, torch::Tensor qx, torch::Tensor sx);
 std::vector<torch::Tensor> rope_kv(torch::Tensor qn, torch::Tensor kn, torch::Tensor vn, torch::Tensor freqs,
                                    torch::Tensor key, torch::Tensor value, torch::Tensor position, int64_t rd);
 std::vector<torch::Tensor> qk_norm_rope_kv(torch::Tensor rawq, torch::Tensor rawk, torch::Tensor vn,
@@ -76,6 +85,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("draft_pick", &mono_decode_xpu::draft_pick);
     m.def("fast_topk", &mono_decode_xpu::fast_topk);
     m.def("fast_pick", &mono_decode_xpu::fast_pick);
+    m.def("topk_rows", &mono_decode_xpu::topk_rows);
+    m.def("draft_embed_norm_cat", &mono_decode_xpu::draft_embed_norm_cat);
+    m.def("draft_add_rmsnorm", &mono_decode_xpu::draft_add_rmsnorm);
+    m.def("draft_sigmoid_mul", &mono_decode_xpu::draft_sigmoid_mul);
+    m.def("draft_silu_mul", &mono_decode_xpu::draft_silu_mul);
+    m.def("draft_norm_rot_quant", &mono_decode_xpu::draft_norm_rot_quant);
     m.def("rope_kv", &mono_decode_xpu::rope_kv);
     m.def("qk_norm_rope_kv", &mono_decode_xpu::qk_norm_rope_kv);
     m.def("layer_pre", &mono_decode_xpu::layer_pre, py::arg("x"), py::arg("norm_w"), py::arg("eps"), py::arg("hadamard"), py::arg("mats"),

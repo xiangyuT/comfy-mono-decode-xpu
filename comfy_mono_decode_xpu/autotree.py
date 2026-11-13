@@ -167,6 +167,9 @@ def install():
             if not mtp_loop.in_device_loop():
                 clock.on_draft()
             return mtp_forward(*a, **k)
+        timed_mtp_forward._mono_observer = True  # timing only: a head that bypasses forward may ignore it
+        if getattr(mtp_forward, "_mono_on_draft", None) is not None:  # an outer observer's per-draft note
+            timed_mtp_forward._mono_on_draft = mtp_forward._mono_on_draft
 
         saved = [(m, vars(m).get("forward")) for m in (self.model, self.mtp)]  # outer wrappers, if any
         self.model.forward, self.mtp.forward = timed_model_forward, timed_mtp_forward

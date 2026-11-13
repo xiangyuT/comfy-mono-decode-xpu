@@ -1,0 +1,288 @@
+// SPDX-License-Identifier: Apache-2.0
+// Fused single-row kernels of the Qwen3.5 MTP draft head (comfy_mono_decode_xpu/draft_head.py), which
+// replace about 20 small launches per draft. One work-group of 1024 threads each, hidden size H <= 8192.
+// The draft only proposes tokens (the verify decides every output token), so these follow the eager
+// head's arithmetic in FP32 without reproducing its reduction order:
+//   draft_embed_norm_cat   int8 ConvRot embedding row (gather, scale, un-rotate) or a given BF16 row, then
+//                          cat(RMSNorm_e(emb), RMSNorm_h(hidden)) -> the fc input
+//   draft_add_rmsnorm      x += h (BF16, in place; no h: x unchanged), out = RMSNorm(x)
+//   draft_sigmoid_mul      out = a * sigmoid(gate) (gate: every other head_dim block of the q projection)
+//   draft_silu_mul         out = silu(gate) * up from the concatenated gate | up projection
+//   draft_norm_rot_quant   x += h (optional, in place), n = RMSNorm(x); the lm_head's ConvRot rotation and
+//                          rowwise INT8 quantization of n
+#include <cstdint>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+namespace mono_decode_xpu {
+namespace {
+using bf16 = sycl::ext::oneapi::bfloat16;
+constexpr int DF_WG = 1024, DF_MAXH = 8192, DF_G = 256;
+
+inline float b2f(const bf16* p, int64_t i) { return float(p[i]); }
+
+// work-group sum (all threads get it)
+inline float df_sum(sycl::nd_item<1>& it, float v) { return sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>()); }
+inline float df_max(sycl::nd_item<1>& it, float v) { return sycl::reduce_over_group(it.get_group(), v, sycl::maximum<float>()); }
+
+// out[c] = bf16(x[c] * rsqrt(mean(x^2) + eps) * w[c]) for this thread's columns (x in registers)
+template <int PER>
+inline void df_rmsnorm(sycl::nd_item<1>& it, const float (&x)[PER], int H, const bf16* w, float eps, bf16* out) {
+    const int t = it.get_local_id(0);
+    float ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int c = t + DF_WG * j;
+        if (c < H) ss += x[j] * x[j];
+    }
+    const float r = sycl::rsqrt(df_sum(it, ss) / float(H) + eps);
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int c = t + DF_WG * j;
+        if (c < H) out[c] = bf16((x[j] * r) * float(w[c]));
+    }
+}
+
+// x_group @ H for every 256-group of row[0..H) in local memory, H = kron(h4, h4, h4, h4) / 16 (comfy_kitchen's
+// regular ConvRot Hadamard, symmetric): four 4-point stages, one per base-4 digit (the factors are equal and
+// symmetric, so the digit order does not matter), each scaled by 1/2
+inline void df_hadamard256(sycl::nd_item<1>& it, const sycl::local_accessor<float, 1>& row, int H) {
+    const int t = it.get_local_id(0);
+    for (int st = 1; st < DF_G; st *= 4) {
+        for (int b = t; b < H / 4; b += DF_WG) {  // butterfly b: group b / 64, then (high, low) around stride st
+            const int g0 = (b / (DF_G / 4)) * DF_G, u = b % (DF_G / 4);
+            const int base = g0 + (u / st) * (4 * st) + u % st;
+            const float a0 = row[base], a1 = row[base + st], a2 = row[base + 2 * st], a3 = row[base + 3 * st];
+            // rows of h4: [1 1 1 -1] [1 1 -1 1] [1 -1 1 1] [-1 1 1 1] (out_j = sum_k a_k h4[k][j])
+            row[base] = 0.5f * (a0 + a1 + a2 - a3);
+            row[base + st] = 0.5f * (a0 + a1 - a2 + a3);
+            row[base + 2 * st] = 0.5f * (a0 - a1 + a2 + a3);
+            row[base + 3 * st] = 0.5f * (-a0 + a1 + a2 + a3);
+        }
+        sycl::group_barrier(it.get_group());
+    }
+}
+
+class EmbedNormCatKernel;
+class AddRmsnormKernel;
+class SigmoidMulKernel;
+class SiluMulKernel;
+class NormRotQuantKernel;
+}  // namespace
+
+void draft_embed_norm_cat(torch::Tensor token, torch::Tensor q, torch::Tensor s, torch::Tensor hmat, torch::Tensor emb,
+                          torch::Tensor hidden, torch::Tensor we, torch::Tensor wh, double eps_e, double eps_h,
+                          torch::Tensor out) {
+    const int64_t H = hidden.numel();
+    TORCH_CHECK(H >= 1 && H <= DF_MAXH && H % DF_G == 0, "hidden size");
+    TORCH_CHECK(hidden.scalar_type() == at::kBFloat16 && hidden.is_contiguous() && we.scalar_type() == at::kBFloat16
+                && wh.scalar_type() == at::kBFloat16 && we.numel() == H && wh.numel() == H && we.is_contiguous()
+                && wh.is_contiguous(), "hidden / norm weights bf16 [H]");
+    TORCH_CHECK(out.scalar_type() == at::kBFloat16 && out.is_contiguous() && out.numel() == 2 * H, "out bf16 [2H]");
+    const bool gather = q.numel() > 0;
+    if (gather) {
+        TORCH_CHECK(q.scalar_type() == at::kChar && q.dim() == 2 && q.size(1) == H && q.is_contiguous(), "q int8 [V, H]");
+        TORCH_CHECK(s.scalar_type() == at::kFloat && s.is_contiguous() && s.numel() == q.size(0), "s float [V]");
+        TORCH_CHECK(token.scalar_type() == at::kLong && token.numel() == 1, "token");
+        TORCH_CHECK(hmat.numel() == 0 || (hmat.scalar_type() == at::kFloat && hmat.is_contiguous() && hmat.numel() == DF_G * DF_G),
+                    "hadamard f32 [256, 256]");
+    } else {
+        TORCH_CHECK(emb.scalar_type() == at::kBFloat16 && emb.is_contiguous() && emb.numel() == H, "emb bf16 [H]");
+    }
+    const int64_t* tp = gather ? token.data_ptr<int64_t>() : nullptr;
+    const int8_t* qp = gather ? reinterpret_cast<const int8_t*>(q.data_ptr()) : nullptr;
+    const float* sp = gather ? s.data_ptr<float>() : nullptr;
+    const float* hp = gather && hmat.numel() ? hmat.data_ptr<float>() : nullptr;
+    const int64_t V = gather ? q.size(0) : 0;
+    const bf16* ep = gather ? nullptr : reinterpret_cast<const bf16*>(emb.data_ptr());
+    const bf16* xp = reinterpret_cast<const bf16*>(hidden.data_ptr());
+    const bf16* wep = reinterpret_cast<const bf16*>(we.data_ptr());
+    const bf16* whp = reinterpret_cast<const bf16*>(wh.data_ptr());
+    bf16* op = reinterpret_cast<bf16*>(out.data_ptr());
+    const int HH = int(H);
+    const float ee = float(eps_e), eh = float(eps_h);
+    c10::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> row(DF_MAXH, cgh);
+        cgh.parallel_for<EmbedNormCatKernel>(sycl::nd_range<1>(DF_WG, DF_WG), [=](sycl::nd_item<1> it) {
+            constexpr int PER = DF_MAXH / DF_WG;
+            const int t = it.get_local_id(0);
+            float e[PER], h[PER];
+            if (qp) {
+                int64_t r = tp[0];
+                r = r < 0 ? 0 : (r >= V ? V - 1 : r);
+                const float sc = sp[r];
+                for (int c = t; c < HH; c += DF_WG) row[c] = float(qp[r * HH + c]) * sc;
+                sycl::group_barrier(it.get_group());
+                if (hp) df_hadamard256(it, row, HH);  // un-rotate: x_group @ H
+#pragma unroll
+                for (int j = 0; j < PER; ++j) {
+                    const int c = t + DF_WG * j;
+                    e[j] = c < HH ? float(bf16(row[c])) : 0.f;  // the embedding row is BF16
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < PER; ++j) {
+                    const int c = t + DF_WG * j;
+                    e[j] = c < HH ? float(ep[c]) : 0.f;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                const int c = t + DF_WG * j;
+                h[j] = c < HH ? float(xp[c]) : 0.f;
+            }
+            df_rmsnorm<PER>(it, e, HH, wep, ee, op);
+            df_rmsnorm<PER>(it, h, HH, whp, eh, op + HH);
+        });
+    });
+}
+
+void draft_add_rmsnorm(torch::Tensor x, torch::Tensor h, torch::Tensor w, double eps, torch::Tensor out) {
+    const int64_t H = x.numel();
+    TORCH_CHECK(H >= 1 && H <= DF_MAXH, "hidden size");
+    for (auto* t : {&x, &w, &out})
+        TORCH_CHECK(t->scalar_type() == at::kBFloat16 && t->is_contiguous() && t->numel() == H, "bf16 [H] rows");
+    TORCH_CHECK(h.numel() == 0 || (h.scalar_type() == at::kBFloat16 && h.is_contiguous() && h.numel() == H), "h bf16 [H]");
+    bf16* xp = reinterpret_cast<bf16*>(x.data_ptr());
+    const bf16* hp = h.numel() ? reinterpret_cast<const bf16*>(h.data_ptr()) : nullptr;
+    const bf16* wp = reinterpret_cast<const bf16*>(w.data_ptr());
+    bf16* op = reinterpret_cast<bf16*>(out.data_ptr());
+    const int HH = int(H);
+    const float e = float(eps);
+    c10::xpu::getCurrentXPUStream().queue().parallel_for<AddRmsnormKernel>(sycl::nd_range<1>(DF_WG, DF_WG), [=](sycl::nd_item<1> it) {
+        constexpr int PER = DF_MAXH / DF_WG;
+        const int t = it.get_local_id(0);
+        float v[PER];
+#pragma unroll
+        for (int j = 0; j < PER; ++j) {
+            const int c = t + DF_WG * j;
+            v[j] = 0.f;
+            if (c < HH) {
+                if (hp) {
+                    const bf16 sum = bf16(float(xp[c]) + float(hp[c]));  // torch.add in BF16
+                    xp[c] = sum;
+                    v[j] = float(sum);
+                } else {
+                    v[j] = float(xp[c]);
+                }
+            }
+        }
+        df_rmsnorm<PER>(it, v, HH, wp, e, op);
+    });
+}
+
+void draft_sigmoid_mul(torch::Tensor a, torch::Tensor qg, int64_t head_dim, torch::Tensor out) {
+    const int64_t n = a.numel();
+    TORCH_CHECK(a.scalar_type() == at::kBFloat16 && a.is_contiguous() && out.scalar_type() == at::kBFloat16
+                && out.is_contiguous() && out.numel() == n, "a / out bf16 [n]");
+    TORCH_CHECK(qg.scalar_type() == at::kBFloat16 && qg.is_contiguous() && qg.numel() >= 2 * n && n % head_dim == 0,
+                "q projection bf16 [heads x 2 head_dim]");
+    const bf16* ap = reinterpret_cast<const bf16*>(a.data_ptr());
+    const bf16* gp = reinterpret_cast<const bf16*>(qg.data_ptr());
+    bf16* op = reinterpret_cast<bf16*>(out.data_ptr());
+    const int64_t D = head_dim;
+    const int64_t groups = (n + DF_WG - 1) / DF_WG;
+    c10::xpu::getCurrentXPUStream().queue().parallel_for<SigmoidMulKernel>(sycl::nd_range<1>(groups * DF_WG, DF_WG), [=](sycl::nd_item<1> it) {
+        const int64_t i = it.get_global_id(0);
+        if (i >= n) return;
+        const int64_t hd = i / D, d = i % D;
+        const float g = float(gp[hd * 2 * D + D + d]);
+        const float sg = float(bf16(1.f / (1.f + sycl::exp(-g))));  // gate.sigmoid() in BF16
+        op[i] = bf16(float(ap[i]) * sg);
+    });
+}
+
+void draft_silu_mul(torch::Tensor gu, torch::Tensor out) {
+    const int64_t n = out.numel();
+    TORCH_CHECK(gu.scalar_type() == at::kBFloat16 && gu.is_contiguous() && gu.numel() == 2 * n && out.scalar_type() == at::kBFloat16
+                && out.is_contiguous(), "gate | up bf16 [2I], out bf16 [I]");
+    const bf16* gp = reinterpret_cast<const bf16*>(gu.data_ptr());
+    bf16* op = reinterpret_cast<bf16*>(out.data_ptr());
+    const int64_t groups = (n + DF_WG - 1) / DF_WG;
+    c10::xpu::getCurrentXPUStream().queue().parallel_for<SiluMulKernel>(sycl::nd_range<1>(groups * DF_WG, DF_WG), [=](sycl::nd_item<1> it) {
+        const int64_t i = it.get_global_id(0);
+        if (i >= n) return;
+        const float g = float(gp[i]);
+        const float act = float(bf16(g / (1.f + sycl::exp(-g))));  // silu(gate) in BF16
+        op[i] = bf16(act * float(gp[n + i]));
+    });
+}
+
+void draft_norm_rot_quant(torch::Tensor x, torch::Tensor h, torch::Tensor w, double eps, torch::Tensor hmat,
+                          torch::Tensor xr, torch::Tensor qx, torch::Tensor sx) {
+    const int64_t H = x.numel();
+    TORCH_CHECK(H >= 1 && H <= DF_MAXH && H % DF_G == 0, "hidden size");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.is_contiguous() && w.scalar_type() == at::kBFloat16
+                && w.is_contiguous() && w.numel() == H, "x / w bf16 [H]");
+    TORCH_CHECK(hmat.scalar_type() == at::kFloat && hmat.is_contiguous() && hmat.numel() == DF_G * DF_G, "hadamard f32 [256, 256]");
+    TORCH_CHECK(xr.scalar_type() == at::kBFloat16 && xr.is_contiguous() && xr.numel() == H, "xr bf16 [H]");
+    TORCH_CHECK(qx.scalar_type() == at::kChar && qx.is_contiguous() && qx.numel() == H, "qx int8 [H]");
+    TORCH_CHECK(sx.scalar_type() == at::kFloat && sx.numel() == 1, "sx float [1]");
+    TORCH_CHECK(h.numel() == 0 || (h.scalar_type() == at::kBFloat16 && h.is_contiguous() && h.numel() == H), "h bf16 [H]");
+    bf16* xp = reinterpret_cast<bf16*>(x.data_ptr());
+    const bf16* addp = h.numel() ? reinterpret_cast<const bf16*>(h.data_ptr()) : nullptr;
+    const bf16* wp = reinterpret_cast<const bf16*>(w.data_ptr());
+    bf16* rp = reinterpret_cast<bf16*>(xr.data_ptr());
+    int8_t* qp = reinterpret_cast<int8_t*>(qx.data_ptr());
+    float* sp = sx.data_ptr<float>();
+    const int HH = int(H);
+    const float e = float(eps);
+    c10::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> row(DF_MAXH, cgh);
+        cgh.parallel_for<NormRotQuantKernel>(sycl::nd_range<1>(DF_WG, DF_WG), [=](sycl::nd_item<1> it) {
+            constexpr int PER = DF_MAXH / DF_WG;
+            const int t = it.get_local_id(0);
+            float v[PER];
+            float ss = 0.f;
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                const int c = t + DF_WG * j;
+                v[j] = 0.f;
+                if (c < HH) {
+                    if (addp) {
+                        const bf16 sum = bf16(float(xp[c]) + float(addp[c]));  // torch.add in BF16
+                        xp[c] = sum;
+                        v[j] = float(sum);
+                    } else {
+                        v[j] = float(xp[c]);
+                    }
+                }
+                ss += v[j] * v[j];
+            }
+            const float r = sycl::rsqrt(df_sum(it, ss) / float(HH) + e);
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                const int c = t + DF_WG * j;
+                if (c < HH) row[c] = float(bf16((v[j] * r) * float(wp[c])));  // the normed row is BF16
+            }
+            sycl::group_barrier(it.get_group());
+            df_hadamard256(it, row, HH);  // the lm_head's ConvRot rotation
+            float m = 0.f;
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                const int c = t + DF_WG * j;
+                float y = 0.f;
+                if (c < HH) {
+                    const bf16 yb = bf16(row[c]);  // the rotated activation is BF16
+                    rp[c] = yb;
+                    y = float(yb);
+                    m = sycl::max(m, sycl::fabs(y));
+                }
+                v[j] = y;
+            }
+            const float amax = df_max(it, m);
+            const float scale = sycl::max(amax / 127.f, 1e-30f);
+            const float div = float(bf16(scale));  // the reference divides by the scale in the input dtype
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                const int c = t + DF_WG * j;
+                if (c < HH) qp[c] = int8_t(sycl::clamp(sycl::rint(v[j] / div), -128.f, 127.f));
+            }
+            if (t == 0) sp[0] = scale;
+        });
+    });
+}
+}  // namespace mono_decode_xpu

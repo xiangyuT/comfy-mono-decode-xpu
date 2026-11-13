@@ -59,3 +59,11 @@ def test_draft_pick_matches_torch(C, seed, ties, noise):
             expect_v[c] = want[j]
         assert vtok.tolist() == expect_v
     assert calls.item() == 3
+    # exact scores (no weight): the pick reads them as the logits
+    if noise == 0.0:
+        e8, ef = torch.empty(0, dtype=torch.int8, device=dev), torch.empty(0, dtype=torch.float32, device=dev)
+        top = torch.full((7,), -1, dtype=torch.long, device=dev)
+        token = torch.full((1,), -1, dtype=torch.long, device=dev)
+        vtok = torch.full((8,), -1, dtype=torch.long, device=dev)
+        C.draft_pick(ex.contiguous(), e8, ef, e8, ef, 7, False, top, top[:0], token, vtok, [1, 2], calls)
+        assert top.tolist() == ref_top.tolist() and token.item() == ref_top[0].item()

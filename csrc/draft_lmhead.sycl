@@ -89,12 +89,17 @@ void draft_pick(torch::Tensor approx, torch::Tensor qx, torch::Tensor sx, torch:
                 torch::Tensor vtok, std::vector<int64_t> children, torch::Tensor calls) {
     TORCH_CHECK(approx.is_xpu() && approx.scalar_type() == at::kBFloat16 && approx.is_contiguous(), "approx: bf16 row");
     const int64_t N = approx.numel();
-    TORCH_CHECK(w.scalar_type() == at::kChar && w.is_contiguous() && w.dim() == 2 && w.size(0) == N, "w: int8 [N, K]");
-    const int64_t K = w.size(1);
-    TORCH_CHECK(K % 64 == 0 && K <= 16384, "K");
-    TORCH_CHECK(qx.scalar_type() == at::kChar && qx.is_contiguous() && qx.numel() == K, "qx: int8 [K]");
-    TORCH_CHECK(sx.scalar_type() == at::kFloat && sx.numel() == 1, "sx: one float");
-    TORCH_CHECK(sw.scalar_type() == at::kFloat && sw.is_contiguous() && sw.numel() == N, "sw: float [N]");
+    // no weight: the scores are the exact logits themselves (a top-n pick with the outputs, no recompute)
+    const bool exact = w.numel() == 0;
+    int64_t K = 0;
+    if (!exact) {
+        TORCH_CHECK(w.scalar_type() == at::kChar && w.is_contiguous() && w.dim() == 2 && w.size(0) == N, "w: int8 [N, K]");
+        K = w.size(1);
+        TORCH_CHECK(K % 64 == 0 && K <= 16384, "K");
+        TORCH_CHECK(qx.scalar_type() == at::kChar && qx.is_contiguous() && qx.numel() == K, "qx: int8 [K]");
+        TORCH_CHECK(sx.scalar_type() == at::kFloat && sx.numel() == 1, "sx: one float");
+        TORCH_CHECK(sw.scalar_type() == at::kFloat && sw.is_contiguous() && sw.numel() == N, "sw: float [N]");
+    }
     TORCH_CHECK(N >= DP_CAND && N < (int64_t(1) << 31), "rows");
     TORCH_CHECK(nout >= 1 && nout <= DP_MAXN, "1 <= nout <= 8");
     TORCH_CHECK(top.numel() == 0 || (top.scalar_type() == at::kLong && top.is_contiguous() && top.numel() >= nout), "top");
@@ -117,10 +122,10 @@ void draft_pick(torch::Tensor approx, torch::Tensor qx, torch::Tensor sx, torch:
     auto* cnt = reinterpret_cast<uint32_t*>(pra + DP_NW);
 
     const auto* ap = reinterpret_cast<const uint16_t*>(approx.data_ptr());
-    const auto* qp = reinterpret_cast<const int8_t*>(qx.data_ptr());
-    const float* sxp = sx.data_ptr<float>();
-    const auto* wp = reinterpret_cast<const int8_t*>(w.data_ptr());
-    const float* swp = sw.data_ptr<float>();
+    const auto* qp = exact ? nullptr : reinterpret_cast<const int8_t*>(qx.data_ptr());
+    const float* sxp = exact ? nullptr : sx.data_ptr<float>();
+    const auto* wp = exact ? nullptr : reinterpret_cast<const int8_t*>(w.data_ptr());
+    const float* swp = exact ? nullptr : sw.data_ptr<float>();
     int64_t* tp = top.numel() ? top.data_ptr<int64_t>() : nullptr;
     int64_t* rp = ranks_row.numel() ? ranks_row.data_ptr<int64_t>() : nullptr;
     int64_t* kp = token.data_ptr<int64_t>();
@@ -217,7 +222,10 @@ void draft_pick(torch::Tensor approx, torch::Tensor qx, torch::Tensor sx, torch:
             if (sid < DP_SEL) {
                 const int c = sel[sid];
                 uint64_t rt = 0, ra = 0;
-                if (c >= 0) {
+                if (c >= 0 && !wp) {
+                    rt = dp_rank_topk(ap[c], uint32_t(c));
+                    ra = dp_rank_argmax(ap[c], uint32_t(c));
+                } else if (c >= 0) {
                     const int8_t* row = wp + int64_t(c) * KK;
                     int32_t acc = 0;
                     for (int k0b = lane * 16; k0b < KK; k0b += 16 * 16) {

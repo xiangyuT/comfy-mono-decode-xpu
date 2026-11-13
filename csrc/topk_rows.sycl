@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: Apache-2.0
+// Exact top-k (k <= 64) of a few long FP32 rows, one launch: the verify step's sampling filter
+// (torch.topk(logits.float(), top_k) over 8 x 248k in ComfyUI's processed_probs; about 270 us in torch
+// XPU's sbtopk gather + segmented sort).
+//
+// torch XPU topk on [R, N] FP32 returns, per row, the k largest by the radix key (TopKTypeConfig<float>:
+// NaN on top, -0 below +0), sorted descending, ties in gather order: iteration i / 32768, then thread
+// (i % 4096) / 4, then load (i % 32768) / 4096, then lane i % 4 (1024 threads x 8 vector loads of 4 per
+// 32768-element iteration). Checked against torch on tie-heavy, +-0 and NaN rows. A 64-bit rank (radix key,
+// then the inverted gather key) orders the elements exactly that way and is unique per row.
+//
+// One work-group per row. Pass 1: each thread's largest radix key (rows t + 1024 j). A 16-ary search over
+// the top 16 bits of those 1024 maxima gives a threshold L with at least k maxima, hence at least k
+// elements, at or above it (bf16 resolution: exact for bf16-valued logits). Pass 2 collects the elements at
+// or above L (usually k plus a few) and ranks them. If more than 1024 qualify (heavy ties at L), an exact
+// 16-ary search over the full 64-bit rank finds the k-th element instead (slow, correct).
+#include <cstdint>
+#include <vector>
+
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <torch/extension.h>
+
+namespace mono_decode_xpu {
+namespace {
+constexpr int TR_WG = 1024, TR_MAXK = 64, TR_CAP = 1024, TR_NSG = TR_WG / 16, TR_NQ = 15, TR_MAXR = 16;
+
+inline uint32_t tr_key(uint32_t bits) {
+    const bool nan = (bits & 0x7FFFFFFFu) > 0x7F800000u;
+    return nan ? 0xFFFFFFFFu : (bits ^ ((bits & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u));
+}
+inline uint64_t tr_rank(uint32_t key, uint32_t i) {
+    const uint32_t off = i & 32767u;
+    const uint32_t g = ((i >> 15) << 15) | (((off & 4095u) >> 2) << 5) | ((off >> 12) << 2) | (off & 3u);
+    return (uint64_t(key) << 32) | uint64_t(0xFFFFFFFFu - g);
+}
+inline int64_t tr_index(uint64_t r) {
+    const uint32_t g = 0xFFFFFFFFu - uint32_t(r);
+    const uint32_t it = g >> 15, th = (g >> 5) & 1023u, ld = (g >> 2) & 7u, ln = g & 3u;
+    return int64_t((it << 15) | (ld << 12) | (th << 2) | ln);
+}
+template <typename T>
+using tr_local = sycl::atomic_ref<T, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                  sycl::access::address_space::local_space>;
+
+// work-group sums of 15 per-thread counts (sub-group reduce, then one exchange); all threads get tot[]
+template <typename F>
+inline void tr_counts(sycl::nd_item<1>& it, const sycl::local_accessor<int, 1>& part, const sycl::local_accessor<int, 1>& tot, F count) {
+    auto sg = it.get_sub_group();
+    const int t = it.get_local_id(0), sid = int(sg.get_group_linear_id()), lane = int(sg.get_local_linear_id());
+#pragma unroll
+    for (int q = 0; q < TR_NQ; ++q) {
+        const int c = sycl::reduce_over_group(sg, count(q), sycl::plus<int>());
+        if (lane == 0) part[sid * TR_NQ + q] = c;
+    }
+    sycl::group_barrier(it.get_group());
+    if (t < TR_NQ) {
+        int c = 0;
+        for (int s = 0; s < TR_NSG; ++s) c += part[s * TR_NQ + t];
+        tot[t] = c;
+    }
+    sycl::group_barrier(it.get_group());
+}
+class TopkRowsKernel;
+}  // namespace
+
+std::vector<torch::Tensor> topk_rows(torch::Tensor x, int64_t k) {
+    TORCH_CHECK(x.is_xpu() && x.scalar_type() == at::kFloat && x.is_contiguous() && x.dim() == 2, "x: contiguous fp32 [R, N]");
+    const int64_t R = x.size(0), N = x.size(1);
+    TORCH_CHECK(R >= 1 && R <= TR_MAXR, "1 <= rows <= 16");
+    TORCH_CHECK(k >= 1 && k <= TR_MAXK && N >= k && N < (int64_t(1) << 31), "1 <= k <= 64, k <= N");
+    auto values = torch::empty({R, k}, x.options());
+    auto indices = torch::empty({R, k}, x.options().dtype(at::kLong));
+    const auto* xp = reinterpret_cast<const uint32_t*>(x.data_ptr());
+    float* vp = values.data_ptr<float>();
+    int64_t* ip = indices.data_ptr<int64_t>();
+    const int K = int(k), NN = int(N);
+    c10::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> part(TR_NSG * TR_NQ, cgh);
+        sycl::local_accessor<int, 1> tot(TR_NQ, cgh);
+        sycl::local_accessor<uint64_t, 1> cand(TR_CAP, cgh);
+        sycl::local_accessor<int, 1> ctr(1, cgh);
+        cgh.parallel_for<TopkRowsKernel>(sycl::nd_range<1>(R * TR_WG, TR_WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const int t = it.get_local_id(0), row = it.get_group(0);
+            auto grp = it.get_group();
+            const uint32_t* xr = xp + int64_t(row) * NN;
+            // pass 1: this thread's largest key, 8 loads in flight
+            uint32_t mx = 0;
+            for (int i0 = t; i0 < NN; i0 += 8 * TR_WG) {
+                uint32_t b[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) b[u] = i0 + u * TR_WG < NN ? xr[i0 + u * TR_WG] : 0u;
+#pragma unroll
+                for (int u = 0; u < 8; ++u)
+                    if (i0 + u * TR_WG < NN) mx = sycl::max(mx, tr_key(b[u]) | 1u);  // | 1: 0 means none
+            }
+            // the threshold: the largest 16-bit prefix L with count(max >> 16 >= L) >= k
+            uint32_t L = 0;
+            for (int s = 12; s >= 0; s -= 4) {
+                tr_counts(it, part, tot, [&](int q) { return int((mx >> 16) >= (L | (uint32_t(q + 1) << s))); });
+                int qs = 0;
+#pragma unroll
+                for (int q = 0; q < TR_NQ; ++q) if (tot[q] >= K) qs = q + 1;
+                L |= uint32_t(qs) << s;
+                sycl::group_barrier(grp);  // part / tot reused
+            }
+            const uint32_t thr = L << 16;  // keys >= thr: at least k elements
+            // pass 2: collect them
+            if (t == 0) ctr[0] = 0;
+            sycl::group_barrier(grp);
+            for (int i0 = t; i0 < NN; i0 += 8 * TR_WG) {
+                uint32_t b[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) b[u] = i0 + u * TR_WG < NN ? xr[i0 + u * TR_WG] : 0u;
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const int i = i0 + u * TR_WG;
+                    if (i < NN) {
+                        const uint32_t key = tr_key(b[u]);
+                        if (key >= thr) {
+                            const int slot = tr_local<int>(ctr[0]).fetch_add(1);
+                            if (slot < TR_CAP) cand[slot] = tr_rank(key, uint32_t(i));
+                        }
+                    }
+                }
+            }
+            sycl::group_barrier(grp);
+            const int n = ctr[0];
+            if (n <= TR_CAP) {
+                // rank the candidates: position = number of larger candidates
+                for (int j = t; j < n; j += TR_WG) {
+                    const uint64_t v = cand[j];
+                    int pos = 0;
+                    for (int q = 0; q < n; ++q) pos += cand[q] > v;
+                    if (pos < K) {
+                        const int64_t idx = tr_index(v);
+                        ip[int64_t(row) * K + pos] = idx;
+                        vp[int64_t(row) * K + pos] = sycl::bit_cast<float>(xr[idx]);
+                    }
+                }
+                return;
+            }
+            // heavy ties at the threshold: the exact k-th rank by a 16-ary search over 64 bits (re-reading
+            // the row each step), then the k elements at or above it
+            uint64_t P = 0;
+            for (int s = 60; s >= 0; s -= 4) {
+                int c[TR_NQ];
+#pragma unroll
+                for (int q = 0; q < TR_NQ; ++q) c[q] = 0;
+                for (int i = t; i < NN; i += TR_WG) {
+                    const uint64_t r = tr_rank(tr_key(xr[i]), uint32_t(i));
+#pragma unroll
+                    for (int q = 0; q < TR_NQ; ++q) c[q] += r >= (P | (uint64_t(q + 1) << s));
+                }
+                tr_counts(it, part, tot, [&](int q) { return c[q]; });
+                int qs = 0;
+#pragma unroll
+                for (int q = 0; q < TR_NQ; ++q) if (tot[q] >= K) qs = q + 1;
+                P |= uint64_t(qs) << s;
+                sycl::group_barrier(grp);
+            }
+            if (t == 0) ctr[0] = 0;
+            sycl::group_barrier(grp);
+            for (int i = t; i < NN; i += TR_WG) {  // exactly k ranks are >= P (ranks are unique)
+                const uint64_t r = tr_rank(tr_key(xr[i]), uint32_t(i));
+                if (r >= P) {
+                    const int slot = tr_local<int>(ctr[0]).fetch_add(1);
+                    if (slot < TR_CAP) cand[slot] = r;
+                }
+            }
+            sycl::group_barrier(grp);
+            const int m = sycl::min(ctr[0], TR_CAP);
+            for (int j = t; j < m; j += TR_WG) {
+                const uint64_t v = cand[j];
+                int pos = 0;
+                for (int q = 0; q < m; ++q) pos += cand[q] > v;
+                if (pos < K) {
+                    const int64_t idx = tr_index(v);
+                    ip[int64_t(row) * K + pos] = idx;
+                    vp[int64_t(row) * K + pos] = sycl::bit_cast<float>(xr[idx]);
+                }
+            }
+        });
+    });
+    return {values, indices};
+}
+}  // namespace mono_decode_xpu

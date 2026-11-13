@@ -27,7 +27,8 @@ import time
 
 import torch
 
-from . import autotree, draft_lmhead, guard, tiles
+from . import autotree, draft_head, draft_lmhead, guard, tiles
+from . import sampling as _sampling  # (_device_generate's `sampling` is the sampling parameters)
 
 CLAIM = "__comfy_mono_decode_xpu_mtp_loop__"
 MODE = os.environ.get("MONO_DECODE_XPU_DEVICE_MTP", "1")
@@ -69,7 +70,7 @@ _stats = {"generates": 0, "steps": 0, "fallback": {}, "shadow_mismatch": 0, "sha
 
 def stats():
     with _lock:
-        return dict(_stats, fallback=dict(_stats["fallback"]))
+        return dict(_stats, fallback=dict(_stats["fallback"]), draft_head=draft_head.stats())
 
 
 def _fallback(why):
@@ -256,6 +257,8 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
     # experimental two-stage draft lm_head (MONO_DECODE_XPU_DRAFT_INT4): None unless enabled and eligible
     lm2 = draft_lmhead.DraftLMHead.create(_C, head, device) if draft_lmhead.enabled() else None
     lm2_on = lm2 is not None and draft_lmhead.MODE == "1"
+    # the fused draft head (MONO_DECODE_XPU_DRAFT_FUSED): None runs the eager head
+    dh = draft_head.DraftHead.create(_C, self, device, lm2 if lm2_on else None) if draft_head.enabled() else None
     adaptive = mtp is True
     widths = (4, 3)
     hits = [[0.0] * 8 for _ in range(7)]
@@ -315,8 +318,9 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
         rows = lg[0] if s is None else lg[0].float()
         if s is None:
             return rows.argmax(dim=-1).unsqueeze(0)
-        return self.sample_token(rows, s["temperature"], s["top_k"], s["top_p"], s["min_p"], 1.0, [],
-                                 generator).transpose(0, 1)
+        with _sampling.topk_mode(_C):  # upstream's sampling; its top-k filter served exactly by topk_rows
+            out = self.sample_token(rows, s["temperature"], s["top_k"], s["top_p"], s["min_p"], 1.0, [], generator)
+        return out.transpose(0, 1)
 
     def enqueue(s):
         """Queue step s entirely on the device: drafts, verify, sampling, accept; returns its record."""
@@ -325,9 +329,18 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
         if ev:
             ev[0].record()
         verify_tokens[:, :1].copy_(nt_buf)
-        draft_hidden.copy_(h_buf)
+        if dh is None:
+            draft_hidden.copy_(h_buf)
+        hid = h_buf  # the fused head: a draft's pre-norm hidden feeds the next one directly
         for k in range(depth):
             _C.mtp_prep_draft(st, k, ftab, draft_freqs, mtp_kv.position, mtp_kv.seqlen)
+            if dh is not None:
+                children = tree.children[k]
+                nout = 7 if adaptive else max(tree.fanout, 1)
+                top = draft_top if adaptive or tree.fanout > 1 else None
+                hid = dh.forward(verify_tokens[:, k:k + 1], hid, draft_freqs, mtp_kv)
+                dh.pick(nout, not adaptive, top, draft_ranks[k] if adaptive else None, draft_token, verify_tokens, children)
+                continue
             draft_token.copy_(verify_tokens[:, k:k + 1])
             draft_emb.copy_(embed_rows(draft_token))
             n1, r1 = self.mtp(draft_emb, draft_hidden, draft_freqs, mtp_kv)
@@ -462,6 +475,9 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
         comfy.model_prefetch.cleanup_prefetch_queues()
         for kv in pkv + [mtp_kv]:
             kv._mono_device = False
+        if dh is not None:
+            with _lock:
+                _stats["draft_fused"] = _stats.get("draft_fused", 0) + int(dh.calls.item())
         if lm2 is not None:
             calls, bad, checked = lm2.counters()
             with _lock:

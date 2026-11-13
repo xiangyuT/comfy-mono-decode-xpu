@@ -137,6 +137,44 @@ draft hiddens the exact top-7 with ties always lay within the int4 top-32 (group
 `check` mode found 0 mismatches over 8432 drafts. A first version gave each thread 8 consecutive rows
 and missed 6% of drafts, because the top-7 often holds adjacent token ids.
 
+#### Fused draft head (`MONO_DECODE_XPU_DRAFT_FUSED`, default on)
+
+Inside the device loop `draft_head.py` replaces the eager draft (embedding lookup, `MTPHead.forward`,
+lm_head, top-k and the copies after it: 45 launches, about 35 of them small). It keeps upstream's
+structure and the oneDNN GEMMs on BF16 weights owned for the generate (q|k|v and gate|up concatenated,
+about 0.47 GB, instead of draft.py's copies) and fuses the rest (`csrc/draft_fused.sycl`): the int8
+ConvRot embedding row (gather, scale, un-rotate) with both pre-fc RMSNorms and the cat; the input
+norm; `attn * sigmoid(gate)`; `x += o` with the post-attention norm; `silu(gate) * up`; `x += down`
+with the final norm, the lm_head's ConvRot rotation and rowwise INT8 quantization. The lm_head runs
+as the prequantized INT8 GEMM and `draft_pick` (exact mode: the logits as they are) writes the top-n,
+argmax, rank row and the children's verify tokens. A draft is 17 launches. The ConvRot rotations are
+4-stage 4-point butterflies in local memory (H256 = kron(h4, h4, h4, h4) / 16, symmetric): a dense
+256 x 256 product per output, reading H from global memory, took 95 us per call; the butterflies 9.
+The next draft reads the previous one's pre-norm hidden directly (no copies).
+
+Drafts follow the eager arithmetic in FP32 but not its reduction order (the user allowed the draft
+to be non-bitwise; the verify decides every output token). Measured on B70 (H3 PE): accepted
+tokens per step on the fixed tree4s1m8 with sampling 3.026 against 3.043 eager (4 seeds each, within
+the seed spread); a draft 2.75 -> 2.69 ms by the loop's device events (profiles show 2.80 -> 2.67 ms,
+the profiler widens the eager head's many gaps). Observing wrappers on `mtp.forward` (autotree, dev
+tools) are marked `_mono_observer`; a head that bypasses forward calls their `_mono_on_draft`.
+
+#### Verify sampling top-k (`MONO_DECODE_XPU_SAMPLE_TOPK`, default on)
+
+`processed_probs` starts with `torch.topk(logits.float(), top_k)` over the verify rows (8 x 248320):
+270 us of torch XPU's sbtopk gather plus a segmented sort per step. Inside the device loop's verify
+sampling a `TorchFunctionMode` serves that call with `topk_rows`, which returns the same values and
+indices in torch's order: radix key descending (NaN on top, -0 below +0), ties in gather order
+(iteration i / 32768, then thread (i % 4096) / 4, then load (i % 32768) / 4096, then lane i % 4),
+established on 40 random tie-heavy, +-0 and NaN trials and checked bit for bit in the unit tests and
+on 3171 real calls (`check` mode). One work-group per row: each thread's largest key, a 16-ary search
+over their top 16 bits gives a threshold with at least k elements above it, a second pass collects
+those (usually k plus a few) and ranks them by the 64-bit (key, gather) rank; heavy ties at the
+threshold fall back to an exact 64-bit search (slow, correct). 48 us. A first version with 16
+work-groups per row and a 64-bit search in each took 603 us (48 barriers, 4 waves of work-groups).
+Everything else in the sampling is upstream's (temperature, min-p, top-p, softmax, multinomial).
+The tail of a step goes from 2.16 to 1.95 ms.
+
 ### DynamicVRAM
 
 - Each call takes the linear's GPU weight from `comfy.ops.CastBiasWeightContext`, the same VBAR
@@ -255,14 +293,12 @@ inputs (`tests/`). What it took:
 
 ## Not done / ideas
 
-- Draft path after the two-stage lm_head (B70, device loop, per draft): about 30 small ops plus their
-  gaps take about 0.17 ms (the int8 embedding gather chain, two norms and the cat, gate / residual
-  element-wise ops, the lm_head's rotate and quantize); the 8 oneDNN BF16 GEMMs run at about 531 GB/s
-  (0.87 ms; about 0.1 ms above the roof). A fused or persistent draft head could take about 0.5 ms
-  per step.
-- Verify sampling: torch `topk(20)` over 8 x 248k logits (`SbtopkGather`) takes about 250 us of the
-  0.4 ms sampling per step; an exact top-20 in `fast_topk`'s style (values, indices, tie order) would
-  cover most of it.
+- Draft head after the fused head (B70, device loop, per draft): the oneDNN BF16 GEMMs run at about
+  490-585 GB/s (fc 130 us for 64 MB is the slowest); the 12 small launches take about 0.15 ms with
+  their gaps. A persistent draft kernel with its own GEMV could take most of both.
+- Verify sampling after topk_rows: about 20 small torch ops (min-p / top-p / softmax / multinomial on
+  8 x k) and the 24 us `.float()` copy of the logits remain; `topk_rows` itself (48 us, one
+  work-group per row) could split each row over several work-groups.
 
 - Tried without gain (2026-11-12): attention register prefetch of the next tile (exact, 12% slower);
   32-row attention packs (slower at short contexts); skipping `layer_post`'s pair-table rebuilds (no
