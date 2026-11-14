@@ -119,3 +119,7 @@ def test_mtp_prep_matches_host_prepare(C):
     assert apos.tolist() == list(range(37, 45)) and aseq.item() == 37
     assert vpos.view(-1).tolist() == [37 + 5 + d for d in tpos.tolist()]
     assert ctl.tolist()[1] == 1 and ctl.tolist()[10:] == list(range(100, 116))
+    verify_freqs = torch.empty(1, 1, 8, 32, 2, 2, device=dev)
+    C.mtp_prep_verify(st, apos, aseq, vpos, tpos, ctl, tctl, 0, 5, ftab, verify_freqs)
+    assert torch.equal(verify_freqs, ftab.index_select(2, tpos + 37))
+    assert vpos.view(-1).tolist() == [37 + 5 + d for d in tpos.tolist()]

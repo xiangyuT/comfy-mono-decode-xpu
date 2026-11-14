@@ -12,6 +12,7 @@
 // st (int64 [4]) is the loop's device state: st[0] committed length (attention index), st[1] MTP KV length.
 
 #include <sycl/sycl.hpp>
+#include <optional>
 #include <c10/xpu/XPUStream.h>
 #include <torch/extension.h>
 
@@ -54,7 +55,7 @@ void mtp_prep_draft(torch::Tensor st, int64_t k, torch::Tensor ftab, torch::Tens
 
 void mtp_prep_verify(torch::Tensor st, torch::Tensor apos, torch::Tensor aseq, torch::Tensor vpos,
                      torch::Tensor tree_pos, torch::Tensor ctl, torch::Tensor tree_ctl, int64_t parity,
-                     int64_t rope_offset) {
+                     int64_t rope_offset, std::optional<torch::Tensor> ftab, std::optional<torch::Tensor> freqs) {
     check_i64(st, "st");
     check_i64(apos, "attention position");
     check_i64(vpos, "verify positions");
@@ -64,6 +65,24 @@ void mtp_prep_verify(torch::Tensor st, torch::Tensor apos, torch::Tensor aseq, t
                 && tree_ctl.numel() == 2 * SLOTS && tree_ctl.is_xpu(), "ctl / tree program");
     const int rows = int(vpos.numel()), np = int(apos.numel());
     TORCH_CHECK(tree_pos.numel() == rows && rows <= SLOTS && np <= 64, "rows");
+    TORCH_CHECK(ftab.has_value() == freqs.has_value(), "provide both rope table and verify buffer");
+    int64_t row_size = 0;
+    const float* table = nullptr;
+    float* rotary = nullptr;
+    if (ftab) {
+        TORCH_CHECK(ftab->device() == st.device() && freqs->device() == st.device()
+                    && ftab->scalar_type() == at::kFloat && freqs->scalar_type() == at::kFloat
+                    && ftab->is_contiguous() && freqs->is_contiguous()
+                    && ftab->dim() >= 3 && freqs->dim() == ftab->dim()
+                    && ftab->size(0) == 1 && ftab->size(1) == 1 && ftab->size(2) > 0
+                    && freqs->size(2) == rows, "FP32 rope table / verify buffer on state device");
+        row_size = ftab->numel() / ftab->size(2);
+        TORCH_CHECK(row_size > 0 && freqs->numel() == rows * row_size, "verify rope row size");
+        for (int d = 0; d < ftab->dim(); ++d)
+            TORCH_CHECK(d == 2 || freqs->size(d) == ftab->size(d), "matching rope row dimensions");
+        table = ftab->data_ptr<float>();
+        rotary = freqs->data_ptr<float>();
+    }
     const int64_t* sp = st.data_ptr<int64_t>();
     int64_t* ap = apos.data_ptr<int64_t>();
     int* aq = aseq.data_ptr<int>();
@@ -80,6 +99,12 @@ void mtp_prep_verify(torch::Tensor st, torch::Tensor apos, torch::Tensor aseq, t
         if (t < rows) vp[t] = tp[t] + pos + rope_offset;  // tree.positions + pos + rope_offset
         if (t == 0) cp[1] = int(parity);  // LinearKV.prepare: this step's side buffers
         if (t < 2 * SLOTS) cp[2 + SLOTS + t] = tc[t];  // parent[], prog[] of this step's tree
+        // The generate owns a table covering its entire position range. Its
+        // first row already contains rope_offset, so index it with pos + depth.
+        for (int64_t i = t; i < rows * row_size; i += 64) {
+            const int64_t row = i / row_size, col = i % row_size;
+            rotary[i] = table[(pos + tp[row]) * row_size + col];
+        }
     });
 }
 

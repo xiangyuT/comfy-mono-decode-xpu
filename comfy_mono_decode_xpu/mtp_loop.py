@@ -34,6 +34,7 @@ CLAIM = "__comfy_mono_decode_xpu_mtp_loop__"
 MODE = os.environ.get("MONO_DECODE_XPU_DEVICE_MTP", "1")
 # the draft head's XPU graph saves host time, which the asynchronous loop already hides (measured: no gain)
 GRAPH_IN_LOOP = os.environ.get("MONO_DECODE_XPU_DEVICE_MTP_GRAPH", "0") == "1"
+VERIFY_FREQS = os.environ.get("MONO_DECODE_XPU_VERIFY_FREQS", "1") == "1"
 _tls = threading.local()
 
 
@@ -278,6 +279,7 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
     verify_tokens = torch.zeros((embeds.shape[0], tree.rows), device=device, dtype=torch.long)
     verify_buffers = (torch.empty((embeds.shape[0], tree.rows, cfg.hidden_size), device=device, dtype=dt),
                       ftab[:, :, pos:pos + tree.rows].clone())
+    freqs_checked = False
     draft_top = torch.empty((embeds.shape[0], 7 if adaptive else tree.fanout), device=device, dtype=torch.long)
     embed = self.model.embed_tokens
     de = verify_head.EmbeddingRows.create(_C, embed, device)
@@ -339,7 +341,7 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
 
     def enqueue(s):
         """Queue step s entirely on the device: drafts, verify, sampling, accept; returns its record."""
-        nonlocal parity
+        nonlocal parity, freqs_checked
         ev = [torch.xpu.Event(enable_timing=True) for _ in range(2)] if timed else None
         if ev:
             ev[0].record()
@@ -383,10 +385,21 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
         if ev:
             ev[1].record()
         parity ^= 1
-        _C.mtp_prep_verify(st, apos, aseq, verify_pos, tree.positions.reshape(-1), ctl, tree_ctl_dev, parity, rope_offset)
+        args = (ftab, verify_buffers[1]) if VERIFY_FREQS else ()
+        _C.mtp_prep_verify(st, apos, aseq, verify_pos, tree.positions.reshape(-1), ctl, tree_ctl_dev, parity, rope_offset,
+                           *args)
+        if VERIFY_FREQS and not freqs_checked:
+            ref = rope_matrix(self.model.compute_freqs_cis(verify_pos, device))
+            if not torch.equal(verify_buffers[1].view(torch.int32), ref.view(torch.int32)):
+                raise ArithmeticError("verify frequency table differs from live position calculation")
+            freqs_checked = True
+        if VERIFY_FREQS:
+            with _lock:
+                _stats["verify_freqs"] = _stats.get("verify_freqs", 0) + 1
         with vh.capture() if vh is not None else contextlib.nullcontext():
             x, _, _ = self.model.forward(None, embeds=embed_rows(verify_tokens), attention_mask=None, past_key_values=pkv,
-                                         position_ids=verify_pos, decode_buffers=verify_buffers)
+                                         position_ids=verify_pos, decode_buffers=verify_buffers,
+                                         freqs_cis=verify_buffers[1] if VERIFY_FREQS else None)
         lg = verify_logits(x)
         toks = lg.argmax(dim=-1) if sampling is None else verify_sample(lg)
         slot = ring[s % RING]

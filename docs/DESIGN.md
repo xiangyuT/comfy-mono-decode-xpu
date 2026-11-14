@@ -196,6 +196,13 @@ top_k 0 / 7 / 20 / 64, top-p, min-p). The tail of a step goes from 2.16 to about
 
 #### Remaining verify preparation and sampling
 
+`VERIFY_FREQS` shares the RoPE table already used by MTP drafts. The existing
+device verify preparation selects `committed_position + tree_depth` rows while
+updating positions and control state. The table already includes the RoPE offset.
+The model receives the resulting matrix through its public `freqs_cis` argument,
+removing per-step frequency arithmetic and matrix construction. First use checks
+the result bitwise against the model's live position-based computation.
+
 `VERIFY_HEAD` shares the final RMSNorm and ConvRot quantization in one launch,
 returning the normalized BF16 hidden as well as the head's quantized activation.
 The hidden passed to MTP accept is unchanged. This reuses the persistent engine's

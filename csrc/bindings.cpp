@@ -61,7 +61,7 @@ void mtp_prep_draft(torch::Tensor st, int64_t k, torch::Tensor ftab, torch::Tens
                     torch::Tensor mseq);
 void mtp_prep_verify(torch::Tensor st, torch::Tensor apos, torch::Tensor aseq, torch::Tensor vpos,
                      torch::Tensor tree_pos, torch::Tensor ctl, torch::Tensor tree_ctl, int64_t parity,
-                     int64_t rope_offset);
+                     int64_t rope_offset, std::optional<torch::Tensor> ftab, std::optional<torch::Tensor> freqs);
 void mtp_accept(torch::Tensor st, torch::Tensor toks, torch::Tensor vtok, torch::Tensor cand, torch::Tensor children,
                 int64_t rows, int64_t depth, torch::Tensor x, torch::Tensor nt_buf, torch::Tensor h_buf,
                 torch::Tensor ctl, torch::Tensor kv_ptrs, int64_t kv_heads, int64_t kv_cap, int64_t head_dim,
@@ -84,7 +84,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("attn_core", &mono_decode_xpu::attn_core);
     m.def("attn_dpas", &mono_decode_xpu::attn_dpas);
     m.def("mtp_prep_draft", &mono_decode_xpu::mtp_prep_draft);
-    m.def("mtp_prep_verify", &mono_decode_xpu::mtp_prep_verify);
+    m.def("mtp_prep_verify", &mono_decode_xpu::mtp_prep_verify,
+          py::arg("st"), py::arg("apos"), py::arg("aseq"), py::arg("vpos"), py::arg("tree_pos"),
+          py::arg("ctl"), py::arg("tree_ctl"), py::arg("parity"), py::arg("rope_offset"),
+          py::arg("ftab") = py::none(), py::arg("freqs") = py::none());
     m.def("mtp_accept", &mono_decode_xpu::mtp_accept);
     m.def("draft_pick", &mono_decode_xpu::draft_pick);
     m.def("fast_topk", &mono_decode_xpu::fast_topk);
