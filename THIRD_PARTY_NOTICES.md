@@ -57,3 +57,8 @@ third-party sources. Those sources and their licenses are listed below.
 - Copyright 2020-2026 Intel Corporation. Licensed under Apache License 2.0.
 - `csrc/rope_kv.sycl` preserves its D256 vectorized RMSNorm reduction and output order
   when fusing gated Q normalization with RoPE and KV writes.
+- `csrc/sampling.sycl` follows the small-row FP32 softmax reduction and loop-scan
+  arithmetic in `src/ATen/native/xpu/sycl/SoftMaxKernels.cpp` and `ScanUtils.h`
+  at `7a617719077a9bdc1515661f2dd8b2af5cc26b2f` of the same Intel repository.
+  The exponential RNG remains a Torch operation; no generator implementation is
+  copied into this project.

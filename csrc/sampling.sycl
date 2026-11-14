@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: Apache-2.0
+// The small, sorted top-k rows of Qwen3.5 verify sampling. Keep torch's top-k
+// ordering, FP32 softmax reduction and inclusive-scan order; RNG stays with the
+// caller's torch generator. No vocabulary truncation beyond the requested k.
+#include <cmath>
+#include <limits>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/math.hpp>
+#include <torch/extension.h>
+
+namespace mono_decode_xpu {
+namespace {
+class SamplingProbsKernel;
+
+// torch XPU's small FP32 softmax uses SIMD16, four adjacent values per lane
+// when k is divisible by four, otherwise one value per lane, strided by 16.
+template <int V>
+inline void small_softmax(sycl::sub_group sg, const float* in, float* out, int k) {
+#pragma clang fp contract(off)
+    const int lane = sg.get_local_linear_id();
+    if constexpr (V == 1) {
+        if (k <= 16) {
+            // For these unaligned short rows torch assigns an entire row to
+            // one work-item, accumulating in increasing column order.
+            if (lane == 0) {
+                float mx = -std::numeric_limits<float>::max(), sum = 0.f;
+                for (int j = 0; j < k; ++j) mx = mx < in[j] ? in[j] : mx;
+                for (int j = 0; j < k; ++j) sum += sycl::exp(in[j] - mx);
+                const float inv = sycl::ext::intel::math::fdiv_rn(1.f, sum);
+                for (int j = 0; j < k; ++j) out[j] = sycl::exp(in[j] - mx) * inv;
+            }
+            return;
+        }
+    }
+    float x[4], mx = -std::numeric_limits<float>::max();
+    for (int j = 0; j < 4; ++j) {
+        const int c = V == 4 ? lane * 4 + j : lane + 16 * j;
+        x[j] = c < k ? in[c] : -std::numeric_limits<float>::max();
+        mx = mx < x[j] ? x[j] : mx;
+    }
+    for (int d = 1; d < 16; d *= 2) {
+        const float b = sycl::shift_group_left(sg, mx, d);
+        mx = mx < b ? b : mx;
+    }
+    mx = sycl::group_broadcast(sg, mx, 0);
+    float sum = 0.f;
+    for (int j = 0; j < 4; ++j) {
+        const int c = V == 4 ? lane * 4 + j : lane + 16 * j;
+        if (c < k) sum += sycl::exp(x[j] - mx);
+    }
+    for (int d = 1; d < 16; d *= 2) sum += sycl::shift_group_left(sg, sum, d);
+    const float inv = sycl::ext::intel::math::fdiv_rn(1.f, sycl::group_broadcast(sg, sum, 0));
+    for (int j = 0; j < 4; ++j) {
+        const int c = V == 4 ? lane * 4 + j : lane + 16 * j;
+        if (c < k) out[c] = sycl::exp(x[j] - mx) * inv;
+    }
+}
+} // namespace
+
+std::vector<torch::Tensor> sampling_pick(torch::Tensor sorted, torch::Tensor indices, torch::Tensor noise,
+                                       double top_p, double min_p) {
+    TORCH_CHECK(sorted.is_xpu() && sorted.scalar_type() == at::kFloat && sorted.is_contiguous()
+                && sorted.dim() == 2, "sorted logits: contiguous XPU FP32 [rows, k]");
+    const int rows = int(sorted.size(0)), k = int(sorted.size(1));
+    TORCH_CHECK(rows >= 1 && rows <= 16 && k >= 1 && k <= 64, "1..16 rows, 1..64 sorted logits");
+    TORCH_CHECK(std::isfinite(top_p) && top_p >= 0. && top_p <= 1.
+                && std::isfinite(min_p) && min_p >= 0. && min_p <= 1., "sampling thresholds in [0,1]");
+    TORCH_CHECK(noise.device() == sorted.device() && noise.scalar_type() == at::kFloat && noise.is_contiguous()
+                && noise.sizes() == sorted.sizes(), "exponential samples: FP32 with logits shape/device");
+    TORCH_CHECK(indices.device() == sorted.device() && indices.scalar_type() == at::kLong && indices.is_contiguous()
+                && indices.sizes() == sorted.sizes(), "top-k indices: INT64 with logits shape/device");
+    auto out = torch::empty({rows, 1}, sorted.options().dtype(at::kLong));
+    auto valid = torch::empty({rows}, sorted.options().dtype(at::kBool));
+    const float* ip = sorted.data_ptr<float>();
+    const float* qp = noise.data_ptr<float>();
+    const int64_t* ids = indices.data_ptr<int64_t>();
+    int64_t* tokens = out.data_ptr<int64_t>();
+    bool* validity = valid.data_ptr<bool>();
+    const float tp = float(top_p), mp = float(min_p);
+    c10::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> logit(64, cgh), prob(64, cgh), scan(64, cgh);
+        cgh.parallel_for<SamplingProbsKernel>(sycl::nd_range<1>(rows * 32, 32),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+#pragma clang fp contract(off)
+            const int t = it.get_local_id(0), row = it.get_group(0);
+            auto sg = it.get_sub_group();
+            for (int c = t; c < k; c += 32) logit[c] = ip[row * k + c];
+            sycl::group_barrier(it.get_group());
+            auto* lp = logit.template get_multi_ptr<sycl::access::decorated::no>().get();
+            auto* pp = prob.template get_multi_ptr<sycl::access::decorated::no>().get();
+            if (mp > 0.f) {
+                if (t < 16) {
+                    if (k % 4 == 0) small_softmax<4>(sg, lp, pp, k);
+                    else small_softmax<1>(sg, lp, pp, k);
+                }
+                sycl::group_barrier(it.get_group());
+                const float threshold = mp * prob[0];
+                for (int c = t; c < k; c += 32)
+                    if (prob[c] < threshold) logit[c] = -std::numeric_limits<float>::max();
+                sycl::group_barrier(it.get_group());
+            }
+            if (tp < 1.f) {
+                if (t < 16) {
+                    if (k % 4 == 0) small_softmax<4>(sg, lp, pp, k);
+                    else small_softmax<1>(sg, lp, pp, k);
+                }
+                sycl::group_barrier(it.get_group());
+                // torch's loop scan has 32 lanes, offsets 1,2,4,8,16 and
+                // adds each preceding chunk's carry after its local scan.
+                for (int c = t; c < 64; c += 32) scan[c] = c < k ? prob[c] : 0.f;
+                sycl::group_barrier(it.get_group());
+                for (int base = 0; base < k; base += 32) {
+                    for (int d = 1; d < 32; d *= 2) {
+                        const float a = scan[base + t];
+                        const float b = t >= d ? scan[base + t - d] : 0.f;
+                        sycl::group_barrier(it.get_group());
+                        if (t >= d) scan[base + t] = b + a;
+                        sycl::group_barrier(it.get_group());
+                    }
+                    if (base) scan[base + t] = scan[base - 1] + scan[base + t];
+                    sycl::group_barrier(it.get_group());
+                }
+                for (int c = t; c < k; c += 32)
+                    if (c > 0 && scan[c - 1] >= tp) logit[c] = -std::numeric_limits<float>::max();
+                sycl::group_barrier(it.get_group());
+            }
+            if (t < 16) {
+                if (k % 4 == 0) small_softmax<4>(sg, lp, pp, k);
+                else small_softmax<1>(sg, lp, pp, k);
+            }
+            sycl::group_barrier(it.get_group());
+            {
+                // torch.multinomial(probs, 1) uses an exponential draw and
+                // argmax(probs / draw). The caller generates exactly the same
+                // draw with its torch generator; filter + divide + argmax +
+                // top-k-index gather now share this launch.
+                float best = -std::numeric_limits<float>::infinity(), pmax = 0.f;
+                int idx = k, nan_idx = k;
+                bool ok = true;
+                for (int c = t; c < k; c += 32) {
+                    const float p = prob[c];
+                    ok = ok && sycl::isfinite(p) && p >= 0.f;
+                    pmax = sycl::fmax(pmax, p);
+                    const float v = sycl::ext::intel::math::fdiv_rn(p, qp[row * k + c]);
+                    if (sycl::isnan(v)) nan_idx = sycl::min(nan_idx, c);
+                    else if (v > best || (v == best && c < idx)) { best = v; idx = c; }
+                }
+                const float mx = sycl::reduce_over_group(it.get_group(), best, sycl::maximum<float>());
+                const int ni = sycl::reduce_over_group(it.get_group(), nan_idx, sycl::minimum<int>());
+                const int bi = sycl::reduce_over_group(it.get_group(), best == mx ? idx : k, sycl::minimum<int>());
+                const bool good = sycl::all_of_group(it.get_group(), ok)
+                    && sycl::reduce_over_group(it.get_group(), pmax, sycl::maximum<float>()) > 0.f;
+                if (t == 0) {
+                    validity[row] = good;
+                    tokens[row] = good ? ids[row * k + (ni < k ? ni : bi)] : 0;
+                }
+            }
+        });
+    });
+    return {out, valid};
+}
+} // namespace mono_decode_xpu

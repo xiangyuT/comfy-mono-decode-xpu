@@ -27,7 +27,7 @@ import time
 
 import torch
 
-from . import autotree, draft_head, draft_lmhead, guard, tiles
+from . import autotree, draft_head, draft_lmhead, guard, tiles, verify_head
 from . import sampling as _sampling  # (_device_generate's `sampling` is the sampling parameters)
 
 CLAIM = "__comfy_mono_decode_xpu_mtp_loop__"
@@ -70,7 +70,7 @@ _stats = {"generates": 0, "steps": 0, "fallback": {}, "shadow_mismatch": 0, "sha
 
 def stats():
     with _lock:
-        return dict(_stats, fallback=dict(_stats["fallback"]), draft_head=draft_head.stats())
+        return dict(_stats, fallback=dict(_stats["fallback"]), draft_head=draft_head.stats(), verify_head=verify_head.stats())
 
 
 def _fallback(why):
@@ -219,6 +219,8 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
     head = self.model.lm_head if hasattr(self.model, "lm_head") else self.model.embed_tokens
 
     def verify_logits(x):
+        if vh is not None:
+            return vh.logits(x)
         if not head.comfy_cast_weights:
             return F.linear(x, head.weight.to(x), None)
         with comfy.ops.CastBiasWeightContext(head, x, offloadable=True) as (w, _bias):
@@ -259,6 +261,7 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
     lm2_on = lm2 is not None and draft_lmhead.MODE == "1"
     # the fused draft head (MONO_DECODE_XPU_DRAFT_FUSED): None runs the eager head
     dh = draft_head.DraftHead.create(_C, self, device, lm2 if lm2_on else None) if draft_head.enabled() else None
+    vh = verify_head.VerifyHead.create(_C, self, device)
     adaptive = mtp is True
     widths = (4, 3)
     hits = [[0.0] * 8 for _ in range(7)]
@@ -277,6 +280,7 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
                       ftab[:, :, pos:pos + tree.rows].clone())
     draft_top = torch.empty((embeds.shape[0], 7 if adaptive else tree.fanout), device=device, dtype=torch.long)
     embed = self.model.embed_tokens
+    de = verify_head.EmbeddingRows.create(_C, embed, device)
     draft_token = torch.empty_like(nt_buf)
     draft_emb = torch.empty_like(h_buf)
     draft_hidden = torch.empty_like(h_buf)
@@ -311,12 +315,22 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
             with _lock:
                 _stats["host_rows"] += 1
             return embed.host_rows(tokens, out_dtype=dt)  # reads the ids on the host (a sync)
+        if de is not None:
+            out = de.forward(tokens)
+            if out is not None:
+                return out
         return embed(tokens).to(dt)
+
+    fused_sampling = _sampling.fused_compatible(self) if sampling is not None else False
 
     def verify_sample(lg):
         s = sampling
         if s is None:
             return lg[0].argmax(dim=-1).unsqueeze(0)
+        if fused_sampling:
+            out = _sampling.fused_sample(_C, lg[0], s, generator)
+            if out is not None:
+                return out.transpose(0, 1)
         # upstream's sampling on lg[0].float(); its top-k filter served exactly by topk_rows
         ctx, rows = _sampling.verify_rows(_C, lg[0])
         with ctx:
@@ -370,8 +384,9 @@ def _device_generate(self, _C, llama, q35, embeds, max_length, stop_tokens, mtp,
             ev[1].record()
         parity ^= 1
         _C.mtp_prep_verify(st, apos, aseq, verify_pos, tree.positions.reshape(-1), ctl, tree_ctl_dev, parity, rope_offset)
-        x, _, _ = self.model.forward(None, embeds=embed_rows(verify_tokens), attention_mask=None, past_key_values=pkv,
-                                     position_ids=verify_pos, decode_buffers=verify_buffers)
+        with vh.capture() if vh is not None else contextlib.nullcontext():
+            x, _, _ = self.model.forward(None, embeds=embed_rows(verify_tokens), attention_mask=None, past_key_values=pkv,
+                                         position_ids=verify_pos, decode_buffers=verify_buffers)
         lg = verify_logits(x)
         toks = lg.argmax(dim=-1) if sampling is None else verify_sample(lg)
         slot = ring[s % RING]

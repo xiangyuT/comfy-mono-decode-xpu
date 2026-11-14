@@ -60,3 +60,39 @@ def test_verify_rows_sampling_matches_upstream(C, T, top_k, top_p, min_p):
             out = llama.BaseGenerate.sample_token(gen, rows, T, top_k, top_p, min_p, 1.0, [],
                                                   torch.Generator(device="xpu").manual_seed(seed))
         assert torch.equal(out, ref)
+        fused_generator = torch.Generator(device="xpu").manual_seed(seed)
+        fused = sampling.fused_sample(C, lg, dict(temperature=T, top_k=top_k, top_p=top_p, min_p=min_p), fused_generator)
+        if T == 1.0 and 1 <= top_k <= 64:
+            expected_generator = torch.Generator(device="xpu").manual_seed(seed)
+            expected = llama.BaseGenerate.sample_token(gen, lg.float(), T, top_k, top_p, min_p, 1.0, [], expected_generator)
+            assert torch.equal(fused, expected)
+            assert torch.equal(fused_generator.get_state(), expected_generator.get_state())
+        else:
+            assert fused is None
+
+
+def test_sampling_cutoff_boundaries(C):
+    """Make the token at a top-p cutoff win whenever it survives filtering.
+
+    Random multinomial trials rarely observe a one-ulp prefix-sum difference;
+    these fixed exponential samples make that boundary directly observable.
+    """
+    llama = pytest.importorskip("comfy.text_encoders.llama")
+    model = object.__new__(llama.BaseGenerate)
+    g = torch.Generator().manual_seed(411)
+    for k in (7, 17, 20, 32, 64):
+        values = torch.randn(1, k, generator=g).bfloat16().float().sort(descending=True).values.xpu()
+        ids = torch.arange(k, device="xpu").reshape(1, k)
+        cdf = values.softmax(-1).cumsum(-1)
+        for cut in (1, k // 2, k - 1):
+            boundary = cdf[0, cut - 1]
+            thresholds = (torch.nextafter(boundary, torch.full_like(boundary, -float("inf"))), boundary,
+                          torch.nextafter(boundary, torch.full_like(boundary, float("inf"))))
+            noise = torch.ones_like(values)
+            noise[0, cut] = 1e-15
+            for threshold in thresholds:
+                top_p = float(threshold)
+                ref, _ = model.processed_probs(values.clone(), 1., 0, top_p, 0.)
+                expected = (ref / noise).argmax(-1, keepdim=True)
+                out, valid = C.sampling_pick(values, ids, noise, top_p, 0.)
+                assert valid.item() and torch.equal(out, expected), (k, cut, top_p)

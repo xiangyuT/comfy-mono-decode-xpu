@@ -22,6 +22,8 @@ sort returns a copy and the cached arange instead of a 10 us segmented radix sor
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import inspect
 import os
 import threading
 
@@ -30,8 +32,55 @@ import torch
 from . import guard
 
 MODE = os.environ.get("MONO_DECODE_XPU_SAMPLE_TOPK", "1")
+FUSED_MODE = os.environ.get("MONO_DECODE_XPU_SAMPLE_FUSED", "1")
 _lock = threading.Lock()
 _stats = {"calls": 0, "checked": 0, "check_mismatch": 0, "skipped": 0}
+
+
+def fused_compatible(model):
+    """Only replace the known sampling policy, preserving instance/class overrides."""
+    from comfy.text_encoders import llama
+    sample = getattr(model.sample_token, "__func__", None)
+    processed = getattr(model.processed_probs, "__func__", None)
+    if sample is not llama.BaseGenerate.sample_token or processed is not llama.BaseGenerate.processed_probs:
+        return False
+    # autotree wraps processed_probs only to remove masked-assignment waits.
+    if getattr(processed, "__comfy_mono_decode_xpu_autotree__", False):
+        processed = processed.__wrapped__
+    try:
+        source = inspect.getsource(processed) + inspect.getsource(sample)
+    except (OSError, TypeError):
+        return False
+    return hashlib.sha256(source.encode()).hexdigest() == "d23a1250bec4d5ff1f14b240debbbd60475d3e0948caa1d7347115e116a28f65"
+
+
+def fused_sample(C, logits, policy, generator):
+    """Native filtering and pick, with torch's original exponential RNG stream.
+
+    Returns None before doing work for an unsupported contract. Once the RNG
+    has advanced, errors propagate; sampling must never replay with a new draw.
+    """
+    if (FUSED_MODE != "1" or MODE in ("0", "check") or guard.off("sample_fused") or guard.off("sample_topk")
+            or not hasattr(C, "sampling_pick")
+            or not isinstance(logits, torch.Tensor) or type(logits) is not torch.Tensor
+            or logits.device.type != "xpu" or logits.dtype not in (torch.bfloat16, torch.float32)
+            or logits.dim() != 2 or not logits.is_contiguous() or not 1 <= logits.shape[0] <= 16
+            or logits.shape[1] < 32768):
+        return None
+    k = policy["top_k"]
+    temperature, top_p, min_p = policy["temperature"], policy["top_p"], policy["min_p"]
+    if (not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= 64
+            or temperature != 1.0 or not 0. <= top_p <= 1. or not 0. <= min_p <= 1.):
+        return None
+    v, indices = C.topk_rows(logits, k)
+    # Same shape, strides, dtype and exponential_ call as torch.multinomial's
+    # one-sample Gumbel-max path. Only deterministic work moves around the draw.
+    noise = torch.empty_like(v).exponential_(1., generator=generator)
+    picked, valid = C.sampling_pick(v, indices, noise, top_p, min_p)
+    torch._assert_async(valid.all(), "probability tensor contains inf, nan, negative values or no positive value")
+    with _lock:
+        _stats["fused"] = _stats.get("fused", 0) + 1
+    return picked
 
 
 def stats():

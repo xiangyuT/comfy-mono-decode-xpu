@@ -39,3 +39,18 @@ def test_mono_mlp_matches_chain(C):
         assert bits_equal(out, ref), ("row-major", M)
         out_t = C.mono_mlp(xn, H, lut, *[t for w in tiled for t in w], 0, 4, True)
         assert bits_equal(out_t, ref), ("tile-major", M)
+
+
+def test_verify_norm_rot_quant_matches_chain(C):
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard
+    from omni_xpu_kernel import norm, int8 as oi
+    g = torch.Generator().manual_seed(31)
+    h = _build_hadamard(256, device="xpu", dtype=torch.bfloat16).contiguous()
+    w = (torch.randn(4096, generator=g) * 0.1 + 1).bfloat16().xpu()
+    for rows in (1, 3, 8):
+        for scale in (0., 1., 100.):
+            x = (torch.randn(rows, 4096, generator=g) * scale).bfloat16().xpu()
+            ref = norm.rms_norm(w, x, 1e-6)
+            rq, rs = oi.quantize_int8_rowwise(oi.rotate_convrot(ref, 256))
+            out, q, s = C.verify_norm_rot_quant(x, w, 1e-6, h)
+            assert bits_equal(out, ref) and bits_equal(q, rq) and bits_equal(s, rs)

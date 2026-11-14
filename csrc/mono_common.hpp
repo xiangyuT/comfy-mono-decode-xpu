@@ -321,7 +321,7 @@ inline int choose_ksplit(int64_t tiles_per_wg, int64_t K) {
 }
 
 // rot_quant of one row (see act_prep.sycl), done by one work-group into q[row], s[row]
-template <typename RED>
+template <bool INT8_HEAD = false, typename RED>
 inline void rot_quant_row(sycl::nd_item<1>& it, const bf16* x, const bf16* h, int8_t* q, float* s, int64_t K,
                           LPtrF xr, RED& red) {
     auto sg = it.get_sub_group();
@@ -363,12 +363,20 @@ inline void rot_quant_row(sycl::nd_item<1>& it, const bf16* x, const bf16* h, in
     for (int i = 0; i < MSG; ++i) rmax = sycl::fmax(rmax, red[i]);
     const float sv = sycl::fmax(rmax / 127.0f, 1e-30f);
     if (t == 0) *s = sv;
-    bf16 sb = static_cast<bf16>(sv);
-    if (static_cast<float>(sb) == 0.f) sb = sycl::bit_cast<bf16>(uint16_t(0x0080));
-    const float sbf = static_cast<float>(sb);
-    for (int64_t i = t; i < K; i += MWG) {
-        const float d = static_cast<float>(static_cast<bf16>(xr[i] / sbf));
-        q[i] = static_cast<int8_t>(sycl::clamp(sycl::rint(d), -128.f, 127.f));
+    if constexpr (INT8_HEAD) {
+        // Kitchen's INT8 head uses the native FP32 row quantizer. W4A8
+        // projections below have a different BF16 scale/division contract.
+        const float inverse_scale = 1.f / sv;
+        for (int64_t i = t; i < K; i += MWG)
+            q[i] = static_cast<int8_t>(sycl::clamp(sycl::rint(xr[i] * inverse_scale), -128.f, 127.f));
+    } else {
+        bf16 sb = static_cast<bf16>(sv);
+        if (static_cast<float>(sb) == 0.f) sb = sycl::bit_cast<bf16>(uint16_t(0x0080));
+        const float sbf = static_cast<float>(sb);
+        for (int64_t i = t; i < K; i += MWG) {
+            const float d = static_cast<float>(static_cast<bf16>(xr[i] / sbf));
+            q[i] = static_cast<int8_t>(sycl::clamp(sycl::rint(d), -128.f, 127.f));
+        }
     }
     sycl::group_barrier(it.get_group());
 }

@@ -10,6 +10,7 @@ torch::Tensor w4a8_decode_linear(torch::Tensor x, torch::Tensor x_scale, torch::
                                  int64_t group_size, int64_t out_dtype_code, int64_t cols, bool fast);
 
 std::tuple<torch::Tensor, torch::Tensor> rot_quant(torch::Tensor x, torch::Tensor h, int64_t order);
+std::vector<torch::Tensor> embedding_gather(torch::Tensor ids, torch::Tensor q, torch::Tensor s);
 torch::Tensor mono_mlp(torch::Tensor xn, torch::Tensor hadamard, torch::Tensor silu_lut,
                        torch::Tensor gq, torch::Tensor gs, torch::Tensor gsc, torch::Tensor gcb,
                        torch::Tensor uq, torch::Tensor us, torch::Tensor usc, torch::Tensor ucb,
@@ -31,6 +32,9 @@ torch::Tensor attn_dpas(torch::Tensor q, torch::Tensor key, torch::Tensor value,
 std::vector<torch::Tensor> fast_topk(torch::Tensor x, int64_t k, bool argmax_order);
 std::vector<torch::Tensor> fast_pick(torch::Tensor x, int64_t k);
 std::vector<torch::Tensor> topk_rows(torch::Tensor x, int64_t k);
+std::vector<torch::Tensor> sampling_pick(torch::Tensor sorted, torch::Tensor indices, torch::Tensor noise,
+                                       double top_p, double min_p);
+std::vector<torch::Tensor> verify_norm_rot_quant(torch::Tensor x, torch::Tensor w, double eps, torch::Tensor h);
 void draft_embed_norm_cat(torch::Tensor token, torch::Tensor q, torch::Tensor s, torch::Tensor hmat, torch::Tensor emb,
                           torch::Tensor hidden, torch::Tensor we, torch::Tensor wh, double eps_e, double eps_h,
                           torch::Tensor out);
@@ -86,6 +90,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fast_topk", &mono_decode_xpu::fast_topk);
     m.def("fast_pick", &mono_decode_xpu::fast_pick);
     m.def("topk_rows", &mono_decode_xpu::topk_rows);
+    m.def("sampling_pick", &mono_decode_xpu::sampling_pick);
+    m.def("verify_norm_rot_quant", &mono_decode_xpu::verify_norm_rot_quant);
     m.def("draft_embed_norm_cat", &mono_decode_xpu::draft_embed_norm_cat);
     m.def("draft_add_rmsnorm", &mono_decode_xpu::draft_add_rmsnorm);
     m.def("draft_sigmoid_mul", &mono_decode_xpu::draft_sigmoid_mul);
@@ -97,4 +103,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("nwg") = 0, py::arg("tiled") = true);
     m.def("layer_post", &mono_decode_xpu::layer_post);
     m.def("rot_quant", &mono_decode_xpu::rot_quant, py::arg("x"), py::arg("h"), py::arg("order") = 0);
+    m.def("embedding_gather", &mono_decode_xpu::embedding_gather);
 }

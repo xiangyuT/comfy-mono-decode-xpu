@@ -84,3 +84,17 @@ def test_norm_rot_quant(C):
     rot = (n.float().view(-1, 256) @ hm).reshape(-1)
     assert _close(xr, rot, 1e-2)
     assert _close(qx.float() * sx, rot, 2e-2)
+
+
+def test_decode_embedding_gather(C):
+    g = torch.Generator().manual_seed(19)
+    q = torch.randint(-128, 128, (101, H), dtype=torch.int8, generator=g).xpu()
+    s = torch.rand(101, 1, generator=g).xpu()
+    for rows in (1, 3, 8):
+        ids = (torch.arange(rows) * 13).reshape(1, rows).xpu()
+        for scales in (s, s[:1]):
+            out, valid = C.embedding_gather(ids, q, scales)
+            ref = q[ids].float() * (scales[ids] if scales.numel() > 1 else scales)
+            assert valid.item() and torch.equal(out.view(torch.int32), ref.view(torch.int32))
+    out, valid = C.embedding_gather(torch.tensor([-1, 101], device="xpu"), q, s)
+    assert not valid.item() and out.count_nonzero().item() == 0

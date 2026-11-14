@@ -194,6 +194,43 @@ copy and a cached arange instead of a 10 us radix sort. Everything else in the s
 the sampled tokens equal upstream's from the same generator in the unit tests (temperature 1 / 0.7 / 0.5,
 top_k 0 / 7 / 20 / 64, top-p, min-p). The tail of a step goes from 2.16 to about 1.85 ms.
 
+#### Remaining verify preparation and sampling
+
+`VERIFY_HEAD` shares the final RMSNorm and ConvRot quantization in one launch,
+returning the normalized BF16 hidden as well as the head's quantized activation.
+The hidden passed to MTP accept is unchanged. This reuses the persistent engine's
+4096-wide RMSNorm reduction and the existing DPAS rotation, rather than changing
+the reduction or replacing it with the draft's butterfly rotation. Module hooks,
+norm-forward overrides, file precision/format settings and Kitchen backend
+selection remain eligibility boundaries. The head follows upstream verify's
+direct `F.linear` inside its cast context, rather than its module forward;
+prepared data lives only in the current generate.
+The head uses the native INT8 quantizer's FP32 scale and reciprocal multiply.
+The W4A8 projection quantizer separately preserves BF16 scale/division rounding;
+these two activation contracts must not be interchanged. The first real row
+count checks both preparation and complete logits against the live operations.
+
+`SAMPLE_FUSED` completes the deterministic sampling tail after exact top-k.
+For temperature 1 and k <= 64, `sampling.sycl` combines min-p/top-p, both softmaxes,
+inclusive scan, division by exponential samples, argmax and token-index gather.
+Small-row reductions follow Torch XPU's vector grouping and scan order. FP32
+reciprocals use correctly rounded division: the compiler's default reciprocal
+introduced one-ulp probability differences. Torch still generates the exact
+exponential samples, with the same shape and generator state as multinomial's
+one-sample path. Invalid probability rows fail an asynchronous assertion; the
+wrapper never retries after advancing the generator. Other sampling policies
+retain the upstream implementation. These paths do not change prefill or enable
+the experimental INT4 draft head.
+
+Decode embedding uses `embedding_gather` for the INT8 row lookup, FP32
+conversion and row scaling. Its inverse rotation still calls the original
+`_rotate_weight` on FP32 rows and the same FP32 Hadamard transpose, then casts
+to BF16. This preserves the oneDNN reduction instead of substituting the
+draft's butterfly. Invalid token IDs produce a failed asynchronous assertion
+without an out-of-bounds table read. The generate owns the rotation and checks
+its first output against the actual embedding module. Host-row residency and
+explicit backend selection remain separate routes.
+
 ### DynamicVRAM
 
 - Each call takes the linear's GPU weight from `comfy.ops.CastBiasWeightContext`, the same VBAR
