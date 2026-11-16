@@ -6,9 +6,9 @@ MONO_DECODE_XPU=0 turns off the recommended stack. Each piece can be set on its
 own with MONO_DECODE_XPU_<PIECE>=1/0, which also overrides the master switch. Each piece is installed
 on its own: one that fails to install is logged and the others still load.
 """
-import glob
 import logging
 import os
+from importlib.machinery import EXTENSION_SUFFIXES
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
@@ -57,7 +57,8 @@ def _install():
     if not any(_on(p) for p in _DEFAULTS):
         return
     here = os.path.dirname(os.path.realpath(__file__))
-    if not glob.glob(os.path.join(here, "comfy_mono_decode_xpu", "_C*.so")):
+    extension = os.path.join(here, "comfy_mono_decode_xpu", "_C")
+    if not any(os.path.isfile(extension + suffix) for suffix in EXTENSION_SUFFIXES):
         logging.warning("[mono_decode_xpu] extension not built: run `python install.py` in %s. "
                         "Decode runs the stock path.", here)
         return

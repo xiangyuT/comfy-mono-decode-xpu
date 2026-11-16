@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from functools import wraps
+from contextlib import contextmanager
+import json
 import logging
 import os
+import sys
 import threading
 
 import torch
+
+from . import guard
 
 CLAIM = "__comfy_mono_decode_xpu_session__"
 _lock = threading.Lock()
@@ -92,20 +97,255 @@ def _copy_budget(device):
                                       *(getattr(params, k, None) for k in ("scale", "s_channel", "codebook"))))
     total = torch.xpu.get_device_properties(device).total_memory
     reserved = torch.xpu.memory_reserved(device)
+    allocated = torch.xpu.memory_allocated(device)
     free = torch.xpu.mem_get_info(device)[0]
     reserve = mm.minimum_inference_memory()
     model_bytes, copy_bytes = _storage_bytes(model_tensors), _storage_bytes(copies)
     reclaimable = _inactive_vram_budget(device) if dynamic else 0
-    available = max(0, min(total - reserved - reserve - model_bytes, free + reclaimable - reserve - _margin))
+    available = max(0, min(total - allocated - reserve - model_bytes, free + reclaimable - reserve - _margin))
     return dict(layout="tile" if copy_bytes <= available else "row", copy_bytes=copy_bytes,
                 available_bytes=available, capacity_bytes=total, reserved_bytes=reserved,
+                allocated_bytes=allocated,
                 inference_reserve_bytes=reserve, model_residency_budget_bytes=model_bytes,
                 dynamic_vram=dynamic, inactive_vbar_bytes=reclaimable, physical_free_bytes=free)
 
 
+def _decode_memory(device):
+    return dict(allocated_bytes=torch.xpu.memory_allocated(device),
+                reserved_bytes=torch.xpu.memory_reserved(device),
+                free_bytes=torch.xpu.mem_get_info(device)[0])
+
+
+def _prepare_decode(device):
+    if device.type != "xpu":
+        return
+    diagnostic = os.environ.get("MONO_DECODE_XPU_DIAGNOSTICS", "0") == "1"
+    trim = os.environ.get("MONO_DECODE_XPU_PREFILL_TRIM", "0") == "1"
+    if not (diagnostic or trim):
+        return
+    before = _decode_memory(device)
+    if trim:
+        with torch.xpu.device(device):
+            torch.xpu.synchronize(device)
+            torch.xpu.empty_cache()
+    logging.info("[mono_decode_xpu] decode boundary trim=%s; before=%s; after=%s",
+                 trim, before, _decode_memory(device) if trim else before)
+
+
+@contextmanager
+def _reuse_tile_plans(model):
+    if os.environ.get("MONO_DECODE_XPU_REUSE_TILES", "1") != "1":
+        yield
+        return
+    body = model.model
+    original = body.forward
+    previous = vars(body).get("forward")
+    prefetch = body.prefetch_dynamic_vbars
+
+    @wraps(original)
+    def forward(*args, **kwargs):
+        embeds = kwargs.get("embeds")
+        reuse = (prefetch and not guard.off("layer") and embeds is not None
+                 and embeds.device.type == "xpu" and embeds.dtype == torch.bfloat16
+                 and embeds.ndim == 3 and embeds.shape[0] == 1 and 1 <= embeds.shape[1] <= 8
+                 and embeds.shape[2] == 4096 and kwargs.get("past_key_values") is not None
+                 and len(body.layers) > 0 and all(plan(block) is not None for block in body.layers))
+        body.prefetch_dynamic_vbars = False if reuse else prefetch
+        if reuse:
+            _session["prefetch_skips"] += 1
+            if _session["prefetch_skips"] == 1:
+                logging.info("[mono_decode_xpu] reusing %d tile plans; skipping redundant body and MTP weight prefetch",
+                             len(body.layers))
+        return original(*args, **kwargs)
+
+    body.forward = forward
+    try:
+        yield
+    finally:
+        body.prefetch_dynamic_vbars = prefetch
+        if previous is None:
+            vars(body).pop("forward", None)
+        else:
+            body.forward = previous
+
+
+@contextmanager
+def _host_embedding_rows(model):
+    embedding = model.model.embed_tokens
+    if (os.environ.get("MONO_DECODE_XPU_HOST_ROWS", "1") != "1"
+            or not hasattr(embedding, "_v")
+            or getattr(embedding, "quant_format", None) != "int8_tensorwise"):
+        yield
+        return
+    original = embedding.forward
+    previous = vars(embedding).get("forward")
+
+    @wraps(original)
+    def forward(tokens, *args, **kwargs):
+        if (not args and not (kwargs.keys() - {"out_dtype"}) and session_active()
+                and tokens.device.type == "xpu" and 1 <= tokens.numel() <= 8
+                and embedding.weight.device.type == "cpu"
+                and not embedding.weight_function and not embedding.bias_function
+                and embedding.weight_lowvram_function is None and embedding.max_norm is None):
+            result = embedding.host_rows(tokens, out_dtype=kwargs.get("out_dtype"))
+            _session["host_rows_calls"] += 1
+            return result
+        return original(tokens, *args, **kwargs)
+
+    embedding.forward = forward
+    try:
+        yield
+    finally:
+        if previous is None:
+            vars(embedding).pop("forward", None)
+        else:
+            embedding.forward = previous
+
+
+@contextmanager
+def _owned_output_head(model):
+    import comfy.ops as ops
+    body = model.model
+    head = getattr(body, "lm_head", None)
+    if (os.environ.get("MONO_DECODE_XPU_HEAD_CACHE", "1") != "1" or head is None
+            or not hasattr(head, "_v") or getattr(head, "quant_format", None) != "int8_tensorwise"):
+        yield
+        return
+    original = ops.cast_bias_weight
+    source = head.weight
+    owner_thread = threading.get_ident()
+    owned = None
+    attempted = False
+    status = _session["head_cache"] = dict(bytes=0, hits=0, reason="waiting for decode")
+
+    @wraps(original)
+    def cast(*args, **kwargs):
+        nonlocal owned, attempted
+        module = args[0] if args else kwargs.get("s")
+        input = args[1] if len(args) > 1 else kwargs.get("input")
+        eligible = (module is head and threading.get_ident() == owner_thread and session_active()
+                    and len(args) == 2 and kwargs == {"offloadable": True} and input is not None
+                    and input.device.type == "xpu" and input.dtype == source.dtype == torch.bfloat16
+                    and input.ndim == 3 and input.shape[0] == 1 and 1 <= input.shape[1] <= 8
+                    and head.weight is source and source.device.type == "cpu"
+                    and not head.weight_function and not head.bias_function and head.bias is None
+                    and head.weight_lowvram_function is None
+                    and not body.prefetch_dynamic_vbars and len(body.layers) > 0
+                    and all(plan(block) is not None for block in body.layers))
+        if not eligible:
+            return original(*args, **kwargs)
+        if owned is not None:
+            status["hits"] += 1
+            return owned, None, None
+        if attempted:
+            return original(*args, **kwargs)
+        attempted = True
+        qdata, scale = source._qdata, source._params.scale
+        required = qdata.numel() * qdata.element_size() + scale.numel() * scale.element_size()
+        if required > _copy_budget(input.device)["available_bytes"]:
+            status["reason"] = "insufficient memory"
+            logging.info("[mono_decode_xpu] output head cache skipped: insufficient memory for %d bytes", required)
+            return original(*args, **kwargs)
+        result = original(*args, **kwargs)
+        try:
+            owned = result[0].clone()
+        except torch.OutOfMemoryError:
+            status["reason"] = "allocation failed"
+            return result
+        except BaseException:
+            ops.uncast_bias_weight(module, *result)
+            raise
+        ops.uncast_bias_weight(module, *result)
+        status.update(bytes=required, reason="ready")
+        logging.info("[mono_decode_xpu] cached INT8 output head: %d bytes; shared by draft and verify", required)
+        return owned, None, None
+
+    ops.cast_bias_weight = cast
+    try:
+        yield
+    finally:
+        ops.cast_bias_weight = original
+        owned = None
+
+
+@contextmanager
+def _diagnose_generation(model):
+    diagnostic = os.environ.get("MONO_DECODE_XPU_DIAGNOSTICS", "0") == "1"
+    profile_path = os.environ.get("MONO_DECODE_XPU_PROFILE")
+    if not (diagnostic or profile_path):
+        yield
+        return
+    body = model.model
+    original = body.forward
+    previous = vars(body).get("forward")
+    calls = 0
+    profile = None
+
+    def finish_profile():
+        nonlocal profile
+        if profile is None:
+            return
+        completed, profile = profile, None
+        completed.add_metadata_json("mono_decode_xpu", json.dumps({
+            "revision": "vocabulary-transfer-v3",
+            "weight_budget": _session["budget"],
+            "tile_bytes": _session["bytes"],
+            "tile_plans": len(_session["plans"]),
+            "prefetch_skips": _session.get("prefetch_skips", 0),
+            "host_rows_calls": _session.get("host_rows_calls", 0),
+            "head_cache": _session.get("head_cache"),
+            "trim": os.environ.get("MONO_DECODE_XPU_PREFILL_TRIM", "0"),
+            "reuse": os.environ.get("MONO_DECODE_XPU_REUSE_TILES", "1"),
+        }))
+        completed.stop()
+        completed.export_chrome_trace(profile_path)
+        logging.info("[mono_decode_xpu] profile=%s\n%s", profile_path,
+                     completed.key_averages().table(sort_by="self_device_time_total", row_limit=15))
+
+    @wraps(original)
+    def observed(*args, **kwargs):
+        nonlocal calls, profile
+        calls += 1
+        embeds = kwargs.get("embeds")
+        if embeds is None and args:
+            embeds = args[0]
+        device = getattr(embeds, "device", None)
+        if profile_path and calls == 9 and device is not None and device.type == "xpu":
+            profile = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                        torch.profiler.ProfilerActivity.XPU], record_shapes=True)
+            profile.start()
+        output = original(*args, **kwargs)
+        if calls == 17:
+            finish_profile()
+        if diagnostic and calls in (1, 33, 129):
+            memory = _decode_memory(device) if device is not None and device.type == "xpu" else {}
+            caches = kwargs.get("past_key_values") or []
+            cache_shapes = sorted({(type(cache).__name__, tuple(cache.key.shape)) for cache in caches})
+            reports = {}
+            for name in ("layer", "mono", "draft", "autotree", "logits"):
+                module = sys.modules.get(f"{__package__}.{name}")
+                if module is not None:
+                    reports[name] = module.stats()
+            logging.info("[mono_decode_xpu] forward=%d input_shape=%s caches=%s memory=%s prefetch_skips=%d stats=%s",
+                         calls, getattr(embeds, "shape", None), cache_shapes, memory,
+                         _session.get("prefetch_skips", 0), reports)
+        return output
+
+    body.forward = observed
+    try:
+        yield
+    finally:
+        if previous is None:
+            vars(body).pop("forward", None)
+        else:
+            body.forward = previous
+        finish_profile()
+
+
 def begin(model):
     _session.update(active=True, ok=_tiled_ok and os.environ.get("MONO_DECODE_XPU_SESSION_TILES", "1") == "1",
-                    tiles={}, cache={}, plans={}, bytes=0, model=model, budget=None)
+                    tiles={}, cache={}, plans={}, bytes=0, model=model, budget=None, prefetch_skips=0,
+                    host_rows_calls=0, head_cache=None)
 
 
 def clear_model_caches(model):
@@ -145,6 +385,7 @@ def tiled(lin, w):
     if not tiles_enabled():
         return None
     if _session["budget"] is None:
+        _prepare_decode(w.device)
         try:
             budget = _copy_budget(w.device)
         except Exception as e:  # an unexpected model/allocator state: keep the row-major weights
@@ -154,6 +395,8 @@ def tiled(lin, w):
         _session["budget"] = _last_budget = budget
         logging.info("[mono_decode_xpu] weight layout=%s; copies=%d, available=%d",
                      _last_budget["layout"], _last_budget["copy_bytes"], _last_budget["available_bytes"])
+        if os.environ.get("MONO_DECODE_XPU_DIAGNOSTICS", "0") == "1":
+            logging.info("[mono_decode_xpu] weight budget=%s", _last_budget)
         if _last_budget["layout"] != "tile":
             _session["ok"] = False
             return None
@@ -220,7 +463,9 @@ def install():
             clear_model_caches(self)
             begin(self)
             try:
-                return _original(self, *a, **k)
+                with (_reuse_tile_plans(self), _host_embedding_rows(self),
+                      _owned_output_head(self), _diagnose_generation(self)):
+                    return _original(self, *a, **k)
             finally:
                 end()
 
