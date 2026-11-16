@@ -300,11 +300,20 @@ Install it like any custom node, into `ComfyUI/custom_nodes/`, using ComfyUI's P
 
 ### Windows portable: validated native extension
 
+**Main integration requires a matching rebuilt extension.** Source commit `46afaf7` and its rebuilt
+Windows extension passed user testing on Arc Pro B70 on 2026-11-16; no separate throughput figure
+was supplied for that integration run. Main now includes
+DPAS attention, device-side MTP, fused draft-head and compact layer-post kernels. The historical
+`windows-aad3005-bmg` asset below is only for the indicated fix branch, not this merged main.
+An old extension can import successfully yet lack functions such as `layer_post_h16`, `attn_dpas`
+and `mtp_accept`. Update the Python source and its matching native extension together before testing.
+
 **Cloning this repository does not install the native extension.** The Windows loader accepts
 `.pyd` files, but Git contains only source code. If the extension is missing or cannot load,
 ComfyUI can still start while Mono Decode stays inactive and prompt enhancement uses the stock path.
 The `install.py` / `build_icpx.sh` source-build instructions below currently require Linux;
-they are not an automatic Windows build procedure.
+they are not an automatic Windows build procedure. For current main on Windows, use the
+[Windows source-build procedure](#windows--oneapi-source-build) below instead of the historical ZIP.
 
 The [Windows BMG release](https://github.com/zhm-algo/comfy-mono-decode-xpu/releases/tag/windows-aad3005-bmg)
 provides the native extension used to validate source commit
@@ -355,6 +364,152 @@ sampling settings, reached approximately 83-93 tokens/s in the later decode phas
 the workflow in 132.81 seconds. These are user-reported single-run observations, not a controlled
 benchmark or a guarantee of identical generated tokens under adaptive MTP. A fresh clone was
 also confirmed working after restoring this native extension.
+
+### Windows / oneAPI source build
+
+The ZIP is optional: it contains a precompiled `_C` extension, not additional source code.
+Building the same source locally produces the `.pyd` that ComfyUI needs. Git clone/pull alone
+does not compile it. Rebuild after native sources change, and when changing the Python ABI,
+Torch version or GPU target. This procedure preserves the single compiler invocation used by
+`build_icpx.sh`; do not substitute a per-file `SyclExtension` build with a separate device link.
+
+#### Prerequisites
+
+- Windows x64 and Visual Studio 2022 Build Tools with **Desktop development with C++**, including
+  the MSVC x64 toolchain and Windows SDK.
+- Intel oneAPI DPC++/C++ compiler for Windows, providing `icx.exe` and `setvars.bat`.
+- A full x64 CPython installation (or its virtual environment) with development headers and
+  `libs/python313.lib`, plus the **same Torch build as ComfyUI**. The tested combination was
+  Python 3.13.14 and Torch 2.14.1+xpu. A portable embedded Python often lacks the development
+  files; use a separate build environment in that case, without replacing ComfyUI's Python.
+- The existing ComfyUI XPU runtime dependencies remain required. Compilation does not install
+  Torch, ComfyUI-OmniXPU, Kitchen or AIMDO into the portable environment.
+
+For example, install the matching Torch into an existing Python 3.13 build environment:
+
+```powershell
+& 'C:\path\to\build-venv\Scripts\python.exe' -m pip install 'torch==2.14.1+xpu' --index-url https://download.pytorch.org/whl/xpu
+```
+
+If that exact build came from a different wheel source, use that same source. Do not silently
+substitute a CPU wheel or a different Torch version. The build machine need not have a B70;
+running the compiled kernels and validating their results requires the matching GPU/runtime.
+
+#### Initialize the toolchain
+
+Open **x64 Native Tools Command Prompt for VS 2022**, then run these commands in that prompt
+(adjust the oneAPI path if installed elsewhere):
+
+```bat
+set "VS2022INSTALLDIR=%VSINSTALLDIR%"
+call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+powershell -NoProfile
+```
+
+Continue in that PowerShell window so it inherits both MSVC and oneAPI environments.
+Setting `VS2022INSTALLDIR` explicitly avoids oneAPI failing to discover an installed BuildTools
+edition. Stop if initialization reports an error.
+
+#### Compile and install
+
+Stop ComfyUI first. Set the three paths below: `$portable` contains both `ComfyUI` and
+`python_embeded`; `$repo` is the source checkout to build; `$python` is the full build Python.
+Use the main checkout for this procedure, not the historical fix branch. For a new checkout,
+clone `https://github.com/zhm-algo/comfy-mono-decode-xpu.git` into the node directory first.
+If building outside the portable node directory, deploy that same Python source revision with
+the resulting extension. Do not copy a new extension over an unrelated source revision.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$portable = (Resolve-Path -LiteralPath 'C:\path\to\ComfyUI_windows_portable').Path
+$repo = (Resolve-Path -LiteralPath "$portable\ComfyUI\custom_nodes\comfy-mono-decode-xpu").Path
+$python = 'C:\path\to\build-venv\Scripts\python.exe'
+$compiler = 'C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin\icx.exe'
+Get-Command cl.exe -ErrorAction Stop | Out-Null
+if (!(Test-Path -LiteralPath $compiler)) { throw 'oneAPI icx.exe not found' }
+$metadata = & $python -c "import json,sys,sysconfig,pathlib,torch; print(json.dumps(dict(torch=str(pathlib.Path(torch.__file__).parent), include=sysconfig.get_paths()['include'], pylib=str(pathlib.Path(sys.base_prefix)/'libs'/('python'+str(sys.version_info.major)+str(sys.version_info.minor)+'.lib')), suffix=sysconfig.get_config_var('EXT_SUFFIX'), version=torch.__version__)))"
+if ($LASTEXITCODE -ne 0) { throw 'Build Python/Torch inspection failed' }
+$config = $metadata | ConvertFrom-Json
+$runtime = & "$portable\python_embeded\python.exe" -s -c "import json,sysconfig,torch; print(json.dumps(dict(suffix=sysconfig.get_config_var('EXT_SUFFIX'), version=torch.__version__)))"
+if ($LASTEXITCODE -ne 0) { throw 'Portable Python/Torch inspection failed' }
+$runtime = $runtime | ConvertFrom-Json
+if ($config.suffix -ne $runtime.suffix -or $config.version -ne $runtime.version) {
+  throw 'Build and portable Python ABI/Torch version must match'
+}
+$sources = @(
+  'csrc/bindings.cpp', 'csrc/w4a8_decode.sycl', 'csrc/act_prep.sycl',
+  'csrc/mono_mlp.sycl', 'csrc/mono_layer.sycl', 'csrc/mono_gdn.sycl',
+  'csrc/attn_port.sycl', 'csrc/attn_dpas.sycl', 'csrc/fast_topk.sycl',
+  'csrc/rope_kv.sycl', 'csrc/mtp_loop.sycl', 'csrc/draft_lmhead.sycl',
+  'csrc/topk_rows.sycl', 'csrc/draft_fused.sycl'
+) | ForEach-Object { Join-Path $repo $_ }
+$libraries = @('torch', 'torch_python', 'torch_cpu', 'torch_xpu', 'c10', 'c10_xpu') |
+  ForEach-Object { Join-Path $config.torch "lib\$_.lib" }
+$libraries += $config.pylib
+foreach ($required in ($sources + $libraries + (Join-Path $config.include 'Python.h'))) {
+  if (!(Test-Path -LiteralPath $required)) { throw "Missing build input: $required" }
+}
+$work = Join-Path $env:TEMP ('mono-native-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $work | Out-Null
+$output = Join-Path $work ("_C" + $config.suffix)
+$compilerArgs = @(
+  '--driver-mode=g++', '-fsycl', '-std=c++20', '-fms-runtime-lib=dll',
+  '-O3', '-DNDEBUG', '-DNOMINMAX', '-shared',
+  '-fsycl-targets=spir64_gen', '-Xsycl-target-backend', '-device bmg',
+  "-I$($config.torch)/include", "-I$($config.torch)/include/torch/csrc/api/include",
+  "-I$($config.include)", "-I$repo/csrc",
+  '-DTORCH_EXTENSION_NAME=_C', '-DTORCH_API_INCLUDE_EXTENSION_H', '-x', 'c++'
+) + $sources + @('-x', 'none', '-o', $output) + $libraries
+Push-Location $work
+try {
+  & $compiler @compilerArgs
+  if ($LASTEXITCODE -ne 0) { throw 'Native compilation failed; previous extension was not replaced' }
+  $destination = Join-Path $repo ('comfy_mono_decode_xpu\_C' + $config.suffix)
+  Copy-Item -LiteralPath $output -Destination $destination -Force
+  Write-Output "Built: $destination"
+} finally {
+  Pop-Location
+  Remove-Item -LiteralPath $work -Recurse -Force
+}
+```
+
+`--driver-mode=g++` is required for these GNU-style options with Windows `icx.exe`;
+without it, Torch headers can fail at C++20 `requires` expressions. `-fms-runtime-lib=dll`
+selects the DLL C/C++ runtime. Keep all 14 sources in this one invocation; when building a later
+revision, keep this list aligned with `SRCS` in `build_icpx.sh`. The output for the tested Python
+is `comfy_mono_decode_xpu/_C.cp313-win_amd64.pyd`. Temporary `.lib`/`.exp` build products are
+not needed for deployment and should not be committed.
+
+#### Verify with ComfyUI's Python
+
+The following checks import the installed extension and verify every export declared in the
+matching source (24 at `46afaf7`). They do not execute GPU kernels:
+
+```powershell
+@'
+import pathlib
+import re
+import sys
+import torch
+
+repo = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(repo))
+from comfy_mono_decode_xpu import _C
+
+names = re.findall(r'm\.def\("([^"]+)"', (repo / 'csrc/bindings.cpp').read_text())
+missing = [name for name in names if not callable(getattr(_C, name, None))]
+assert names and not missing, missing
+print(_C.__file__)
+print(len(names), 'native exports verified')
+'@ | & "$portable\python_embeded\python.exe" -s - "$repo"
+if ($LASTEXITCODE -ne 0) { throw 'Native import/API verification failed' }
+```
+
+A DLL-load error requires checking the oneAPI runtime/DLL search paths and Python/Torch ABI;
+a missing export means the source and extension are mismatched or the build omitted a source.
+Restart ComfyUI using the normal XPU launcher, confirm `[mono_decode_xpu] layer installed=True`,
+then run the original full workflow on B70 and check output and throughput. Import/API checks
+alone do not establish GPU correctness or performance. A locally built `.pyd` needs no ZIP to run.
 
 ### Linux / oneAPI source build
 
