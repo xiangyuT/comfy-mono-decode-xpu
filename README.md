@@ -298,6 +298,45 @@ upstream eager kernels, and upstream comfy-aimdo has no XPU DynamicVRAM (results
 
 Install it like any custom node, into `ComfyUI/custom_nodes/`, using ComfyUI's Python environment.
 
+### Why a native build is required
+
+This project has two parts:
+
+- **Python integration** connects to ComfyUI, manages decode memory and schedules inference.
+- **C++/SYCL native GPU code** implements the accelerated operations. Its source is included
+  in `csrc/`, but Python cannot execute that source directly; it must load a compiled `_C` module.
+
+This is not a Windows-only requirement. Windows loads the native module as a `.pyd` file;
+Linux normally uses `.so`. The Linux installer automates the compiler invocation, while Windows
+currently uses the manual procedure below. The Python integration itself needs no manual build.
+
+**`git clone` downloads source; it does not compile the extension.** If `_C` is missing or cannot
+load, the plugin does not install its acceleration hooks, and ComfyUI can continue on the stock
+decode path. This explained the Windows fresh-clone slowdown seen during validation: restoring
+the matching `.pyd` restored acceleration. Installing Python source alone is not enough.
+
+A native ZIP is simply a convenient way to distribute the compiled `.pyd`. **A matching native
+extension is required, but a particular ZIP is not:** build it locally, or install a compatible
+precompiled asset when one is available. Neither route replaces the required runtime dependencies.
+A source-only PR is complete for maintainers who can build it; end users still need one of these
+two installation steps. Submitting a PR does not automatically publish Release attachments.
+
+For example, `mono-decode-native-46afaf7-cp313-torch214-bmg.zip` identifies the locally prepared
+B70 retest archive, not an upstream Release attachment:
+
+| filename marker | meaning |
+|---|---|
+| `46afaf7` | source commit used for the build |
+| `cp313` | CPython 3.13 ABI |
+| `torch214` | Torch 2.14 family; this particular build used **2.14.1+xpu** |
+| `bmg` | Intel Battlemage GPU compilation target |
+
+The short filename is not a complete compatibility guarantee; check the build/release details.
+New main revisions can add native interfaces that an older `.pyd` lacks even if it still imports.
+Keep Python callers and native exports compatible, and rebuild when native sources, required
+interfaces, Python ABI, Torch version or GPU target change. Documentation-only and test-only
+commits do not by themselves require rebuilding an otherwise matching extension.
+
 ### Windows portable: validated native extension
 
 **Main integration requires a matching rebuilt extension.** Source commit `46afaf7` and its rebuilt
