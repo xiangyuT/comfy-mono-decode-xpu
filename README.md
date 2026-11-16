@@ -298,6 +298,66 @@ upstream eager kernels, and upstream comfy-aimdo has no XPU DynamicVRAM (results
 
 Install it like any custom node, into `ComfyUI/custom_nodes/`, using ComfyUI's Python environment.
 
+### Windows portable: validated native extension
+
+**Cloning this repository does not install the native extension.** The Windows loader accepts
+`.pyd` files, but Git contains only source code. If the extension is missing or cannot load,
+ComfyUI can still start while Mono Decode stays inactive and prompt enhancement uses the stock path.
+The `install.py` / `build_icpx.sh` source-build instructions below currently require Linux;
+they are not an automatic Windows build procedure.
+
+The [Windows BMG release](https://github.com/zhm-algo/comfy-mono-decode-xpu/releases/tag/windows-aad3005-bmg)
+provides the native extension used to validate source commit
+[`aad3005`](https://github.com/zhm-algo/comfy-mono-decode-xpu/commit/aad3005548cc3c801f7cfa352c33f74764df68c4)
+on branch `fix/windows-dynamic-vram-decode`. It is for **Windows x64, CPython 3.13,
+Torch 2.14.1+xpu and Intel BMG**, tested with Python 3.13.14 on Arc Pro B70.
+It is not a universal wheel or a replacement for Torch/oneAPI runtime dependencies.
+Do not reuse it with another Python ABI, Torch version, GPU architecture, or changed native sources
+without rebuilding and validating that combination.
+
+Stop ComfyUI before installing. Set `$portable` to the actual directory containing both
+`python_embeded` and `ComfyUI`, **not its parent directory**. For a new clone:
+
+```powershell
+$portable = (Resolve-Path -LiteralPath 'C:\path\to\ComfyUI_windows_portable').Path
+git -C "$portable\ComfyUI\custom_nodes" clone --single-branch --branch fix/windows-dynamic-vram-decode https://github.com/zhm-algo/comfy-mono-decode-xpu.git
+```
+
+If the node is already cloned, keep that directory and check out the indicated branch instead.
+Then download, verify, and extract the release asset:
+
+```powershell
+$archive = Join-Path $env:TEMP 'mono-decode-native-aad3005-cp313-torch214-bmg.zip'
+$url = 'https://github.com/zhm-algo/comfy-mono-decode-xpu/releases/download/windows-aad3005-bmg/mono-decode-native-aad3005-cp313-torch214-bmg.zip'
+Invoke-WebRequest -Uri $url -OutFile $archive
+$expected = 'fea7b8210ecfd5465347bd2b65bd7229ae7d74ae839a9fefbc39379a2346b6f9'
+if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) {
+  throw 'Native extension archive checksum mismatch'
+}
+Expand-Archive -LiteralPath $archive -DestinationPath $portable -Force
+& "$portable\python_embeded\python.exe" -s -c "import sys,torch; sys.path.insert(0,sys.argv[1]); from comfy_mono_decode_xpu import _C; print(_C.__file__)" "$portable\ComfyUI\custom_nodes\comfy-mono-decode-xpu"
+if ($LASTEXITCODE -ne 0) { throw 'Native extension import failed; do not continue to inference' }
+```
+
+The ZIP contains only
+`ComfyUI/custom_nodes/comfy-mono-decode-xpu/comfy_mono_decode_xpu/_C.cp313-win_amd64.pyd`.
+It does not overwrite Python source, settings, workflows, or models. An import error mentioning a
+"partially initialized module" can mean `_C` is missing or has an incompatible filename; it does
+not by itself establish a Python circular import. A DLL-load error instead requires checking
+runtime dependencies and ABI compatibility. Do not proceed until the import prints the extension
+path inside the intended portable installation.
+
+Restart ComfyUI and check its **startup** log for `[mono_decode_xpu] layer installed=True`.
+With eligible Qwen3.5 decode and enough memory, generation should also report `reusing 32 tile plans`
+and `cached INT8 output head`. Import success alone does not establish that the hooks are active.
+The validated Windows MiniMax H3 edit run retained the full 11,541-token input, image, MTP and
+sampling settings, reached approximately 83-93 tokens/s in the later decode phase, and completed
+the workflow in 132.81 seconds. These are user-reported single-run observations, not a controlled
+benchmark or a guarantee of identical generated tokens under adaptive MTP. A fresh clone was
+also confirmed working after restoring this native extension.
+
+### Linux / oneAPI source build
+
 **ComfyUI-Manager.** Install from the Git URL
 `https://github.com/xiangyuT/comfy-mono-decode-xpu`. Manager clones the repo and runs `install.py`,
 which builds the kernels.
