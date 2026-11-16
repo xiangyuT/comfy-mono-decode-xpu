@@ -89,9 +89,9 @@ def windows_environment():
         raise RuntimeError("MSVC 2022 not found; install Build Tools with Desktop development with C++ "
                            "and Windows SDK, or set VS2022INSTALLDIR")
     env["VS2022INSTALLDIR"] = visual_studio
-    command = ('"' + env.get("COMSPEC", "cmd.exe") + '" /d /s /c "call "' + setvars
+    command = ('"' + env.get("COMSPEC", "cmd.exe") + '" /d /u /s /c "call "' + setvars
                + '" >nul 2>nul & set"')
-    configured = subprocess.run(command, env=env, capture_output=True, text=True, errors="replace", check=True)
+    configured = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-16-le", check=True)
     env = {key.upper(): value for line in configured.stdout.splitlines()
            for key, separator, value in [line.partition("=")] if separator and key}
     if not (windows_compiler(env) and shutil.which("cl.exe", path=env.get("PATH", "")) and env.get("LIB")):
@@ -101,6 +101,8 @@ def windows_environment():
 
 
 def windows_python_development(root=None):
+    if root:
+        root = os.path.abspath(root)
     include = os.path.join(root, "include") if root else sysconfig.get_paths()["include"]
     abi = ("t" if sysconfig.get_config_var("Py_GIL_DISABLED") else "")
     abi += "_d" if sysconfig.get_config_var("Py_DEBUG") else ""

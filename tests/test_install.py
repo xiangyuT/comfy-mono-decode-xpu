@@ -124,6 +124,8 @@ def test_windows_setup_discovers_msvc(installer, monkeypatch, tmp_path):
     def configure(command, **kwargs):
         assert isinstance(command, str)
         assert f'call "{setup}"' in command
+        assert " /u " in command
+        assert kwargs["encoding"] == "utf-16-le"
         assert kwargs["env"]["VS2022INSTALLDIR"] == "C:\\VS Build Tools"
         return types.SimpleNamespace(stdout="Path=configured\nLIB=libraries\nOTHER=left=right\n=C:=ignored\n")
 
@@ -135,8 +137,24 @@ def test_windows_setup_discovers_msvc(installer, monkeypatch, tmp_path):
     assert "" not in env
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows cmd.exe")
+def test_windows_environment_preserves_unicode(installer, monkeypatch, tmp_path):
+    monkeypatch.delenv("LIB", raising=False)
+    monkeypatch.setenv("ONEAPI_ROOT", str(tmp_path))
+    monkeypatch.setenv("VS2022INSTALLDIR", "C:\\VS Build Tools")
+    value = "C:\\Build\\caf\u00e9\\\u4e2d\u6587"
+    monkeypatch.setenv("MONO_INSTALL_TEST_PATH", value)
+    (tmp_path / "setvars.bat").write_text('@echo off\nset "LIB=test-libraries"\n', encoding="ascii")
+    monkeypatch.setattr(installer, "windows_compiler", lambda env: "icx.exe" if env.get("LIB") else None)
+    monkeypatch.setattr(installer.shutil, "which", lambda *args, **kwargs: "cl.exe")
+    env = installer.windows_environment()
+    assert env["LIB"] == "test-libraries"
+    assert env["MONO_INSTALL_TEST_PATH"] == value
+
+
+@pytest.mark.parametrize("relative", [False, True])
 @pytest.mark.parametrize("success", [True, False])
-def test_windows_single_invocation_preserves_output_on_failure(installer, monkeypatch, tmp_path, python_dev, success):
+def test_windows_single_invocation_preserves_output_on_failure(installer, monkeypatch, tmp_path, python_dev, success, relative):
     root = tmp_path / "source checkout"
     for source in installer.SOURCES:
         path = root / source
@@ -156,6 +174,8 @@ def test_windows_single_invocation_preserves_output_on_failure(installer, monkey
     def compile_native(command, cwd, env):
         calls.append(command)
         assert command[0] == "C:\\oneAPI compiler\\icx.exe"
+        assert "-I" + str(python_dev / "include") in command
+        assert str(next((python_dev / "libs").glob("*.lib"))) in command
         for flag in ("--driver-mode=g++", "-std=c++20", "-fms-runtime-lib=dll", "-device test-target"):
             assert flag in command
         sources = command[command.index("c++") + 1:command.index("none") - 1]
@@ -168,7 +188,8 @@ def test_windows_single_invocation_preserves_output_on_failure(installer, monkey
 
     monkeypatch.setattr(installer.subprocess, "call", compile_native)
     torch = types.SimpleNamespace(__file__=str(torch_root / "__init__.py"))
-    assert installer.build_windows(torch, {"MONO_DECODE_XPU_XPU_DEVICE": "test-target"}, str(python_dev)) == success
+    python_root = os.path.relpath(python_dev) if relative else str(python_dev)
+    assert installer.build_windows(torch, {"MONO_DECODE_XPU_XPU_DEVICE": "test-target"}, python_root) == success
     assert len(calls) == 1
     assert output.read_bytes() == (b"new extension" if success else b"old extension")
     assert not list(root.glob(".mono-build-*"))
