@@ -312,104 +312,36 @@ currently uses the manual procedure below. The Python integration itself needs n
 
 **`git clone` downloads source; it does not compile the extension.** If `_C` is missing or cannot
 load, the plugin does not install its acceleration hooks, and ComfyUI can continue on the stock
-decode path. This explained the Windows fresh-clone slowdown seen during validation: restoring
-the matching `.pyd` restored acceleration. Installing Python source alone is not enough.
+decode path. Installing Python source alone is not enough.
 
 A native ZIP is simply a convenient way to distribute the compiled `.pyd`. **A matching native
 extension is required, but a particular ZIP is not:** build it locally, or install a compatible
 precompiled asset when one is available. Neither route replaces the required runtime dependencies.
-A source-only PR is complete for maintainers who can build it; end users still need one of these
-two installation steps. Submitting a PR does not automatically publish Release attachments.
+Source distributions include everything needed to build the extension, but deployment still
+requires compiling or obtaining the matching binary.
 
-For example, `mono-decode-native-46afaf7-cp313-torch214-bmg.zip` identifies the locally prepared
-B70 retest archive, not an upstream Release attachment:
+When evaluating a precompiled extension, check all of the following compatibility details:
 
-| filename marker | meaning |
+| attribute | required match |
 |---|---|
-| `46afaf7` | source commit used for the build |
-| `cp313` | CPython 3.13 ABI |
-| `torch214` | Torch 2.14 family; this particular build used **2.14.1+xpu** |
-| `bmg` | Intel Battlemage GPU compilation target |
+| source revision | native interfaces and kernels required by the Python checkout |
+| platform and Python ABI | for example, Windows x64 and CPython 3.13 (`cp313`) |
+| Torch build | the matching version and backend, not just the major/minor version |
+| GPU target | for example, Intel Battlemage (`bmg`) |
 
-The short filename is not a complete compatibility guarantee; check the build/release details.
+An archive filename alone is not a complete compatibility guarantee; check the build details.
 New main revisions can add native interfaces that an older `.pyd` lacks even if it still imports.
 Keep Python callers and native exports compatible, and rebuild when native sources, required
 interfaces, Python ABI, Torch version or GPU target change. Documentation-only and test-only
 commits do not by themselves require rebuilding an otherwise matching extension.
 
-### Windows portable: validated native extension
-
-**Main integration requires a matching rebuilt extension.** Source commit `46afaf7` and its rebuilt
-Windows extension passed user testing on Arc Pro B70 on 2026-11-16; no separate throughput figure
-was supplied for that integration run. Main now includes
-DPAS attention, device-side MTP, fused draft-head and compact layer-post kernels. The historical
-`windows-aad3005-bmg` asset below is only for the indicated fix branch, not this merged main.
-An old extension can import successfully yet lack functions such as `layer_post_h16`, `attn_dpas`
-and `mtp_accept`. Update the Python source and its matching native extension together before testing.
-
-**Cloning this repository does not install the native extension.** The Windows loader accepts
-`.pyd` files, but Git contains only source code. If the extension is missing or cannot load,
-ComfyUI can still start while Mono Decode stays inactive and prompt enhancement uses the stock path.
-The `install.py` / `build_icpx.sh` source-build instructions below currently require Linux;
-they are not an automatic Windows build procedure. For current main on Windows, use the
-[Windows source-build procedure](#windows--oneapi-source-build) below instead of the historical ZIP.
-
-The [Windows BMG release](https://github.com/zhm-algo/comfy-mono-decode-xpu/releases/tag/windows-aad3005-bmg)
-provides the native extension used to validate source commit
-[`aad3005`](https://github.com/zhm-algo/comfy-mono-decode-xpu/commit/aad3005548cc3c801f7cfa352c33f74764df68c4)
-on branch `fix/windows-dynamic-vram-decode`. It is for **Windows x64, CPython 3.13,
-Torch 2.14.1+xpu and Intel BMG**, tested with Python 3.13.14 on Arc Pro B70.
-It is not a universal wheel or a replacement for Torch/oneAPI runtime dependencies.
-Do not reuse it with another Python ABI, Torch version, GPU architecture, or changed native sources
-without rebuilding and validating that combination.
-
-Stop ComfyUI before installing. Set `$portable` to the actual directory containing both
-`python_embeded` and `ComfyUI`, **not its parent directory**. For a new clone:
-
-```powershell
-$portable = (Resolve-Path -LiteralPath 'C:\path\to\ComfyUI_windows_portable').Path
-git -C "$portable\ComfyUI\custom_nodes" clone --single-branch --branch fix/windows-dynamic-vram-decode https://github.com/zhm-algo/comfy-mono-decode-xpu.git
-```
-
-If the node is already cloned, keep that directory and check out the indicated branch instead.
-Then download, verify, and extract the release asset:
-
-```powershell
-$archive = Join-Path $env:TEMP 'mono-decode-native-aad3005-cp313-torch214-bmg.zip'
-$url = 'https://github.com/zhm-algo/comfy-mono-decode-xpu/releases/download/windows-aad3005-bmg/mono-decode-native-aad3005-cp313-torch214-bmg.zip'
-Invoke-WebRequest -Uri $url -OutFile $archive
-$expected = 'fea7b8210ecfd5465347bd2b65bd7229ae7d74ae839a9fefbc39379a2346b6f9'
-if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) {
-  throw 'Native extension archive checksum mismatch'
-}
-Expand-Archive -LiteralPath $archive -DestinationPath $portable -Force
-& "$portable\python_embeded\python.exe" -s -c "import sys,torch; sys.path.insert(0,sys.argv[1]); from comfy_mono_decode_xpu import _C; print(_C.__file__)" "$portable\ComfyUI\custom_nodes\comfy-mono-decode-xpu"
-if ($LASTEXITCODE -ne 0) { throw 'Native extension import failed; do not continue to inference' }
-```
-
-The ZIP contains only
-`ComfyUI/custom_nodes/comfy-mono-decode-xpu/comfy_mono_decode_xpu/_C.cp313-win_amd64.pyd`.
-It does not overwrite Python source, settings, workflows, or models. An import error mentioning a
-"partially initialized module" can mean `_C` is missing or has an incompatible filename; it does
-not by itself establish a Python circular import. A DLL-load error instead requires checking
-runtime dependencies and ABI compatibility. Do not proceed until the import prints the extension
-path inside the intended portable installation.
-
-Restart ComfyUI and check its **startup** log for `[mono_decode_xpu] layer installed=True`.
-With eligible Qwen3.5 decode and enough memory, generation should also report `reusing 32 tile plans`
-and `cached INT8 output head`. Import success alone does not establish that the hooks are active.
-The validated Windows MiniMax H3 edit run retained the full 11,541-token input, image, MTP and
-sampling settings, reached approximately 83-93 tokens/s in the later decode phase, and completed
-the workflow in 132.81 seconds. These are user-reported single-run observations, not a controlled
-benchmark or a guarantee of identical generated tokens under adaptive MTP. A fresh clone was
-also confirmed working after restoring this native extension.
-
 ### Windows / oneAPI source build
 
-The ZIP is optional: it contains a precompiled `_C` extension, not additional source code.
-Building the same source locally produces the `.pyd` that ComfyUI needs. Git clone/pull alone
-does not compile it. Rebuild after native sources change, and when changing the Python ABI,
-Torch version or GPU target. This procedure preserves the single compiler invocation used by
+The `install.py` / `build_icpx.sh` installer currently requires Linux; it does not automatically
+build an extension on Windows. Follow the manual procedure below to produce the `.pyd` locally.
+An outdated extension can import yet lack required functions such as `layer_post_h16`, `attn_dpas`
+or `mtp_accept`; update the Python source and matching native extension together.
+This procedure preserves the single compiler invocation used by
 `build_icpx.sh`; do not substitute a per-file `SyclExtension` build with a separate device link.
 
 #### Prerequisites
@@ -453,8 +385,9 @@ edition. Stop if initialization reports an error.
 
 Stop ComfyUI first. Set the three paths below: `$portable` contains both `ComfyUI` and
 `python_embeded`; `$repo` is the source checkout to build; `$python` is the full build Python.
-Use the main checkout for this procedure, not the historical fix branch. For a new checkout,
-clone `https://github.com/zhm-algo/comfy-mono-decode-xpu.git` into the node directory first.
+Do not point `$portable` at the parent directory of the portable installation. For a new checkout,
+clone `https://github.com/xiangyuT/comfy-mono-decode-xpu.git` into
+`ComfyUI/custom_nodes/comfy-mono-decode-xpu` first.
 If building outside the portable node directory, deploy that same Python source revision with
 the resulting extension. Do not copy a new extension over an unrelated source revision.
 
@@ -522,7 +455,7 @@ not needed for deployment and should not be committed.
 #### Verify with ComfyUI's Python
 
 The following checks import the installed extension and verify every export declared in the
-matching source (24 at `46afaf7`). They do not execute GPU kernels:
+matching source. They do not execute GPU kernels:
 
 ```powershell
 @'
