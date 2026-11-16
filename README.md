@@ -298,6 +298,33 @@ upstream eager kernels, and upstream comfy-aimdo has no XPU DynamicVRAM (results
 
 Install it like any custom node, into `ComfyUI/custom_nodes/`, using ComfyUI's Python environment.
 
+**ComfyUI-Manager** clones `https://github.com/xiangyuT/comfy-mono-decode-xpu` and runs
+`install.py`. The same entry point supports Linux and Windows; install the platform prerequisites
+below before using Manager, or rerun the installer after adding them.
+
+**By hand**, from `ComfyUI/custom_nodes`:
+
+```bash
+git clone https://github.com/xiangyuT/comfy-mono-decode-xpu
+cd comfy-mono-decode-xpu
+python install.py
+```
+
+Use the Python that runs ComfyUI, not an unrelated system Python. The installer uses its Torch
+headers and libraries and builds `_C` in place. It skips an extension newer than the native sources
+and build scripts. After `git pull`, run it again.
+
+Options:
+- `--force`: rebuild even when the extension is up to date.
+- `--target DEVICE`: AOT GPU target (default `bmg`, or `MONO_DECODE_XPU_XPU_DEVICE`).
+- `--python-dev DIRECTORY`: Windows development files from a matching full Python installation
+  (also configurable with `MONO_DECODE_XPU_PYTHON_DEV`).
+
+To keep Manager installation non-fatal, missing tools, missing XPU support or compilation failures
+are logged and return exit code 0. **Exit code 0 alone does not mean the extension was built.**
+Check for `extension ok` in the installer output, then restart ComfyUI and check
+`[mono_decode_xpu] layer installed=True`. Without a usable extension, decode uses the stock path.
+
 ### Why a native build is required
 
 This project has two parts:
@@ -307,8 +334,8 @@ This project has two parts:
   in `csrc/`, but Python cannot execute that source directly; it must load a compiled `_C` module.
 
 This is not a Windows-only requirement. Windows loads the native module as a `.pyd` file;
-Linux normally uses `.so`. The Linux installer automates the compiler invocation, while Windows
-currently uses the manual procedure below. The Python integration itself needs no manual build.
+Linux normally uses `.so`. The installer invokes the platform toolchain on either system.
+The Python integration itself needs no manual build.
 
 **`git clone` downloads source; it does not compile the extension.** If `_C` is missing or cannot
 load, the plugin does not install its acceleration hooks, and ComfyUI can continue on the stock
@@ -335,182 +362,49 @@ commits do not by themselves require rebuilding an otherwise matching extension.
 
 ### Windows / oneAPI source build
 
-The `install.py` / `build_icpx.sh` installer currently requires Linux; it does not automatically
-build an extension on Windows. Follow the manual procedure below to produce the `.pyd` locally.
-An outdated extension can import yet lack required functions such as `layer_post_h16`, `attn_dpas`
-or `mtp_accept`; update the Python source and matching native extension together.
-This procedure preserves the single compiler invocation used by
-`build_icpx.sh`; do not substitute a per-file `SyclExtension` build with a separate device link.
-
-#### Prerequisites
-
 - Windows x64 and Visual Studio 2022 Build Tools with **Desktop development with C++**, including
   the MSVC x64 toolchain and Windows SDK.
 - Intel oneAPI DPC++/C++ compiler for Windows, providing `icx.exe` and `setvars.bat`.
-- A full x64 CPython installation (or its virtual environment) with development headers and
-  `libs/python313.lib`, plus the **same Torch build as ComfyUI**. The tested combination was
-  Python 3.13.14 and Torch 2.14.1+xpu. A portable embedded Python often lacks the development
-  files; use a separate build environment in that case, without replacing ComfyUI's Python.
-- The existing ComfyUI XPU runtime dependencies remain required. Compilation does not install
-  Torch, ComfyUI-OmniXPU, Kitchen or AIMDO into the portable environment.
+- Python development headers and the matching import library. Full Python installations usually
+  include them; portable embedded Python often does not. In that case, install a full x64 CPython
+  matching the portable runtime's version and ABI, and point `--python-dev` at its root directory
+  (containing `include` and `libs`, not at a virtual environment).
 
-For example, install the matching Torch into an existing Python 3.13 build environment:
+`install.py` discovers MSVC through `vswhere.exe` and initializes oneAPI automatically when the
+toolchain is not already active. For non-default installations, set `ONEAPI_ROOT` to the oneAPI
+root and/or `VS2022INSTALLDIR` to the VS 2022 installation. An initialized x64 Native Tools
+Command Prompt with oneAPI loaded is also supported.
 
-```powershell
-& 'C:\path\to\build-venv\Scripts\python.exe' -m pip install 'torch==2.14.1+xpu' --index-url https://download.pytorch.org/whl/xpu
-```
-
-If that exact build came from a different wheel source, use that same source. Do not silently
-substitute a CPU wheel or a different Torch version. The build machine need not have a B70;
-running the compiled kernels and validating their results requires the matching GPU/runtime.
-
-#### Initialize the toolchain
-
-Open **x64 Native Tools Command Prompt for VS 2022**, then run these commands in that prompt
-(adjust the oneAPI path if installed elsewhere):
-
-```bat
-set "VS2022INSTALLDIR=%VSINSTALLDIR%"
-call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
-powershell -NoProfile
-```
-
-Continue in that PowerShell window so it inherits both MSVC and oneAPI environments.
-Setting `VS2022INSTALLDIR` explicitly avoids oneAPI failing to discover an installed BuildTools
-edition. Stop if initialization reports an error.
-
-#### Compile and install
-
-Stop ComfyUI first. Set the three paths below: `$portable` contains both `ComfyUI` and
-`python_embeded`; `$repo` is the source checkout to build; `$python` is the full build Python.
-Do not point `$portable` at the parent directory of the portable installation. For a new checkout,
-clone `https://github.com/xiangyuT/comfy-mono-decode-xpu.git` into
-`ComfyUI/custom_nodes/comfy-mono-decode-xpu` first.
-If building outside the portable node directory, deploy that same Python source revision with
-the resulting extension. Do not copy a new extension over an unrelated source revision.
+Stop ComfyUI before replacing a loaded `.pyd`. For a portable installation, set `$portable` to
+the directory containing both `python_embeded` and `ComfyUI`, not its parent:
 
 ```powershell
-$ErrorActionPreference = 'Stop'
 $portable = (Resolve-Path -LiteralPath 'C:\path\to\ComfyUI_windows_portable').Path
-$repo = (Resolve-Path -LiteralPath "$portable\ComfyUI\custom_nodes\comfy-mono-decode-xpu").Path
-$python = 'C:\path\to\build-venv\Scripts\python.exe'
-$compiler = 'C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin\icx.exe'
-Get-Command cl.exe -ErrorAction Stop | Out-Null
-if (!(Test-Path -LiteralPath $compiler)) { throw 'oneAPI icx.exe not found' }
-$metadata = & $python -c "import json,sys,sysconfig,pathlib,torch; print(json.dumps(dict(torch=str(pathlib.Path(torch.__file__).parent), include=sysconfig.get_paths()['include'], pylib=str(pathlib.Path(sys.base_prefix)/'libs'/('python'+str(sys.version_info.major)+str(sys.version_info.minor)+'.lib')), suffix=sysconfig.get_config_var('EXT_SUFFIX'), version=torch.__version__)))"
-if ($LASTEXITCODE -ne 0) { throw 'Build Python/Torch inspection failed' }
-$config = $metadata | ConvertFrom-Json
-$runtime = & "$portable\python_embeded\python.exe" -s -c "import json,sysconfig,torch; print(json.dumps(dict(suffix=sysconfig.get_config_var('EXT_SUFFIX'), version=torch.__version__)))"
-if ($LASTEXITCODE -ne 0) { throw 'Portable Python/Torch inspection failed' }
-$runtime = $runtime | ConvertFrom-Json
-if ($config.suffix -ne $runtime.suffix -or $config.version -ne $runtime.version) {
-  throw 'Build and portable Python ABI/Torch version must match'
-}
-$sources = @(
-  'csrc/bindings.cpp', 'csrc/w4a8_decode.sycl', 'csrc/act_prep.sycl',
-  'csrc/mono_mlp.sycl', 'csrc/mono_layer.sycl', 'csrc/mono_gdn.sycl',
-  'csrc/attn_port.sycl', 'csrc/attn_dpas.sycl', 'csrc/fast_topk.sycl',
-  'csrc/rope_kv.sycl', 'csrc/mtp_loop.sycl', 'csrc/draft_lmhead.sycl',
-  'csrc/topk_rows.sycl', 'csrc/draft_fused.sycl'
-) | ForEach-Object { Join-Path $repo $_ }
-$libraries = @('torch', 'torch_python', 'torch_cpu', 'torch_xpu', 'c10', 'c10_xpu') |
-  ForEach-Object { Join-Path $config.torch "lib\$_.lib" }
-$libraries += $config.pylib
-foreach ($required in ($sources + $libraries + (Join-Path $config.include 'Python.h'))) {
-  if (!(Test-Path -LiteralPath $required)) { throw "Missing build input: $required" }
-}
-$work = Join-Path $env:TEMP ('mono-native-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $work | Out-Null
-$output = Join-Path $work ("_C" + $config.suffix)
-$compilerArgs = @(
-  '--driver-mode=g++', '-fsycl', '-std=c++20', '-fms-runtime-lib=dll',
-  '-O3', '-DNDEBUG', '-DNOMINMAX', '-shared',
-  '-fsycl-targets=spir64_gen', '-Xsycl-target-backend', '-device bmg',
-  "-I$($config.torch)/include", "-I$($config.torch)/include/torch/csrc/api/include",
-  "-I$($config.include)", "-I$repo/csrc",
-  '-DTORCH_EXTENSION_NAME=_C', '-DTORCH_API_INCLUDE_EXTENSION_H', '-x', 'c++'
-) + $sources + @('-x', 'none', '-o', $output) + $libraries
-Push-Location $work
-try {
-  & $compiler @compilerArgs
-  if ($LASTEXITCODE -ne 0) { throw 'Native compilation failed; previous extension was not replaced' }
-  $destination = Join-Path $repo ('comfy_mono_decode_xpu\_C' + $config.suffix)
-  Copy-Item -LiteralPath $output -Destination $destination -Force
-  Write-Output "Built: $destination"
-} finally {
-  Pop-Location
-  Remove-Item -LiteralPath $work -Recurse -Force
-}
+$node = "$portable\ComfyUI\custom_nodes\comfy-mono-decode-xpu"
+& "$portable\python_embeded\python.exe" -s "$node\install.py" --python-dev 'C:\path\to\full-python'
 ```
 
-`--driver-mode=g++` is required for these GNU-style options with Windows `icx.exe`;
-without it, Torch headers can fail at C++20 `requires` expressions. `-fms-runtime-lib=dll`
-selects the DLL C/C++ runtime. Keep all 14 sources in this one invocation; when building a later
-revision, keep this list aligned with `SRCS` in `build_icpx.sh`. The output for the tested Python
-is `comfy_mono_decode_xpu/_C.cp313-win_amd64.pyd`. Temporary `.lib`/`.exp` build products are
-not needed for deployment and should not be committed.
-
-#### Verify with ComfyUI's Python
-
-The following checks import the installed extension and verify every export declared in the
-matching source. They do not execute GPU kernels:
+Omit `--python-dev` when the running Python already provides development files. The installer
+always uses ComfyUI's Python and Torch; it does not run or install Torch into the development-file
+provider. For Manager, set the equivalent environment variable **before starting ComfyUI**:
 
 ```powershell
-@'
-import pathlib
-import re
-import sys
-import torch
-
-repo = pathlib.Path(sys.argv[1])
-sys.path.insert(0, str(repo))
-from comfy_mono_decode_xpu import _C
-
-names = re.findall(r'm\.def\("([^"]+)"', (repo / 'csrc/bindings.cpp').read_text())
-missing = [name for name in names if not callable(getattr(_C, name, None))]
-assert names and not missing, missing
-print(_C.__file__)
-print(len(names), 'native exports verified')
-'@ | & "$portable\python_embeded\python.exe" -s - "$repo"
-if ($LASTEXITCODE -ne 0) { throw 'Native import/API verification failed' }
+$env:MONO_DECODE_XPU_PYTHON_DEV = 'C:\path\to\full-python'
 ```
 
-A DLL-load error requires checking the oneAPI runtime/DLL search paths and Python/Torch ABI;
-a missing export means the source and extension are mismatched or the build omitted a source.
-Restart ComfyUI using the normal XPU launcher, confirm `[mono_decode_xpu] layer installed=True`,
-then run the original full workflow on B70 and check output and throughput. Import/API checks
-alone do not establish GPU correctness or performance.
+The Windows build uses a temporary directory and replaces the extension only after successful
+compilation. An import/DLL failure still requires checking runtime dependencies and ABI compatibility.
+Successful import alone does not validate GPU numerics; use the tests and full workflow checks in
+[tests/README.md](tests/README.md).
 
 ### Linux / oneAPI source build
 
-**ComfyUI-Manager.** Install from the Git URL
-`https://github.com/xiangyuT/comfy-mono-decode-xpu`. Manager clones the repo and runs `install.py`,
-which builds the kernels.
+Install the oneAPI DPC++ compiler and run the same `python install.py` entry point (or `./install.sh`).
+The installer invokes `build_icpx.sh`; if `icpx` is not on `PATH`, it sources `setvars.sh` under
+`ONEAPI_ROOT` (default `/opt/intel/oneapi`). Torch XPU comes from the ComfyUI environment.
 
-**By hand:**
-
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/xiangyuT/comfy-mono-decode-xpu
-cd comfy-mono-decode-xpu
-python install.py            # or ./install.sh; use ComfyUI's python
-```
-
-`install.py` builds `comfy_mono_decode_xpu/_C*.so` in place. The build is a single icpx invocation
-and takes about 7–8 minutes on the test host. It is skipped when the extension is newer than every source. If `icpx` is not
-on `PATH`, oneAPI's `setvars.sh` under `ONEAPI_ROOT` (default `/opt/intel/oneapi`) is sourced.
-
-The script never fails the install. Without a compiler or an XPU, it explains what is missing and
-exits. ComfyUI still starts, and the node logs that it is inactive.
-
-Options:
-- `--force`: rebuild.
-- `--target DEVICE`: AOT device name (default `bmg`).
-
-There are no extra Python dependencies; torch (XPU) comes from the ComfyUI environment.
-After `git pull`, rerun `python install.py`: a changed source triggers a rebuild.
-
-Build only through `install.py` / `build_icpx.sh`, not `pip install`. torch's SyclExtension compiles
+Both platforms use the source list in `install.py` and one compiler invocation for compilation and
+device linking. Build through the installer, not `pip install`. torch's SyclExtension compiles
 each file separately and device-links afterwards, and that produced different device code for
 identical source. The kernels are validated bit-exact against the single-invocation build only.
 
