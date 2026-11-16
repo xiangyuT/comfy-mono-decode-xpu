@@ -314,13 +314,12 @@ currently uses the manual procedure below. The Python integration itself needs n
 load, the plugin does not install its acceleration hooks, and ComfyUI can continue on the stock
 decode path. Installing Python source alone is not enough.
 
-A native ZIP is simply a convenient way to distribute the compiled `.pyd`. **A matching native
-extension is required, but a particular ZIP is not:** build it locally, or install a compatible
-precompiled asset when one is available. Neither route replaces the required runtime dependencies.
-Source distributions include everything needed to build the extension, but deployment still
-requires compiling or obtaining the matching binary.
+**This project distributes source code and build instructions only, not precompiled native
+extensions.** Build the extension from source for your ComfyUI environment using the platform
+procedure below. The resulting `.pyd` or `.so` is a local build artifact, not a project Release
+attachment. Building the extension does not replace the required runtime dependencies.
 
-When evaluating a precompiled extension, check all of the following compatibility details:
+Match the build configuration to the environment where ComfyUI will run:
 
 | attribute | required match |
 |---|---|
@@ -329,7 +328,6 @@ When evaluating a precompiled extension, check all of the following compatibilit
 | Torch build | the matching version and backend, not just the major/minor version |
 | GPU target | for example, Intel Battlemage (`bmg`) |
 
-An archive filename alone is not a complete compatibility guarantee; check the build details.
 New main revisions can add native interfaces that an older `.pyd` lacks even if it still imports.
 Keep Python callers and native exports compatible, and rebuild when native sources, required
 interfaces, Python ABI, Torch version or GPU target change. Documentation-only and test-only
@@ -481,7 +479,7 @@ A DLL-load error requires checking the oneAPI runtime/DLL search paths and Pytho
 a missing export means the source and extension are mismatched or the build omitted a source.
 Restart ComfyUI using the normal XPU launcher, confirm `[mono_decode_xpu] layer installed=True`,
 then run the original full workflow on B70 and check output and throughput. Import/API checks
-alone do not establish GPU correctness or performance. A locally built `.pyd` needs no ZIP to run.
+alone do not establish GPU correctness or performance.
 
 ### Linux / oneAPI source build
 
