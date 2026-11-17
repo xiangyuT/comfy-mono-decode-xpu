@@ -255,6 +255,23 @@ The five cases complement 82 locally passed runtime cases from that revision, no
 87-case target run. The rebased source includes upstream #8 native changes and needs a matching
 rebuilt extension and fresh target validation; earlier rates are not measurements of that build.
 
+For the rebased source `3498d71ca816bbe8ca5ad325a064fc306dc4be0b`, the Windows BMG extension
+was rebuilt and its 24 callable exports checked in an independent portable Python process.
+The artifact SHA-256 is `DF5D114B674CBF925EEE4CB3F30877D3D526780C3236F2E2272A2C91037C4A29`.
+The B70 tester subsequently reported **185 passed in 10.19 s**, without failures or skips, and
+these decode observations:
+
+| workflow | tokens / limit | logged tok/s |
+|---|---:|---:|
+| T2I | 2904 / 8192 | 137.48 |
+| image edit | 4602 / 8196 | 118.22 |
+
+These single-run rates are not a matched performance comparison or proof of complete workflows.
+The platform probe reports an unresolved ISA FAIL and multiple visible XPUs despite the passing
+suite. Full workflow logs, repeated-run completion, prompt/image inspection and recovery evidence
+remain pending. See [B70 acceptance](../tests/README.md#b70-rebased-baseline-acceptance) for the
+required evidence before marking this baseline fully retested; do not substitute earlier results.
+
 ### Removed prefill-trim experiment
 
 With weight reuse enabled, the tester supplied one Windows run per setting/workflow before rebase:
