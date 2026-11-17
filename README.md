@@ -322,8 +322,10 @@ for Manager and leave decode on the stock path. Restart ComfyUI after installati
 ### Windows / oneAPI source build
 
 Requires Windows x64, VS 2022 Build Tools with Desktop development with C++ and Windows SDK,
-and Intel oneAPI DPC++/C++ (`icx.exe`). The installer initializes MSVC/oneAPI automatically;
-non-default locations can use `ONEAPI_ROOT` and `VS2022INSTALLDIR`.
+and Intel oneAPI DPC++/C++ (`icx.exe`). **Install these components on the build machine first:
+the installer initializes the MSVC/oneAPI environment but does not install the tools. Without
+them, it cannot compile a new `.pyd`; a successful Manager installation is not proof of a
+successful native build.** Non-default locations can use `ONEAPI_ROOT` and `VS2022INSTALLDIR`.
 
 Stop ComfyUI before rebuilding a loaded `.pyd`. Embedded Python needs matching full CPython
 development files (`include` and `libs`, not a venv). From the portable root containing
