@@ -2,7 +2,6 @@
 """Minimal regressions for stateful error recovery and inference-mode norm caching."""
 import sys
 import types
-import json
 from contextlib import nullcontext
 
 import pytest
@@ -254,15 +253,13 @@ def test_inference_norm_cache_has_generation_lifetime(monkeypatch):
         tiles.end()
 
 
-@pytest.mark.parametrize("device,diagnostic,trim,expected", [
-    ("xpu", "0", "0", []),
-    ("xpu", "1", "0", ["memory"]),
-    ("xpu", "0", "1", ["memory", "synchronize", "empty_cache", "memory"]),
-    ("cpu", "1", "1", []),
+@pytest.mark.parametrize("device,trim,expected", [
+    ("xpu", "0", []),
+    ("xpu", "1", ["memory", "synchronize", "empty_cache", "memory"]),
+    ("cpu", "1", []),
 ])
-def test_decode_boundary_controls(monkeypatch, device, diagnostic, trim, expected):
+def test_decode_boundary_controls(monkeypatch, device, trim, expected):
     calls = []
-    monkeypatch.setenv("MONO_DECODE_XPU_DIAGNOSTICS", diagnostic)
     monkeypatch.setenv("MONO_DECODE_XPU_PREFILL_TRIM", trim)
     monkeypatch.setattr(tiles, "_decode_memory", lambda device: calls.append("memory") or {})
     monkeypatch.setattr(torch.xpu, "device", lambda device: nullcontext())
@@ -292,45 +289,101 @@ def test_decode_boundary_runs_once_per_generate(monkeypatch):
         tiles.end()
 
 
-@pytest.mark.parametrize("instance_forward", [False, True])
+@pytest.mark.parametrize("value,expected", [(None, True), ("1", True), ("0", False)])
+def test_weight_reuse_switch(monkeypatch, value, expected):
+    for name in ("REUSE_TILES", "HEAD_CACHE", "HOST_ROWS"):
+        monkeypatch.setenv("MONO_DECODE_XPU_" + name, "0" if expected else "1")
+    if value is None:
+        monkeypatch.delenv("MONO_DECODE_XPU_WEIGHT_REUSE", raising=False)
+    else:
+        monkeypatch.setenv("MONO_DECODE_XPU_WEIGHT_REUSE", value)
+    assert tiles._weight_reuse_enabled() is expected
+
+
+@pytest.mark.parametrize("setting", [None, "0", "1"])
 @pytest.mark.parametrize("fail", [False, True])
-def test_generation_diagnostics_restore_forward(monkeypatch, caplog, instance_forward, fail):
-    class Body:
-        def forward(self, embeds=None, past_key_values=None):
+def test_generation_wrapper_without_diagnostics(monkeypatch, setting, fail):
+    calls = []
+    body = types.SimpleNamespace(layers=[], prefetch_dynamic_vbars=True,
+                                 embed_tokens=object(), lm_head=None, forward=lambda **kwargs: "forward")
+    original = body.forward
+
+    class Qwen35:
+        model = body
+
+        def modules(self):
+            return iter([])
+
+        def generate(self):
+            assert tiles.session_active()
+            tiles._prepare_decode(torch.device("xpu"))
+            calls.append(self.model.forward())
             if fail:
                 raise RuntimeError("generation failed")
-            return embeds
+            return "generated"
 
-    body = Body()
-    if instance_forward:
-        body.forward = body.forward
-    original = body.forward
-    model = types.SimpleNamespace(model=body)
+    comfy = types.ModuleType("comfy")
+    ops = types.ModuleType("comfy.ops")
+    encoders = types.ModuleType("comfy.text_encoders")
+    encoders.qwen35 = types.SimpleNamespace(Qwen35=Qwen35)
+    encoders.llama = types.SimpleNamespace(BaseGenerate=type("BaseGenerate", (), {}))
+    comfy.ops, comfy.text_encoders = ops, encoders
+    for name, module in (("comfy", comfy), ("comfy.ops", ops), ("comfy.text_encoders", encoders)):
+        monkeypatch.setitem(sys.modules, name, module)
+    if setting is None:
+        monkeypatch.delenv("MONO_DECODE_XPU_WEIGHT_REUSE", raising=False)
+    else:
+        monkeypatch.setenv("MONO_DECODE_XPU_WEIGHT_REUSE", setting)
+    monkeypatch.setenv("MONO_DECODE_XPU_PREFILL_TRIM", "0")
     monkeypatch.setenv("MONO_DECODE_XPU_DIAGNOSTICS", "1")
-    monkeypatch.delenv("MONO_DECODE_XPU_PROFILE", raising=False)
-    embeds = torch.zeros(1, 1, 4)
-    caplog.set_level("INFO")
+    monkeypatch.setenv("MONO_DECODE_XPU_PROFILE", "unused-profile.json")
+    monkeypatch.setattr(tiles, "_decode_memory", lambda device: pytest.fail("unexpected memory query"))
+    monkeypatch.setattr(torch.profiler, "profile", lambda **kwargs: pytest.fail("unexpected profiler"))
     try:
-        with tiles._diagnose_generation(model):
-            for step in range(33):
-                assert body.forward(embeds=embeds) is embeds
-    except RuntimeError as error:
-        assert fail and str(error) == "generation failed"
-    assert body.forward == original
-    assert ("forward" in vars(body)) == instance_forward
-    if not fail:
-        assert "forward=1 " in caplog.text and "forward=33 " in caplog.text
+        assert tiles.install() == 1
+        if fail:
+            with pytest.raises(RuntimeError, match="generation failed"):
+                Qwen35().generate()
+        else:
+            assert Qwen35().generate() == "generated"
+        assert calls == ["forward"]
+        assert body.forward is original and body.prefetch_dynamic_vbars
+        assert not tiles.session_active() and tiles.stats()["live_bytes"] == 0
+    finally:
+        tiles.end()
 
 
-def test_generation_diagnostics_disabled(monkeypatch):
-    monkeypatch.setenv("MONO_DECODE_XPU_DIAGNOSTICS", "0")
-    monkeypatch.delenv("MONO_DECODE_XPU_PROFILE", raising=False)
-    with tiles._diagnose_generation(object()):
-        pass
+def test_generation_stats_survive_cleanup():
+    owner = types.SimpleNamespace(modules=lambda: iter([]))
+    try:
+        tiles.begin(owner)
+        assert tiles.stats()["budget"] is None
+        tiles._session.update(plans={object(): {}}, bytes=256, prefetch_skips=3,
+                              host_rows_calls=2, head_cache=dict(bytes=80, hits=4, reason="ready"),
+                              budget=dict(layout="tile", available_bytes=1024))
+        active = tiles.stats()
+        assert active["tile_plans"] == 1 and active["live_bytes"] == 256 and active["active"]
+        tiles.end()
+        completed = tiles.stats()
+        assert not completed["active"] and completed["live_bytes"] == 0
+        assert completed["tile_plans"] == 1 and completed["prefetch_skips"] == 3
+        assert completed["host_rows_calls"] == 2
+        assert completed["head_cache"] == dict(bytes=80, hits=4, reason="ready")
+        assert completed["budget"] == dict(layout="tile", available_bytes=1024)
+        completed["head_cache"]["hits"] = 100
+        completed["budget"]["layout"] = "row"
+        assert tiles.stats()["head_cache"]["hits"] == 4
+        assert tiles.stats()["budget"]["layout"] == "tile"
+        tiles.begin(owner)
+        fresh = tiles.stats()
+        assert fresh["tile_plans"] == fresh["prefetch_skips"] == fresh["host_rows_calls"] == 0
+        assert fresh["head_cache"] is None and fresh["budget"] is None
+    finally:
+        tiles.end()
 
 
 @pytest.mark.parametrize("case,expected", [
-    ("ready", False), ("prefill", True), ("missing_plan", True),
+    ("ready", False), ("default", False), ("prefill", True), ("missing_plan", True),
     ("row", True), ("inactive", True), ("disabled", True),
     ("guard", True), ("cpu", True), ("no_kv", True), ("no_prefetch", False),
 ])
@@ -356,7 +409,10 @@ def test_tile_plan_prefetch_reuse(monkeypatch, case, expected, fail):
     monkeypatch.setattr(guard, "_off", {"layer": "test"} if case == "guard" else {})
     monkeypatch.setattr(tiles, "_tiled_ok", True)
     monkeypatch.setenv("MONO_DECODE_XPU_SESSION_TILES", "1")
-    monkeypatch.setenv("MONO_DECODE_XPU_REUSE_TILES", "0" if case == "disabled" else "1")
+    if case == "default":
+        monkeypatch.delenv("MONO_DECODE_XPU_WEIGHT_REUSE", raising=False)
+    else:
+        monkeypatch.setenv("MONO_DECODE_XPU_WEIGHT_REUSE", "0" if case == "disabled" else "1")
     embeds = types.SimpleNamespace(device=torch.device("cpu" if case == "cpu" else "xpu"),
                                    dtype=torch.bfloat16, ndim=3,
                                    shape=(1, 100 if case == "prefill" else 8, 4096))
@@ -385,7 +441,7 @@ def test_tile_plan_prefetch_reuse(monkeypatch, case, expected, fail):
 
 
 @pytest.mark.parametrize("case,expected", [
-    ("ready", "rows"), ("resident", "full"), ("prefetched", "full"),
+    ("ready", "rows"), ("default", "rows"), ("resident", "full"), ("prefetched", "full"),
     ("prefill", "full"), ("cpu", "full"), ("weight_function", "full"),
     ("lowvram", "full"), ("max_norm", "full"), ("format", "full"), ("disabled", "full"),
 ])
@@ -424,7 +480,10 @@ def test_host_embedding_rows(monkeypatch, case, expected, fail):
     owner = types.SimpleNamespace(model=types.SimpleNamespace(embed_tokens=embedding), modules=lambda: iter([]))
     tokens = types.SimpleNamespace(device=torch.device("cpu" if case == "cpu" else "xpu"),
                                    numel=lambda: 100 if case == "prefill" else 8)
-    monkeypatch.setenv("MONO_DECODE_XPU_HOST_ROWS", "0" if case == "disabled" else "1")
+    if case == "default":
+        monkeypatch.delenv("MONO_DECODE_XPU_WEIGHT_REUSE", raising=False)
+    else:
+        monkeypatch.setenv("MONO_DECODE_XPU_WEIGHT_REUSE", "0" if case == "disabled" else "1")
     try:
         tiles.begin(owner)
         try:
@@ -467,7 +526,7 @@ def test_fused_draft_embedding_avoids_full_table_cast(monkeypatch, streamed):
     comfy.ops = ops
     monkeypatch.setitem(sys.modules, "comfy", comfy)
     monkeypatch.setitem(sys.modules, "comfy.ops", ops)
-    monkeypatch.setenv("MONO_DECODE_XPU_HOST_ROWS", "1")
+    monkeypatch.setenv("MONO_DECODE_XPU_WEIGHT_REUSE", "1")
     empty = torch.empty(0)
 
     def fused(*args):
@@ -488,7 +547,7 @@ def test_fused_draft_embedding_avoids_full_table_cast(monkeypatch, streamed):
         tiles.end()
 
 
-@pytest.mark.parametrize("case", ["ready", "prefill", "cpu", "prefetch", "missing_plan",
+@pytest.mark.parametrize("case", ["ready", "default", "prefill", "cpu", "prefetch", "missing_plan",
                                  "weight_function", "lowvram", "budget", "oom", "error", "disabled"])
 def test_owned_output_head(monkeypatch, case):
     from comfy_kitchen.tensor.base import QuantizedTensor
@@ -520,7 +579,10 @@ def test_owned_output_head(monkeypatch, case):
     monkeypatch.setitem(sys.modules, "comfy.ops", ops)
     monkeypatch.setattr(tiles, "plan", lambda block: None if case == "missing_plan" else object())
     monkeypatch.setattr(tiles, "_copy_budget", lambda device: {"available_bytes": 0 if case == "budget" else 1024})
-    monkeypatch.setenv("MONO_DECODE_XPU_HEAD_CACHE", "0" if case == "disabled" else "1")
+    if case == "default":
+        monkeypatch.delenv("MONO_DECODE_XPU_WEIGHT_REUSE", raising=False)
+    else:
+        monkeypatch.setenv("MONO_DECODE_XPU_WEIGHT_REUSE", "0" if case == "disabled" else "1")
     if case in ("oom", "error"):
         def fail_clone(self):
             raise torch.OutOfMemoryError("test allocation") if case == "oom" else RuntimeError("test clone")
@@ -535,7 +597,7 @@ def test_owned_output_head(monkeypatch, case):
             else:
                 first = ops.cast_bias_weight(head, input, offloadable=True)
                 second = ops.cast_bias_weight(head, input, offloadable=True)
-                if case == "ready":
+                if case in ("ready", "default"):
                     assert len(calls) == len(releases) == 1
                     assert first[0] is second[0] and first[2] is None
                     assert type(first[0]) is QuantizedTensor
@@ -574,7 +636,7 @@ def test_tile_prefetch_restores_when_plan_becomes_unavailable(monkeypatch):
                                    ndim=3, shape=(1, 8, 4096))
     monkeypatch.setattr(guard, "_off", {})
     monkeypatch.setattr(tiles, "_tiled_ok", True)
-    monkeypatch.setenv("MONO_DECODE_XPU_REUSE_TILES", "1")
+    monkeypatch.setenv("MONO_DECODE_XPU_WEIGHT_REUSE", "1")
     monkeypatch.setenv("MONO_DECODE_XPU_SESSION_TILES", "1")
     try:
         tiles.begin(owner)
@@ -590,64 +652,3 @@ def test_tile_prefetch_restores_when_plan_becomes_unavailable(monkeypatch):
         assert body.prefetch_dynamic_vbars is True
     finally:
         tiles.end()
-
-
-@pytest.mark.parametrize("steps,fail_at,expected", [
-    (8, None, []),
-    (12, None, ["start", "metadata", "stop", "export", "table"]),
-    (20, None, ["start", "metadata", "stop", "export", "table"]),
-    (20, 10, ["start", "metadata", "stop", "export", "table"]),
-])
-def test_generation_profile_window(monkeypatch, steps, fail_at, expected):
-    events = []
-
-    class Profile:
-        def start(self):
-            events.append("start")
-
-        def add_metadata_json(self, name, value):
-            assert name == "mono_decode_xpu"
-            metadata = json.loads(value)
-            assert metadata["revision"] == "vocabulary-transfer-v3"
-            assert "weight_budget" in metadata and "prefetch_skips" in metadata
-            events.append("metadata")
-
-        def stop(self):
-            events.append("stop")
-
-        def export_chrome_trace(self, path):
-            assert path == "decode-test.json"
-            events.append("export")
-
-        def key_averages(self):
-            return self
-
-        def table(self, sort_by, row_limit):
-            assert sort_by == "self_device_time_total"
-            events.append("table")
-            return "profile table"
-
-    class Body:
-        calls = 0
-
-        def forward(self, embeds=None):
-            self.calls += 1
-            if self.calls == fail_at:
-                raise RuntimeError("generation failed")
-            return embeds
-
-    body = Body()
-    original = body.forward
-    model = types.SimpleNamespace(model=body)
-    embeds = types.SimpleNamespace(device=torch.device("xpu"), shape=(1, 1, 4))
-    monkeypatch.setenv("MONO_DECODE_XPU_DIAGNOSTICS", "0")
-    monkeypatch.setenv("MONO_DECODE_XPU_PROFILE", "decode-test.json")
-    monkeypatch.setattr(torch.profiler, "profile", lambda **kwargs: Profile())
-    try:
-        with tiles._diagnose_generation(model):
-            for step in range(steps):
-                assert body.forward(embeds=embeds) is embeds
-    except RuntimeError as error:
-        assert fail_at is not None and str(error) == "generation failed"
-    assert events == expected
-    assert body.forward == original and "forward" not in vars(body)

@@ -34,6 +34,11 @@ Validated on Arc Pro B70:
 | MOSS Image (`image_moss_image_t2i`) | v0.45 (and v0.43) | performance and output, see Results |
 | MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | performance and output in DynamicVRAM, see Results (prompt-enhance decode about 140–149 tok/s on every image; `MONO_DECODE_XPU=0`: 24–28 tok/s); the default workflow also completes in prefetch and ordinary-memory modes |
 
+For DynamicVRAM weight reuse, `MONO_DECODE_XPU_WEIGHT_REUSE` defaults on. Set it to `0` for a
+whole-feature A/B without disabling the layer kernels. See [environment variables](docs/ENV.md)
+for migration from the former three switches and [Windows observations](docs/DESIGN.md#windows-whole-feature-observations-2026-11-17)
+for the B70 image-edit logs and their different-length comparison limits.
+
 ## Results
 
 All numbers are from one Arc Pro B70. The current results (ComfyUI v0.45, 2026-11-13 and 2026-11-16) use the
