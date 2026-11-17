@@ -44,6 +44,7 @@ These default to `1` (except where noted). `0` returns that part only to the sto
 | variable | effect |
 |---|---|
 | `MONO_DECODE_XPU_XPU_DEVICE` | AOT device for the build (default `bmg`); `install.py --target` sets it. |
+| `MONO_DECODE_XPU_HOST_ROWS` | Default `1`. Enable the session INT8 host-row optimization only when ComfyUI's current VBAR watermark indicates streaming and no prefetch is active. Rechecked at each lookup; CPU source weights alone do not qualify. `0` disables this optimization, not the existing non-resident fallbacks in the draft head and device MTP loop. |
 | `MONO_DECODE_XPU_STATS` | Path: the W4 linear patch writes its call counters there at exit. |
 | `MONO_DECODE_XPU_GRAPH_WARMUP` | Eager steps before the experimental graph captures (default `3`). |
 | `MONO_DECODE_XPU_DEVICE_MTP_GRAPH` | `1` replays the draft head graph inside the asynchronous device loop too (default off: the loop already hides the host time, no gain measured). |

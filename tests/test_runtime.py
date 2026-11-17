@@ -385,7 +385,8 @@ def test_tile_plan_prefetch_reuse(monkeypatch, case, expected, fail):
 
 
 @pytest.mark.parametrize("case,expected", [
-    ("ready", "rows"), ("prefill", "full"), ("cpu", "full"), ("weight_function", "full"),
+    ("ready", "rows"), ("resident", "full"), ("prefetched", "full"),
+    ("prefill", "full"), ("cpu", "full"), ("weight_function", "full"),
     ("lowvram", "full"), ("max_norm", "full"), ("format", "full"), ("disabled", "full"),
 ])
 @pytest.mark.parametrize("fail", [False, True])
@@ -409,6 +410,16 @@ def test_host_embedding_rows(monkeypatch, case, expected, fail):
             return "rows"
 
     embedding = Embedding()
+    if case == "prefetched":
+        embedding._prefetch = {"resident": True}
+    residency = {"above_watermark": case != "resident"}
+    ops = types.ModuleType("comfy.ops")
+    ops.vbar_above_watermark = lambda module: (
+        residency["above_watermark"] and getattr(module, "_prefetch", None) is None)
+    comfy = types.ModuleType("comfy")
+    comfy.ops = ops
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    monkeypatch.setitem(sys.modules, "comfy.ops", ops)
     original = embedding.forward
     owner = types.SimpleNamespace(model=types.SimpleNamespace(embed_tokens=embedding), modules=lambda: iter([]))
     tokens = types.SimpleNamespace(device=torch.device("cpu" if case == "cpu" else "xpu"),
@@ -419,9 +430,60 @@ def test_host_embedding_rows(monkeypatch, case, expected, fail):
         try:
             with tiles._host_embedding_rows(owner):
                 assert embedding.forward(tokens, out_dtype=torch.bfloat16) == expected
+                if case == "ready" and not fail:
+                    residency["above_watermark"] = False
+                    assert embedding.forward(tokens, out_dtype=torch.bfloat16) == "full"
+                    residency["above_watermark"] = True
+                    assert embedding.forward(tokens, out_dtype=torch.bfloat16) == "rows"
+                    embedding._prefetch = {"resident": True}
+                    assert embedding.forward(tokens, out_dtype=torch.bfloat16) == "full"
         except RuntimeError as error:
             assert fail and expected == "rows" and str(error) == "row gather failed"
         assert embedding.forward == original and "forward" not in vars(embedding)
+    finally:
+        tiles.end()
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_fused_draft_embedding_avoids_full_table_cast(monkeypatch, streamed):
+    from comfy_mono_decode_xpu.draft_head import DraftHead
+
+    calls = []
+    params = types.SimpleNamespace(scale=torch.ones(4, 1), convrot=False)
+    quantized = types.SimpleNamespace(_qdata=torch.ones(4, 4, dtype=torch.int8), _params=params)
+    embedding = types.SimpleNamespace(
+        _v=object(), quant_format="int8_tensorwise", weight_function=[], bias_function=[],
+        weight_lowvram_function=None, max_norm=None,
+        weight=types.SimpleNamespace(device=torch.device("cpu"), dtype=torch.bfloat16,
+                        _layout_cls="TensorWiseINT8Layout", _params=params),
+        host_rows=lambda tokens, out_dtype: calls.append("rows") or torch.ones(1, 1, 4, dtype=out_dtype))
+    token = types.SimpleNamespace(device=torch.device("xpu"), numel=lambda: 1)
+    token.reshape = lambda *shape: token
+    ops = types.ModuleType("comfy.ops")
+    ops.vbar_above_watermark = lambda module: streamed
+    ops.CastBiasWeightContext = lambda *args, **kwargs: (
+        calls.append("cast") or nullcontext((quantized, None)))
+    comfy = types.ModuleType("comfy")
+    comfy.ops = ops
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    monkeypatch.setitem(sys.modules, "comfy.ops", ops)
+    monkeypatch.setenv("MONO_DECODE_XPU_HOST_ROWS", "1")
+    empty = torch.empty(0)
+
+    def fused(*args):
+        if streamed:
+            assert args[0].numel() == 0 and torch.equal(args[4], torch.ones(4, dtype=torch.bfloat16))
+            calls.append("fused norms")
+        else:
+            assert args[0] is token and args[1] is quantized._qdata and args[4].numel() == 0
+            calls.append("fused gather")
+
+    head = types.SimpleNamespace(embed=embedding, C=types.SimpleNamespace(draft_embed_norm_cat=fused),
+                                 eps=(1e-6, 1e-6), empty=empty, n_e=empty, n_h=empty, fc_in=empty)
+    tiles.begin(types.SimpleNamespace(modules=lambda: iter([])))
+    try:
+        DraftHead._embed(head, token, torch.zeros(1, 1, 4))
+        assert calls == (["rows", "fused norms"] if streamed else ["cast", "fused gather"])
     finally:
         tiles.end()
 

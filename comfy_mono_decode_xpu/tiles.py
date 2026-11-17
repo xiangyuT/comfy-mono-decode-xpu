@@ -169,6 +169,19 @@ def _reuse_tile_plans(model):
             body.forward = previous
 
 
+def host_rows_enabled(embedding, tokens):
+    if not (os.environ.get("MONO_DECODE_XPU_HOST_ROWS", "1") == "1"
+            and hasattr(embedding, "_v")
+            and getattr(embedding, "quant_format", None) == "int8_tensorwise"
+            and session_active() and tokens.device.type == "xpu" and 1 <= tokens.numel() <= 8
+            and embedding.weight.device.type == "cpu"
+            and not embedding.weight_function and not embedding.bias_function
+            and embedding.weight_lowvram_function is None and embedding.max_norm is None):
+        return False
+    import comfy.ops
+    return comfy.ops.vbar_above_watermark(embedding)
+
+
 @contextmanager
 def _host_embedding_rows(model):
     embedding = model.model.embed_tokens
@@ -182,11 +195,7 @@ def _host_embedding_rows(model):
 
     @wraps(original)
     def forward(tokens, *args, **kwargs):
-        if (not args and not (kwargs.keys() - {"out_dtype"}) and session_active()
-                and tokens.device.type == "xpu" and 1 <= tokens.numel() <= 8
-                and embedding.weight.device.type == "cpu"
-                and not embedding.weight_function and not embedding.bias_function
-                and embedding.weight_lowvram_function is None and embedding.max_norm is None):
+        if not args and not (kwargs.keys() - {"out_dtype"}) and host_rows_enabled(embedding, tokens):
             result = embedding.host_rows(tokens, out_dtype=kwargs.get("out_dtype"))
             _session["host_rows_calls"] += 1
             return result
