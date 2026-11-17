@@ -208,6 +208,74 @@ installed together: removing the wait while keeping host clocks makes `auto` pic
 - The fused RoPE routes compare their first call in each generate with the live operator chain. On a
   mismatch they rewrite the KV slots from the live result and disable only that route.
 
+### Generation-owned weight reuse
+
+`MONO_DECODE_XPU_WEIGHT_REUSE` defaults on and controls three operations together, without
+disabling the existing session tiles or layer kernels when set to `0`:
+
+- Skip body/MTP prefetch only for eligible BF16 decode rows when every layer has a usable tiled
+  plan. Restore the original setting when plans become unavailable and on exit, including failure.
+- Once prefetch is suppressed and all plans exist, clone the INT8 output head's packed data and
+  quantization metadata within the live copy budget. Draft and verify share this generation-owned
+  copy; release the original cast and drop the copy at generation exit. Insufficient budget or
+  allocation failure keeps the ordinary cast path.
+- Gather only needed INT8 embedding rows on the host when ComfyUI's current VBAR watermark
+  indicates streaming and no prefetch is active. Recheck every lookup: CPU source weights alone
+  do not prove non-residency. Existing non-resident draft/device-loop fallbacks stay independent.
+
+`tiles.stats()` retains the budget, plan count, prefetch skips, embedding-wrapper row calls and
+head-cache status for the current or last generation, without a user-facing profiler wrapper.
+
+### Windows whole-feature observations (2026-11-17)
+
+User-supplied MiniMax H3 image-edit logs: Arc Pro B70 (31907 MB VRAM), Windows, Python 3.13.14,
+Torch 2.14.1+xpu, ComfyUI 0.45.0, DynamicVRAM, Kitchen 0.2.41, AIMDO 0.6.0 and
+`omni_xpu_kernel 0.2.0b3+torch214.bmg`. Source/native build: `dae77d7`, before consolidation/rebase.
+Both groups kept MONO and LAYER enabled. A disabled all three former weight-reuse switches; B
+enabled them. One warmup and three measurements per server; reported token progress-bar `it/s`:
+
+| run | A: all off, limit 128 (tok/s) | B: all on, limit 8196 (tok/s) |
+|---|---:|---:|
+| warmup (excluded) | 1.92 | 117.70 |
+| 1 | 1.91 | 109.46 |
+| 2 | 2.12 | 121.88 |
+| 3 | 2.12 | 117.79 |
+| measured median | 2.12 | 117.79 |
+
+A reached 128 tokens each run; B's measured runs reached 2667, 4971 and 4602. Each B run reported
+32 reused tile plans and a 1,018,112,000-byte owned INT8 head. Host-row counts were not recorded.
+These are whole-feature observations, not a matched-length speedup or per-component attribution.
+The tester separately reports short B at 20-30 tok/s and long A around 2 tok/s; those trials are
+not in the supplied log table. Setup cost, auto MTP and generated text can affect reported rates.
+
+After consolidation (`bc1bdb2`, before rebase), the tester reported all five XPU-dependent error
+recovery cases passing (6.92 s, no skips), image-edit decode at 117.40 tok/s (4602/8196), and T2I
+at 140.73 tok/s (4642/8192). These snippets establish decode execution, not final-image quality.
+The five cases complement 82 locally passed runtime cases from that revision, not a single
+87-case target run. The rebased source includes upstream #8 native changes and needs a matching
+rebuilt extension and fresh target validation; earlier rates are not measurements of that build.
+
+### Removed prefill-trim experiment
+
+With weight reuse enabled, the tester supplied one Windows run per setting/workflow before rebase:
+
+| workflow | trim | generated tokens | logged tok/s | workflow seconds |
+|---|---:|---:|---:|---:|
+| T2I | 0 | 8192 | 140.46 | 87.96 |
+| T2I | 1 | 6576 | 137.53 | 76.67 |
+| image edit | 0 | 4602 | 117.05 | 109.25 |
+| image edit | 1 | 4602 | 117.11 | 108.78 |
+
+T2I trim reduced Torch reserved memory by 116 MiB, with allocated and reported free memory
+unchanged. Its shorter total time is confounded by fewer generated tokens and downstream attention
+length changing from 4097 to 533. Image edit's allocated/reserved/free readings were unchanged;
+its 0.05% rate difference and 0.47 s total-time difference do not establish a benefit in one trial.
+The T2I trim-off run reached its token limit; prompt completeness was not established by the log.
+
+There is no demonstrated need for this extra synchronization/cache flush on these workflows.
+`PREFILL_TRIM`, its boundary hook and logging are removed rather than made automatic. This is not
+a claim of no benefit under every memory-pressure condition.
+
 ## Not in the default stack
 
 - `graph_step.py`: XPU graph capture of the whole verify step (`MONO_DECODE_XPU_GRAPH=1`), resident

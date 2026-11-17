@@ -187,7 +187,8 @@ def main():
                                        "DPC++ compiler, then rerun `python install.py`")
                 success = subprocess.call(cmd, cwd=HERE, env=env) == 0
         except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-            log(f"build unavailable ({error}). Stop ComfyUI before rebuilding. Decode runs the stock path.")
+            hint = " Stop ComfyUI before rebuilding." if windows else ""
+            log(f"build unavailable ({error}).{hint} Decode runs the stock path.")
             return 0
         if not success:
             log("build failed (see the compiler output above). Decode runs the stock path.")

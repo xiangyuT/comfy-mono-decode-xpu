@@ -196,14 +196,20 @@ def test_windows_single_invocation_preserves_output_on_failure(installer, monkey
 
 
 @pytest.mark.parametrize("failure", [None, "missing", "compiler"])
-def test_windows_main_routes_options_and_keeps_install_nonfatal(installer, monkeypatch, failure, capsys):
+@pytest.mark.parametrize("development_source", ["cli", "environment"])
+def test_windows_main_routes_options_and_keeps_install_nonfatal(installer, monkeypatch, failure, capsys,
+                                                                development_source):
     torch = types.SimpleNamespace(__version__="test+xpu", xpu=types.SimpleNamespace(
         is_available=lambda: True, get_device_name=lambda index: "test GPU"))
     monkeypatch.setitem(installer.sys.modules, "torch", torch)
     monkeypatch.setitem(installer.sys.modules, "comfy_mono_decode_xpu",
                         types.SimpleNamespace(_C=types.SimpleNamespace(operation=lambda: None)))
     monkeypatch.setattr(installer.sys, "platform", "win32")
-    monkeypatch.setattr(installer.sys, "argv", ["install.py", "--force", "--target", "test-gpu", "--python-dev", "dev-root"])
+    arguments = ["install.py", "--force", "--target", "test-gpu"]
+    monkeypatch.setenv("MONO_DECODE_XPU_PYTHON_DEV", "dev-root" if development_source == "environment" else "unused")
+    if development_source == "cli":
+        arguments.extend(["--python-dev", "dev-root"])
+    monkeypatch.setattr(installer.sys, "argv", arguments)
     monkeypatch.setattr(installer, "up_to_date", lambda: True)
     calls = []
 
@@ -225,6 +231,25 @@ def test_windows_main_routes_options_and_keeps_install_nonfatal(installer, monke
     output = capsys.readouterr().out
     assert ("extension ok" in output) == (failure is None)
     assert ("stock path" in output) == (failure is not None)
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_stop_before_rebuild_hint_is_windows_only(installer, monkeypatch, platform, capsys):
+    monkeypatch.setitem(installer.sys.modules, "torch", types.SimpleNamespace(
+        __version__="test+xpu", xpu=types.SimpleNamespace(is_available=lambda: True, get_device_name=lambda index: "GPU")))
+    monkeypatch.setattr(installer.sys, "platform", platform)
+    monkeypatch.setattr(installer.sys, "argv", ["install.py", "--force"])
+    monkeypatch.setattr(installer, "up_to_date", lambda: False)
+
+    def unavailable():
+        raise RuntimeError("compiler unavailable")
+
+    monkeypatch.setattr(installer, "windows_environment", unavailable)
+    monkeypatch.setattr(installer, "build_command", unavailable)
+    assert installer.main() == 0
+    output = capsys.readouterr().out
+    assert "build unavailable" in output and "stock path" in output
+    assert ("Stop ComfyUI before rebuilding" in output) == (platform == "win32")
 
 
 def test_up_to_date_windows_does_not_need_compiler(installer, monkeypatch):

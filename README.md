@@ -301,13 +301,8 @@ upstream eager kernels, and upstream comfy-aimdo has no XPU DynamicVRAM (results
 
 ## Install
 
-Install it like any custom node, into `ComfyUI/custom_nodes/`, using ComfyUI's Python environment.
-
-**ComfyUI-Manager** clones `https://github.com/xiangyuT/comfy-mono-decode-xpu` and runs
-`install.py`. The same entry point supports Linux and Windows; install the platform prerequisites
-below before using Manager, or rerun the installer after adding them.
-
-**By hand**, from `ComfyUI/custom_nodes`:
+Use ComfyUI's Python environment. Manager runs `install.py` after cloning; for manual installation,
+start in `ComfyUI/custom_nodes`:
 
 ```bash
 git clone https://github.com/xiangyuT/comfy-mono-decode-xpu
@@ -315,92 +310,33 @@ cd comfy-mono-decode-xpu
 python install.py
 ```
 
-Use the Python that runs ComfyUI, not an unrelated system Python. The installer uses its Torch
-headers and libraries and builds `_C` in place. It skips an extension newer than the native sources
-and build scripts. After `git pull`, run it again.
+This is a source-only distribution: cloning does not build the native `.pyd` (Windows) or `.so`
+(Linux). Rerun the installer after updates; it skips an up-to-date extension. Use `--force` to
+rebuild and `--target DEVICE` to select the AOT GPU (default `bmg`). Rebuild when native sources,
+required interfaces, Python ABI, Torch build or GPU target change.
 
-Options:
-- `--force`: rebuild even when the extension is up to date.
-- `--target DEVICE`: AOT GPU target (default `bmg`, or `MONO_DECODE_XPU_XPU_DEVICE`).
-- `--python-dev DIRECTORY`: Windows development files from a matching full Python installation
-  (also configurable with `MONO_DECODE_XPU_PYTHON_DEV`).
-
-To keep Manager installation non-fatal, missing tools, missing XPU support or compilation failures
-are logged and return exit code 0. **Exit code 0 alone does not mean the extension was built.**
-Check for `extension ok` in the installer output, then restart ComfyUI and check
-`[mono_decode_xpu] layer installed=True`. Without a usable extension, decode uses the stock path.
-
-### Why a native build is required
-
-This project has two parts:
-
-- **Python integration** connects to ComfyUI, manages decode memory and schedules inference.
-- **C++/SYCL native GPU code** implements the accelerated operations. Its source is included
-  in `csrc/`, but Python cannot execute that source directly; it must load a compiled `_C` module.
-
-This is not a Windows-only requirement. Windows loads the native module as a `.pyd` file;
-Linux normally uses `.so`. The installer invokes the platform toolchain on either system.
-The Python integration itself needs no manual build.
-
-**`git clone` downloads source; it does not compile the extension.** If `_C` is missing or cannot
-load, the plugin does not install its acceleration hooks, and ComfyUI can continue on the stock
-decode path. Installing Python source alone is not enough.
-
-**This project distributes source code and build instructions only, not precompiled native
-extensions.** Build the extension from source for your ComfyUI environment using the platform
-procedure below. The resulting `.pyd` or `.so` is a local build artifact, not a project Release
-attachment. Building the extension does not replace the required runtime dependencies.
-
-Match the build configuration to the environment where ComfyUI will run:
-
-| attribute | required match |
-|---|---|
-| source revision | native interfaces and kernels required by the Python checkout |
-| platform and Python ABI | for example, Windows x64 and CPython 3.13 (`cp313`) |
-| Torch build | the matching version and backend, not just the major/minor version |
-| GPU target | for example, Intel Battlemage (`bmg`) |
-
-New main revisions can add native interfaces that an older `.pyd` lacks even if it still imports.
-Keep Python callers and native exports compatible, and rebuild when native sources, required
-interfaces, Python ABI, Torch version or GPU target change. Documentation-only and test-only
-commits do not by themselves require rebuilding an otherwise matching extension.
+**Require `extension ok`, not just exit code 0:** unavailable tools and failed builds are non-fatal
+for Manager and leave decode on the stock path. Restart ComfyUI after installation. See
+[tests/README.md](tests/README.md) for numerical and workflow validation.
 
 ### Windows / oneAPI source build
 
-- Windows x64 and Visual Studio 2022 Build Tools with **Desktop development with C++**, including
-  the MSVC x64 toolchain and Windows SDK.
-- Intel oneAPI DPC++/C++ compiler for Windows, providing `icx.exe` and `setvars.bat`.
-- Python development headers and the matching import library. Full Python installations usually
-  include them; portable embedded Python often does not. In that case, install a full x64 CPython
-  matching the portable runtime's version and ABI, and point `--python-dev` at its root directory
-  (containing `include` and `libs`, not at a virtual environment).
+Requires Windows x64, VS 2022 Build Tools with Desktop development with C++ and Windows SDK,
+and Intel oneAPI DPC++/C++ (`icx.exe`). The installer initializes MSVC/oneAPI automatically;
+non-default locations can use `ONEAPI_ROOT` and `VS2022INSTALLDIR`.
 
-`install.py` discovers MSVC through `vswhere.exe` and initializes oneAPI automatically when the
-toolchain is not already active. For non-default installations, set `ONEAPI_ROOT` to the oneAPI
-root and/or `VS2022INSTALLDIR` to the VS 2022 installation. An initialized x64 Native Tools
-Command Prompt with oneAPI loaded is also supported.
-
-Stop ComfyUI before replacing a loaded `.pyd`. For a portable installation, set `$portable` to
-the directory containing both `python_embeded` and `ComfyUI`, not its parent:
+Stop ComfyUI before rebuilding a loaded `.pyd`. Embedded Python needs matching full CPython
+development files (`include` and `libs`, not a venv). From the portable root containing
+`python_embeded` and `ComfyUI`:
 
 ```powershell
-$portable = (Resolve-Path -LiteralPath 'C:\path\to\ComfyUI_windows_portable').Path
-$node = "$portable\ComfyUI\custom_nodes\comfy-mono-decode-xpu"
-& "$portable\python_embeded\python.exe" -s "$node\install.py" --python-dev 'C:\path\to\full-python'
+& .\python_embeded\python.exe -s .\ComfyUI\custom_nodes\comfy-mono-decode-xpu\install.py --python-dev 'C:\path\to\full-python'
 ```
 
-Omit `--python-dev` when the running Python already provides development files. The installer
-always uses ComfyUI's Python and Torch; it does not run or install Torch into the development-file
-provider. For Manager, set the equivalent environment variable **before starting ComfyUI**:
-
-```powershell
-$env:MONO_DECODE_XPU_PYTHON_DEV = 'C:\path\to\full-python'
-```
-
-The Windows build uses a temporary directory and replaces the extension only after successful
-compilation. An import/DLL failure still requires checking runtime dependencies and ABI compatibility.
-Successful import alone does not validate GPU numerics; use the tests and full workflow checks in
-[tests/README.md](tests/README.md).
+Omit `--python-dev` for a runtime that already provides those files. For Manager, set
+`MONO_DECODE_XPU_PYTHON_DEV` before starting ComfyUI (see [ENV](docs/ENV.md)). The development root
+supplies headers/libraries only; compilation still uses portable Python and its Torch. A failed
+compile leaves the existing extension unchanged.
 
 ### Linux / oneAPI source build
 
@@ -408,10 +344,8 @@ Install the oneAPI DPC++ compiler and run the same `python install.py` entry poi
 The installer invokes `build_icpx.sh`; if `icpx` is not on `PATH`, it sources `setvars.sh` under
 `ONEAPI_ROOT` (default `/opt/intel/oneapi`). Torch XPU comes from the ComfyUI environment.
 
-Both platforms use the source list in `install.py` and one compiler invocation for compilation and
-device linking. Build through the installer, not `pip install`. torch's SyclExtension compiles
-each file separately and device-links afterwards, and that produced different device code for
-identical source. The kernels are validated bit-exact against the single-invocation build only.
+Both platforms compile and device-link in one invocation. Use the installer, not `pip install` or
+a separate SyclExtension build, whose device code can differ from the validated build.
 
 ## Use
 

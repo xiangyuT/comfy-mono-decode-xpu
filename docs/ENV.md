@@ -47,6 +47,7 @@ timing changes can alter tree selection and generated text even when an operatio
 | variable | effect |
 |---|---|
 | `MONO_DECODE_XPU_XPU_DEVICE` | AOT device for the build (default `bmg`); `install.py --target` sets it. |
+| `MONO_DECODE_XPU_PYTHON_DEV` | Windows build only: full CPython root containing `include/Python.h`, `include/patchlevel.h` and the matching `libs/pythonXY.lib`. Match the running Python's version, architecture and ABI. Defaults to the running Python's development paths; embedded Python commonly needs an explicit root. `install.py --python-dev DIRECTORY` overrides it. This provides build files only, not a replacement interpreter or Torch installation. |
 | `MONO_DECODE_XPU_STATS` | Path: the W4 linear patch writes its call counters there at exit. |
 | `MONO_DECODE_XPU_GRAPH_WARMUP` | Eager steps before the experimental graph captures (default `3`). |
 | `MONO_DECODE_XPU_DEVICE_MTP_GRAPH` | `1` replays the draft head graph inside the asynchronous device loop too (default off: the loop already hides the host time, no gain measured). |
@@ -63,6 +64,8 @@ The former `MONO_DECODE_XPU_REUSE_TILES`, `MONO_DECODE_XPU_HEAD_CACHE` and
 `MONO_DECODE_XPU_HOST_ROWS` variables are no longer read; remove them from launch scripts.
 The PR's `MONO_DECODE_XPU_DIAGNOSTICS` and `MONO_DECODE_XPU_PROFILE` variables are also removed.
 They no longer install observing wrappers, emit per-forward dumps or export profiles.
+`MONO_DECODE_XPU_PREFILL_TRIM` is also removed: the Windows trials showed no established benefit.
+Generation no longer adds a boundary synchronization or calls `empty_cache()` for this experiment.
 
 Each module exposes `stats()`: `comfy_mono_decode_xpu.layer.stats()`, `.logits.stats()`,
 `.mono.stats()`, `.patch.stats()`, `.autotree.stats()` (the device-timed draft / verify cost that

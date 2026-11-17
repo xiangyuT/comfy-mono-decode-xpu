@@ -121,27 +121,6 @@ def _copy_budget(device):
                 dynamic_vram=dynamic, inactive_vbar_bytes=reclaimable, physical_free_bytes=free)
 
 
-def _decode_memory(device):
-    return dict(allocated_bytes=torch.xpu.memory_allocated(device),
-                reserved_bytes=torch.xpu.memory_reserved(device),
-                free_bytes=torch.xpu.mem_get_info(device)[0])
-
-
-def _prepare_decode(device):
-    if device.type != "xpu":
-        return
-    trim = os.environ.get("MONO_DECODE_XPU_PREFILL_TRIM", "0") == "1"
-    if not trim:
-        return
-    before = _decode_memory(device)
-    if trim:
-        with torch.xpu.device(device):
-            torch.xpu.synchronize(device)
-            torch.xpu.empty_cache()
-    logging.info("[mono_decode_xpu] decode boundary trim=%s; before=%s; after=%s",
-                 trim, before, _decode_memory(device) if trim else before)
-
-
 @contextmanager
 def _reuse_tile_plans(model):
     if not _weight_reuse_enabled():
@@ -333,7 +312,6 @@ def tiled(lin, w):
     if not tiles_enabled():
         return None
     if _session["budget"] is None:
-        _prepare_decode(w.device)
         try:
             budget = _copy_budget(w.device)
         except Exception as e:  # an unexpected model/allocator state: keep the row-major weights

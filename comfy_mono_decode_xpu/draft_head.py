@@ -166,7 +166,7 @@ class DraftHead:
         eps_e, eps_h = self.eps[0], self.eps[1]
         host = (tiles.host_rows_enabled(e, token)
             or (hasattr(e, "_v") and e.weight_lowvram_function is None and len(e.weight_function) == 0
-            and comfy.ops.vbar_above_watermark(e)))
+                and comfy.ops.vbar_above_watermark(e)))
         w = e.weight
         p = getattr(w, "_params", None)
         if (not host and len(e.weight_function) == 0 and getattr(e, "quant_format", None) == "int8_tensorwise"

@@ -12,7 +12,6 @@ from comfy_mono_decode_xpu import guard, layer, mono, tiles
 
 @pytest.mark.parametrize("failure", ["kv", "x", "subpath"])
 def test_state_write_is_not_replayed(C, monkeypatch, failure):
-    pytest.importorskip("comfy.ops")  # the layer path imports ComfyUI's ops (stubbed entry types below)
     x = torch.zeros(1, 1, 4096, dtype=torch.bfloat16, device="xpu")
     kv = torch.zeros(1, device="xpu")
     replay = []
@@ -191,12 +190,14 @@ def test_reclaimable_pages_do_not_override_model_capacity(monkeypatch):
     assert tiles._copy_budget(device)["layout"] == "row"
 
 
-@pytest.mark.parametrize("allocated,free,expected", [
-    (1575362048, 13634584576, "tile"),
-    (1575362048, 11500000000, "row"),
-    (20000000000, 13634584576, "row"),
+@pytest.mark.parametrize("allocated,free,reclaimable,expected", [
+    (1575362048, 13634584576, 0, "tile"),
+    (1575362048, 11500000000, 0, "row"),
+    (20000000000, 13634584576, 0, "row"),
+    (1575362048, 11500000000, 2500000000, "tile"),
+    (20000000000, 13634584576, 100000000000, "row"),
 ])
-def test_copy_budget_reuses_allocator_cache(monkeypatch, allocated, free, expected):
+def test_copy_budget_reuses_allocator_cache(monkeypatch, allocated, free, reclaimable, expected):
     total, reserved = 33456746496, max(18131976192, allocated)
     reserve, model_bytes, copy_bytes = 5153960755.2, 7343366112, 3888119808
     comfy = types.ModuleType("comfy")
@@ -211,7 +212,7 @@ def test_copy_budget_reuses_allocator_cache(monkeypatch, allocated, free, expect
     monkeypatch.setattr(torch.xpu, "memory_allocated", lambda device: allocated)
     monkeypatch.setattr(torch.xpu, "mem_get_info", lambda device: (free, total))
     monkeypatch.setattr(tiles, "_margin", 3 * 1024 ** 3)
-    monkeypatch.setattr(tiles, "_inactive_vram_budget", lambda device: 0)
+    monkeypatch.setattr(tiles, "_inactive_vram_budget", lambda device: reclaimable)
     packed, scale = object(), object()
     weight = types.SimpleNamespace(device=torch.device("cpu"), _qdata=packed,
                                    _params=types.SimpleNamespace(group_size=16, convrot_groupsize=256, scale=scale))
@@ -224,9 +225,10 @@ def test_copy_budget_reuses_allocator_cache(monkeypatch, allocated, free, expect
         budget = tiles._copy_budget(torch.device("xpu:0"))
         assert budget["layout"] == expected
         assert budget["dynamic_vram"]
+        assert budget["inactive_vbar_bytes"] == reclaimable and budget["physical_free_bytes"] == free
         assert budget["allocated_bytes"] == allocated and budget["reserved_bytes"] == reserved
         assert budget["available_bytes"] == max(0, min(total - allocated - reserve - model_bytes,
-                                                     free - reserve - tiles._margin))
+                                 free + reclaimable - reserve - tiles._margin))
         if expected == "tile":
             assert total - reserved - reserve - model_bytes < copy_bytes
             assert budget["available_bytes"] >= copy_bytes
@@ -253,31 +255,17 @@ def test_inference_norm_cache_has_generation_lifetime(monkeypatch):
         tiles.end()
 
 
-@pytest.mark.parametrize("device,trim,expected", [
-    ("xpu", "0", []),
-    ("xpu", "1", ["memory", "synchronize", "empty_cache", "memory"]),
-    ("cpu", "1", []),
-])
-def test_decode_boundary_controls(monkeypatch, device, trim, expected):
-    calls = []
-    monkeypatch.setenv("MONO_DECODE_XPU_PREFILL_TRIM", trim)
-    monkeypatch.setattr(tiles, "_decode_memory", lambda device: calls.append("memory") or {})
-    monkeypatch.setattr(torch.xpu, "device", lambda device: nullcontext())
-    monkeypatch.setattr(torch.xpu, "synchronize", lambda device: calls.append("synchronize"))
-    monkeypatch.setattr(torch.xpu, "empty_cache", lambda: calls.append("empty_cache"))
-    tiles._prepare_decode(torch.device(device))
-    assert calls == expected
-
-
-def test_decode_boundary_runs_once_per_generate(monkeypatch):
+def test_copy_budget_runs_once_per_generate_without_trim(monkeypatch):
     calls = []
     owner = types.SimpleNamespace(modules=lambda: iter([]))
-    monkeypatch.setattr(tiles, "_prepare_decode", lambda device: calls.append(device))
     monkeypatch.setattr(tiles, "_copy_budget", lambda device:
-                        dict(layout="row", copy_bytes=1, available_bytes=0))
+                        calls.append(device) or dict(layout="row", copy_bytes=1, available_bytes=0))
     monkeypatch.setattr(tiles, "_tiled_ok", True)
     monkeypatch.setenv("MONO_DECODE_XPU_SESSION_TILES", "1")
-    device = torch.device("cpu")
+    monkeypatch.setenv("MONO_DECODE_XPU_PREFILL_TRIM", "1")
+    monkeypatch.setattr(torch.xpu, "synchronize", lambda *args: pytest.fail("unexpected synchronization"))
+    monkeypatch.setattr(torch.xpu, "empty_cache", lambda: pytest.fail("unexpected cache trim"))
+    device = torch.device("xpu")
     try:
         for generation in range(2):
             tiles.begin(owner)
@@ -316,7 +304,6 @@ def test_generation_wrapper_without_diagnostics(monkeypatch, setting, fail):
 
         def generate(self):
             assert tiles.session_active()
-            tiles._prepare_decode(torch.device("xpu"))
             calls.append(self.model.forward())
             if fail:
                 raise RuntimeError("generation failed")
@@ -334,10 +321,8 @@ def test_generation_wrapper_without_diagnostics(monkeypatch, setting, fail):
         monkeypatch.delenv("MONO_DECODE_XPU_WEIGHT_REUSE", raising=False)
     else:
         monkeypatch.setenv("MONO_DECODE_XPU_WEIGHT_REUSE", setting)
-    monkeypatch.setenv("MONO_DECODE_XPU_PREFILL_TRIM", "0")
     monkeypatch.setenv("MONO_DECODE_XPU_DIAGNOSTICS", "1")
     monkeypatch.setenv("MONO_DECODE_XPU_PROFILE", "unused-profile.json")
-    monkeypatch.setattr(tiles, "_decode_memory", lambda device: pytest.fail("unexpected memory query"))
     monkeypatch.setattr(torch.profiler, "profile", lambda **kwargs: pytest.fail("unexpected profiler"))
     try:
         assert tiles.install() == 1
