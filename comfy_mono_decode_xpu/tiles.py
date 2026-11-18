@@ -319,6 +319,8 @@ def tiled(lin, w):
                             "row-major weights for this generate", type(e).__name__, e)
             budget = dict(layout="row", copy_bytes=0, available_bytes=0, error=f"{type(e).__name__}: {e}")
         _session["budget"] = _last_budget = budget
+        logging.info("[mono_decode_xpu] weight layout=%s; copies=%d, available=%d",
+                     _last_budget["layout"], _last_budget["copy_bytes"], _last_budget["available_bytes"])
         if _last_budget["layout"] != "tile":
             _session["ok"] = False
             return None

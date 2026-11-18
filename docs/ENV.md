@@ -60,12 +60,6 @@ timing changes can alter tree selection and generated text even when an operatio
 For whole-feature A/B, keep `MONO_DECODE_XPU=1` and `MONO_DECODE_XPU_LAYER=1`, and change only
 `MONO_DECODE_XPU_WEIGHT_REUSE`: `0` for A, `1` (or unset) for B. Use fresh servers with the same
 workflow, inputs, sampling, MTP mode and generation limit for a matched comparison.
-The former `MONO_DECODE_XPU_REUSE_TILES`, `MONO_DECODE_XPU_HEAD_CACHE` and
-`MONO_DECODE_XPU_HOST_ROWS` variables are no longer read; remove them from launch scripts.
-The PR's `MONO_DECODE_XPU_DIAGNOSTICS` and `MONO_DECODE_XPU_PROFILE` variables are also removed.
-They no longer install observing wrappers, emit per-forward dumps or export profiles.
-`MONO_DECODE_XPU_PREFILL_TRIM` is also removed: the Windows trials showed no established benefit.
-Generation no longer adds a boundary synchronization or calls `empty_cache()` for this experiment.
 
 Each module exposes `stats()`: `comfy_mono_decode_xpu.layer.stats()`, `.logits.stats()`,
 `.mono.stats()`, `.patch.stats()`, `.autotree.stats()` (the device-timed draft / verify cost that

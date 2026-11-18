@@ -120,7 +120,9 @@ def test_norm_rope_native_error_is_not_replayed(C, monkeypatch):
     assert not writes and guard.off("norm_rope") and not guard.off("layer")
 
 
-def test_copy_budget_error_reads_row_major(monkeypatch):
+def test_copy_budget_error_reads_row_major(monkeypatch, caplog):
+    caplog.set_level("INFO")
+
     def broken(device):
         raise AttributeError("unexpected parameter layout")
 
@@ -132,6 +134,7 @@ def test_copy_budget_error_reads_row_major(monkeypatch):
         tiles.begin(owner)
         assert tiles.tiled(object(), types.SimpleNamespace(device=torch.device("cpu"))) is None
         assert not tiles.tiles_enabled() and tiles.stats()["budget"]["layout"] == "row"
+        assert caplog.text.count("weight layout=row; copies=0, available=0") == 1
     finally:
         tiles.end()
 
