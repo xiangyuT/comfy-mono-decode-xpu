@@ -1,6 +1,6 @@
 # Environment variables
 
-The variables are read when ComfyUI starts, when the custom node loads. `1` means on, `0` means off.
+Set variables before starting ComfyUI and restart it after changes. `1` means on, `0` means off.
 
 ## Pieces (read by the node's `__init__.py`)
 
@@ -18,6 +18,8 @@ A piece set explicitly overrides the master switch, e.g. `MONO_DECODE_XPU=1 MONO
 ## Layer path tuning (A/B and debugging)
 
 These default to `1` (except where noted). `0` returns that part only to the stock code. The verify numerics stay the same, except `ATTN_DPAS=0` (bit-identical attention). `AUTOTREE` and the draft switches change what is drafted, which can change the sampled text; the verify still decides every token.
+With `auto` MTP,
+timing changes can alter tree selection and generated text even when an operation's values match.
 
 | variable | part |
 |---|---|
@@ -32,6 +34,7 @@ These default to `1` (except where noted). `0` returns that part only to the sto
 | `MONO_DECODE_XPU_PICK` | Argmax and top-8 in one pass, reused by the topk that follows. |
 | `MONO_DECODE_XPU_TILED` | Tile-major W4 copies. `0` makes the kernels read row-major weights even when resident. |
 | `MONO_DECODE_XPU_SESSION_TILES` | Per-generate tile-major copies in resident and DynamicVRAM modes. |
+| `MONO_DECODE_XPU_WEIGHT_REUSE` | Generation-owned DynamicVRAM weight reuse as one feature: skip redundant body/MTP prefetch when every layer has a usable tiled plan, cache the INT8 output head within the live copy budget, and gather only needed INT8 embedding rows when the current VBAR watermark indicates streaming with no active prefetch. `0` disables all three together, not session tile creation, layer kernels, or existing non-resident draft/device-loop fallbacks. |
 | `MONO_DECODE_XPU_TILE_MARGIN_GB` | Default `3`. Free VRAM kept beyond the actual model-copy requirement and inference reserve. |
 | `MONO_DECODE_XPU_DRAFT` | Keep the eager MTP draft head's BF16 weights for the generate instead of recasting them on every draft (DynamicVRAM: one copy, about 0.5 GB, when free memory allows). |
 | `MONO_DECODE_XPU_DEVICE_MTP` | Device MTP loop: the per-step bookkeeping runs on the device and the host reads each step one step late. `sync` keeps one sync per step; `shadow` also runs upstream's host walk and compares (slow); `0` runs upstream's loop. Unsupported configurations (penalties, batch > 1, other caches, a ComfyUI whose MTP loop differs from v0.45) run upstream's loop. |
@@ -44,6 +47,7 @@ These default to `1` (except where noted). `0` returns that part only to the sto
 | variable | effect |
 |---|---|
 | `MONO_DECODE_XPU_XPU_DEVICE` | AOT device for the build (default `bmg`); `install.py --target` sets it. |
+| `MONO_DECODE_XPU_PYTHON_DEV` | Windows build only: full CPython root containing `include/Python.h`, `include/patchlevel.h` and the matching `libs/pythonXY.lib`. Match the running Python's version, architecture and ABI. Defaults to the running Python's development paths; embedded Python commonly needs an explicit root. `install.py --python-dev DIRECTORY` overrides it. This provides build files only, not a replacement interpreter or Torch installation. |
 | `MONO_DECODE_XPU_STATS` | Path: the W4 linear patch writes its call counters there at exit. |
 | `MONO_DECODE_XPU_GRAPH_WARMUP` | Eager steps before the experimental graph captures (default `3`). |
 | `MONO_DECODE_XPU_DEVICE_MTP_GRAPH` | `1` replays the draft head graph inside the asynchronous device loop too (default off: the loop already hides the host time, no gain measured). |
@@ -53,6 +57,10 @@ These default to `1` (except where noted). `0` returns that part only to the sto
 
 ## Checking what ran
 
+For whole-feature A/B, keep `MONO_DECODE_XPU=1` and `MONO_DECODE_XPU_LAYER=1`, and change only
+`MONO_DECODE_XPU_WEIGHT_REUSE`: `0` for A, `1` (or unset) for B. Use fresh servers with the same
+workflow, inputs, sampling, MTP mode and generation limit for a matched comparison.
+
 Each module exposes `stats()`: `comfy_mono_decode_xpu.layer.stats()`, `.logits.stats()`,
 `.mono.stats()`, `.patch.stats()`, `.autotree.stats()` (the device-timed draft / verify cost that
 `auto` uses), `.draft.stats()`, `.graph_draft.stats()` and `.mtp_loop.stats()`. They report call counts and the fallback reasons.
@@ -60,3 +68,11 @@ Each module exposes `stats()`: `comfy_mono_decode_xpu.layer.stats()`, `.logits.s
 (`attn`, `attn_dpas`, `rope`, `norm_rope`), the fallback reasons and the tile-copy state
 (`weight_layout`, live and copied bytes, `session_active`, `disabled`). The `weights` fallback counts
 the BF16 MTP block, which does not take the layer path.
+
+`comfy_mono_decode_xpu.tiles.stats()` exposes the current generation's copy `budget`, `tile_plans`,
+`prefetch_skips`, embedding-wrapper `host_rows_calls`, and `head_cache` (`bytes`, `hits`, `reason`).
+After generation cleanup these describe the last generation, while `active` is false and
+`live_bytes` is zero. `tile_bytes` and `tile_oom` are cumulative. Read these in the running ComfyUI
+process; a separate Python process has its own empty counters. Statistics collection does not
+enable a profiler or add device synchronization. The draft/device-loop fallbacks have their own
+counters and are not included in the embedding-wrapper count.

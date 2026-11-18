@@ -34,6 +34,9 @@ Validated on Arc Pro B70:
 | MOSS Image (`image_moss_image_t2i`) | v0.45 (and v0.43) | performance and output, see Results |
 | MiniMax H3 Image (`image_minimax_h3_image_t2i`) | v0.45 | performance and output in DynamicVRAM, see Results (prompt-enhance decode about 140–149 tok/s on every image; `MONO_DECODE_XPU=0`: 24–28 tok/s); the default workflow also completes in prefetch and ordinary-memory modes |
 
+For DynamicVRAM weight reuse, `MONO_DECODE_XPU_WEIGHT_REUSE` defaults on. Set it to `0` for a
+whole-feature A/B without disabling the layer kernels. See [environment variables](docs/ENV.md).
+
 ## Results
 
 All numbers are from one Arc Pro B70. The current results (ComfyUI v0.45, 2026-11-13 and 2026-11-16) use the
@@ -296,38 +299,53 @@ upstream eager kernels, and upstream comfy-aimdo has no XPU DynamicVRAM (results
 
 ## Install
 
-Install it like any custom node, into `ComfyUI/custom_nodes/`, using ComfyUI's Python environment.
-
-**ComfyUI-Manager.** Install from the Git URL
-`https://github.com/xiangyuT/comfy-mono-decode-xpu`. Manager clones the repo and runs `install.py`,
-which builds the kernels.
-
-**By hand:**
+Use ComfyUI's Python environment. Manager runs `install.py` after cloning; for manual installation,
+start in `ComfyUI/custom_nodes`:
 
 ```bash
-cd ComfyUI/custom_nodes
 git clone https://github.com/xiangyuT/comfy-mono-decode-xpu
 cd comfy-mono-decode-xpu
-python install.py            # or ./install.sh; use ComfyUI's python
+python install.py
 ```
 
-`install.py` builds `comfy_mono_decode_xpu/_C*.so` in place. The build is a single icpx invocation
-and takes about 7–8 minutes on the test host. It is skipped when the extension is newer than every source. If `icpx` is not
-on `PATH`, oneAPI's `setvars.sh` under `ONEAPI_ROOT` (default `/opt/intel/oneapi`) is sourced.
+This is a source-only distribution: cloning does not build the native `.pyd` (Windows) or `.so`
+(Linux). Rerun the installer after updates; it skips an up-to-date extension. Use `--force` to
+rebuild and `--target DEVICE` to select the AOT GPU (default `bmg`). Rebuild when native sources,
+required interfaces, Python ABI, Torch build or GPU target change.
 
-The script never fails the install. Without a compiler or an XPU, it explains what is missing and
-exits. ComfyUI still starts, and the node logs that it is inactive.
+**Require `extension ok`, not just exit code 0:** unavailable tools and failed builds are non-fatal
+for Manager and leave decode on the stock path. Restart ComfyUI after installation. See
+[tests/README.md](tests/README.md) for numerical and workflow validation.
 
-Options:
-- `--force`: rebuild.
-- `--target DEVICE`: AOT device name (default `bmg`).
+### Windows / oneAPI source build
 
-There are no extra Python dependencies; torch (XPU) comes from the ComfyUI environment.
-After `git pull`, rerun `python install.py`: a changed source triggers a rebuild.
+Requires Windows x64, VS 2022 Build Tools with Desktop development with C++ and Windows SDK,
+and Intel oneAPI DPC++/C++ (`icx.exe`). **Install these components on the build machine first:
+the installer initializes the MSVC/oneAPI environment but does not install the tools. Without
+them, it cannot compile a new `.pyd`; a successful Manager installation is not proof of a
+successful native build.** Non-default locations can use `ONEAPI_ROOT` and `VS2022INSTALLDIR`.
 
-Build only through `install.py` / `build_icpx.sh`, not `pip install`. torch's SyclExtension compiles
-each file separately and device-links afterwards, and that produced different device code for
-identical source. The kernels are validated bit-exact against the single-invocation build only.
+Stop ComfyUI before rebuilding a loaded `.pyd`. Embedded Python needs matching full CPython
+development files (`include` and `libs`, not a venv). From the portable root containing
+`python_embeded` and `ComfyUI`:
+
+```powershell
+& .\python_embeded\python.exe -s .\ComfyUI\custom_nodes\comfy-mono-decode-xpu\install.py --python-dev 'C:\path\to\full-python'
+```
+
+Omit `--python-dev` for a runtime that already provides those files. For Manager, set
+`MONO_DECODE_XPU_PYTHON_DEV` before starting ComfyUI (see [ENV](docs/ENV.md)). The development root
+supplies headers/libraries only; compilation still uses portable Python and its Torch. A failed
+compile leaves the existing extension unchanged.
+
+### Linux / oneAPI source build
+
+Install the oneAPI DPC++ compiler and run the same `python install.py` entry point (or `./install.sh`).
+The installer invokes `build_icpx.sh`; if `icpx` is not on `PATH`, it sources `setvars.sh` under
+`ONEAPI_ROOT` (default `/opt/intel/oneapi`). Torch XPU comes from the ComfyUI environment.
+
+Both platforms compile and device-link in one invocation. Use the installer, not `pip install` or
+a separate SyclExtension build, whose device code can differ from the validated build.
 
 ## Use
 

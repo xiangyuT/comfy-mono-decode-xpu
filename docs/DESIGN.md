@@ -208,6 +208,24 @@ installed together: removing the wait while keeping host clocks makes `auto` pic
 - The fused RoPE routes compare their first call in each generate with the live operator chain. On a
   mismatch they rewrite the KV slots from the live result and disable only that route.
 
+### Generation-owned weight reuse
+
+`MONO_DECODE_XPU_WEIGHT_REUSE` defaults on and controls three operations together, without
+disabling the existing session tiles or layer kernels when set to `0`:
+
+- Skip body/MTP prefetch only for eligible BF16 decode rows when every layer has a usable tiled
+  plan. Restore the original setting when plans become unavailable and on exit, including failure.
+- Once prefetch is suppressed and all plans exist, clone the INT8 output head's packed data and
+  quantization metadata within the live copy budget. Draft and verify share this generation-owned
+  copy; release the original cast and drop the copy at generation exit. Insufficient budget or
+  allocation failure keeps the ordinary cast path.
+- Gather only needed INT8 embedding rows on the host when ComfyUI's current VBAR watermark
+  indicates streaming and no prefetch is active. Recheck every lookup: CPU source weights alone
+  do not prove non-residency. Existing non-resident draft/device-loop fallbacks stay independent.
+
+`tiles.stats()` retains the budget, plan count, prefetch skips, embedding-wrapper row calls and
+head-cache status for the current or last generation, without a user-facing profiler wrapper.
+
 ## Not in the default stack
 
 - `graph_step.py`: XPU graph capture of the whole verify step (`MONO_DECODE_XPU_GRAPH=1`), resident

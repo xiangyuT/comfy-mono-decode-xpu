@@ -7,8 +7,9 @@ python install.py
 PYTHONPATH=/path/to/ComfyUI python -m pytest -q tests
 ```
 
-Tests that need ComfyUI modules (CombinedLinear, the MTP loop install, the logits and sampling hooks,
-the runtime replay checks) skip when ComfyUI is not on `PYTHONPATH`.
+Tests that need ComfyUI modules (CombinedLinear, the MTP loop install, the logits and sampling hooks)
+skip when ComfyUI is not on `PYTHONPATH`. State-write replay checks supply their own ComfyUI stubs
+and do not skip for a missing `comfy.ops` installation.
 
 The unit tests use random/synthetic tensors and native operations; no checkpoint, model download,
 ComfyUI server or development script is needed. They require the built extension,
