@@ -2,7 +2,8 @@
 
 The kernels were written for and validated on Xe2 (Arc Pro B70). On any other platform, answer each
 question below by measurement or by reading the code, before relying on a fast path.
-The skill's `scripts/platform_probe.py` answers the first few from device properties.
+The skill's `scripts/platform_probe.py` checks co-residency before anything runs and reports the
+device properties; the tests and measurements establish the rest.
 
 ## Device
 
@@ -13,7 +14,8 @@ The skill's `scripts/platform_probe.py` answers the first few from device proper
 - **Work-group shape.** Can one work-group hold all hardware threads of a core, with the sub-group
   size the kernels require?
 - **ISA.** Which matrix instructions (DPAS shapes) and block-load features exist? The kernels assume
-  Xe2's.
+  Xe2's. Establish this by building and running the tests on the device; reported device properties
+  are not evidence.
 - **SLM.** The persistent kernels use most of a core's shared local memory, and more when fewer
   cores share the work. Where is the limit on this device?
 - **Memory capacity.** Per-generate weight copies need free memory beside the workflow's models.

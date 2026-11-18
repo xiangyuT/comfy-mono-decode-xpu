@@ -4,8 +4,10 @@
 usage: python platform_probe.py [--comfyui DIR] [--node DIR] [--device N] [--json OUT]
 
 Run it with the Python that runs ComfyUI. It reads device properties only; it launches no kernel
-and loads no model. Exit code 0 means no FAIL check; a FAIL means the device breaks an assumption the
-kernels rely on.
+and loads no model. A FAIL means the kernels must not run here: there is no XPU, or a launch could
+hang, which the tests cannot safely discover. Exit code 0 means no FAIL. Capabilities whose absence
+fails cleanly (instruction set, launch limits) are established by building the extension and
+running the tests, not from reported properties.
 """
 import argparse
 import importlib.metadata as md
@@ -82,8 +84,7 @@ def main():
     p = torch.xpu.get_device_properties(a.device)
     keys = ("name", "device_id", "driver_version", "total_memory", "is_integrated_gpu", "gpu_eu_count",
             "gpu_subslice_count", "max_compute_units", "local_mem_size", "max_work_group_size",
-            "sub_group_sizes", "has_subgroup_2d_block_io", "has_subgroup_matrix_multiply_accumulate",
-            "last_level_cache_size", "has_bfloat16_conversions")
+            "sub_group_sizes", "last_level_cache_size")
     dev = {k: getattr(p, k, None) for k in keys}
     if isinstance(dev["device_id"], int):
         dev["device_id_hex"] = f"0x{dev['device_id']:04X}"
@@ -106,20 +107,19 @@ def main():
                   "safe, but some cores stay idle")
         else:
             check("OK", "co-residency", f"{cores} Xe cores, one 1024-thread work-group each")
-    # 2. One work-group is all 1024 hardware threads of an Xe core, in SIMD16 sub-groups.
-    if (dev["max_work_group_size"] or 0) < 1024 or 16 not in (dev["sub_group_sizes"] or []):
-        check("FAIL", "work-group", f"needs 1024 work-items and sub-group 16; device has "
-              f"{dev['max_work_group_size']} / {dev['sub_group_sizes']}")
-    # 3. The kernels use DPAS and 2D block loads (Xe2 / BMG).
-    if not dev["has_subgroup_matrix_multiply_accumulate"] or not dev["has_subgroup_2d_block_io"]:
-        check("FAIL", "isa", "no DPAS or no 2D block IO: the persistent kernels and attn_dpas are Xe2-only")
     else:
-        check("OK", "isa", "DPAS and 2D block IO present")
-    # 4. Persistent work-groups use more than 64 KiB of SLM; fewer cores give each one a larger share.
+        check("WARN", "co-residency", f"not established (max_compute_units {cus}, gpu_subslice_count "
+              f"{cores}): compare the device topology with csrc/mono_launch.hpp before running the kernels")
+    # 2. One work-group is all 1024 hardware threads of an Xe core, in SIMD16 sub-groups. A device
+    #    without them rejects the launch with an error, which the tests report.
+    if (dev["max_work_group_size"] or 0) < 1024 or 16 not in (dev["sub_group_sizes"] or []):
+        check("WARN", "work-group", f"needs 1024 work-items and sub-group 16; device reports "
+              f"{dev['max_work_group_size']} / {dev['sub_group_sizes']}: expect the launches to be rejected")
+    # 3. Persistent work-groups use more than 64 KiB of SLM; fewer cores give each one a larger share.
     slm = dev["local_mem_size"] or 0
     check("OK" if slm >= 128 * 1024 else "WARN", "slm",
           f"{slm // 1024} KiB per work-group (the launch is rejected before start if a share exceeds it)")
-    # 5. Memory: the per-generate tile-major copy of the post-block weights (~3.9 GB for Qwen3.5-9B
+    # 4. Memory: the per-generate tile-major copy of the post-block weights (~3.9 GB for Qwen3.5-9B
     #    W4A8) only happens when it fits beside the models plus MONO_DECODE_XPU_TILE_MARGIN_GB (3).
     gb = (dev["total_memory"] or 0) / 2**30
     if gb >= 24:
@@ -135,7 +135,7 @@ def main():
     if known is None:
         check("WARN", "device", f"{dev.get('device_id_hex')} is not the validated device: establish "
               "every assumption (references/platform.md) before trusting a fast path")
-    # 6. Build state.
+    # 5. Build state.
     if not built:
         check("WARN", "extension", "comfy_mono_decode_xpu/_C* not built yet: build it with `python install.py`")
     check("OK" if rep["packages"]["comfy-kitchen"] else "WARN", "kitchen",

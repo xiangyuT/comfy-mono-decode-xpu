@@ -42,8 +42,9 @@ exactness boundary), `docs/ENV.md` (switches) and `tests/README.md` first.
    - Run `python skills/mono-platform-dev/scripts/platform_probe.py --comfyui <ComfyUI>` with
      ComfyUI's Python.
    - Answer the remaining questions in `references/platform.md`.
-   - A FAIL means the device breaks an assumption the kernels rely on: the fast paths must not run
-     here until the code is ported. Keep the node off with `MONO_DECODE_XPU=0`.
+   - A FAIL means the kernels must not run here (no XPU, or a launch that could hang): keep the node
+     off with `MONO_DECODE_XPU=0` and do not run the tests until the code is ported.
+   - The probe does not judge capabilities such as the instruction set; step 2 establishes them.
 2. **Build and test.**
    - `python install.py --force [--target <aot>]`, then
      `PYTHONPATH=<ComfyUI> python -m pytest -q tests`, in ComfyUI's own environment.
@@ -97,7 +98,7 @@ cat bench/base/summary.md
 | The server exits before it is ready | `<out>/<config>/server.log`: the launcher, model paths or port. |
 | "no observer records" in the summary | The observer did not load: a custom-node whitelist must include `mono_tune_observer`. Generates without MTP are not recorded. |
 | A run ends in `timeout` | Something on the device never completed. Read the server log, then bring the pieces up one at a time (`references/development.md`). |
-| The probe reports FAIL | The platform breaks a kernel assumption: keep `MONO_DECODE_XPU=0` and see `references/development.md`, Porting. |
+| The probe reports FAIL | The kernels must not run here: keep `MONO_DECODE_XPU=0` and see `references/development.md`, Porting. |
 
 ## Limitations
 
